@@ -70,32 +70,38 @@ uint16 timer_box_cnt = 0;
 //	{3,7},{6,2},{6,6}
 //};
 
-Point car = {2, 2};
- BoxTargetPair pairs[6] = {
-    {{6,8}, {3, 5}},
-	{{4, 3}, {4, 4}},
-	{{5, 11}, {2, 10}},
-	{{9,4}, {10,10}},
-	{{8,1},{13,0}},
-	{{3,2},{13,15}}
-};//
+PlannerPointV3 car = {1, 2};
+PlannerPointV3 boxes[3] = {
+    {1, 7},  // 箱子1
+    {7, 4},  // 箱子2
+	{10, 4}
+};
+PlannerPointV3 targets[3] = {
+    {9, 5},  // 目标池位A
+    {9, 6},  // 目标池位B
+    {9, 7}  // 预留额外目标位
+};  // 任意箱子可去任一未使用目标
 
-Point obstacles[18] = {
+PlannerPointV3 obstacles[31] = {
 
-    {2, 4}, {3, 4}, {2, 5}, 
-	{4, 5}, {5, 4}, {5, 5},
-	{1, 10}, {1, 11}, {2, 11}, 
-	{10,9}, {9,9}, {9,10},
-	{12,0}, {12,1}, {13,1},
-	{13,14}, {13,14}, {14,15}
+    {5, 1}, {6, 1}, {7, 1}, 
+	{8, 1}, {0, 7}, {2, 7},
+	{3, 7}, {4, 7}, {4, 6}, 
+	{4, 5}, {5, 5}, {6, 5},
+	{7, 5}, {8, 5}, {8, 6},
+	{8, 7}, {8, 8}, {9, 8},
+	{10, 8},{11, 8},{12, 8},
+	{12, 7},{12, 6},{12, 5},
+	{12, 4},{12, 3},{11, 3},
+	{10, 3},{10, 5},{10, 6},
+	{1, 9}
 
 };//
 	//
 //Point car = {5,1};
-Point boxes[8];
 size_t steps;
 int res;
-Point path[GREEDY_AREA];
+PlannerPointV3 path[GREEDY_AREA];
 
 int main(void)
 {
@@ -132,7 +138,7 @@ int main(void)
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
 
-	res = plan_boxes_greedy(18, 18, car, pairs, 6, obstacles, 18, path, GREEDY_AREA, &steps);
+	res = plan_boxes_greedy_v3(14, 10, car, boxes, 3,targets,3, obstacles, 31, path, GREEDY_AREA, &steps, NULL);
 	if (steps)
 	{
 		ips200_show_string(0, 16, "path init.");
