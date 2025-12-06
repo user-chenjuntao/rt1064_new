@@ -1,4 +1,20 @@
-# assigned_box_planner_greedy_1 算法文档
+# assigned_box_planner 算法文档
+
+## 版本选择指南
+
+### v3 (assigned_box_planner_greedy_1) - 混合策略版
+- **文件**：`assigned_box_planner_greedy_1.c/h`
+- **策略**：近距离使用贪心+区域BFS，远距离自动切换全局BFS+A*
+- **特点**：效率高，适合大多数场景
+- **适用场景**：通用推箱规划，兼顾速度和准确性
+
+### v3_BFS (assigned_box_planner_greedy_2) - 纯BFS+A*版
+- **文件**：`assigned_box_planner_greedy_2.c/h`
+- **策略**：所有箱子都使用全局BFS+A*，完全移除贪心算法
+- **特点**：路径最优，搜索可靠，性能稳定
+- **适用场景**：复杂环境、需要最优解、或v3版本失败的情况
+
+---
 
 ## 算法概述（简化版 v3）
 - **核心策略**：贪心规划 + 障碍/箱子绕行 + 远距离自动切换全局BFS+A*，去掉拐点最小化和路径简化
@@ -18,7 +34,9 @@
   - 支持目标数≥箱子数（多余目标不使用）
   - 箱子到达目标后，箱子消失（坐标标记为-1），目标点也不再被其他箱子使用
 
-## 函数接口（v3 简化版）
+## 函数接口
+
+### v3 混合策略版
 ```c
 #include "assigned_box_planner_greedy_1.h"
 
@@ -30,6 +48,21 @@ int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3 car,
                          size_t *out_steps,
                          size_t *out_box_target_indices /* 可为 NULL */);
 ```
+
+### v3_BFS 纯BFS+A*版
+```c
+#include "assigned_box_planner_greedy_2.h"
+
+int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
+                             const PlannerPointV3_BFS *boxes, size_t box_count,
+                             const PlannerPointV3_BFS *targets, size_t target_count,
+                             const PlannerPointV3_BFS *obstacles, size_t obstacle_count,
+                             PlannerPointV3_BFS *path_buffer, size_t path_capacity,
+                             size_t *out_steps,
+                             size_t *out_box_target_indices /* 可为 NULL */);
+```
+
+**注意**：`PlannerPointV3` 和 `PlannerPointV3_BFS` 都是 `Point` 的别名，可以互换使用。
 
 ### 参数说明
 - `rows/cols`：网格行数/列数，总单元格数需 ≤400
@@ -126,7 +159,142 @@ if (ret == 0) {
 }
 ```
 
+### 纯BFS+A*版本使用示例（v3_BFS）
+
+如果需要全局最优路径或 v3 版本规划失败，可以使用纯 BFS+A* 版本：
+
+```c
+#include "assigned_box_planner_greedy_2.h"
+
+// 使用相同的地图配置
+PlannerPointV3_BFS car = {1, 2};
+PlannerPointV3_BFS boxes[] = {
+    {1, 7},
+    {7, 4},
+    {10, 4},
+};
+PlannerPointV3_BFS targets[] = {
+    {9, 5},
+    {9, 6},
+    {9, 7},
+};
+PlannerPointV3_BFS obstacles[] = {
+    {5, 1},  {6, 1},  {7, 1},  {8, 1},
+    {0, 7},  {2, 7},  {3, 7},  {4, 7},
+    {4, 6},  {4, 5},  {5, 5},  {6, 5},
+    {7, 5},  {8, 5},  {8, 6},  {8, 7},
+    {8, 8},  {9, 8},  {10, 8}, {11, 8},
+    {12, 8}, {12, 7}, {12, 6}, {12, 5},
+    {12, 4}, {12, 3}, {11, 3}, {10, 3},
+    {10, 5}, {10, 6}, {1, 9},
+};
+
+PlannerPointV3_BFS path[2048];
+size_t steps = 0;
+size_t mapping[3] = {SIZE_MAX, SIZE_MAX, SIZE_MAX};
+
+// 使用纯BFS+A*版本
+int ret = plan_boxes_greedy_v3_bfs(14, 10, car,
+                                   boxes, 3,
+                                   targets, 3,
+                                   obstacles, sizeof(obstacles) / sizeof(obstacles[0]),
+                                   path, sizeof(path) / sizeof(path[0]),
+                                   &steps, mapping);
+
+if (ret == 0) {
+    printf("纯BFS+A*版本规划成功\n");
+    printf("路径总步数: %zu\n", steps);
+    
+    // 打印箱子到目标的映射
+    for (size_t i = 0; i < 3; ++i) {
+        if (mapping[i] != SIZE_MAX) {
+            printf("箱子[%zu] (%d,%d) -> 目标[%zu] (%d,%d)\n",
+                   i, boxes[i].row, boxes[i].col,
+                   mapping[i], targets[mapping[i]].row, targets[mapping[i]].col);
+        }
+    }
+} else {
+    printf("规划失败，错误码: %d\n", ret);
+}
+```
+
+#### v3 与 v3_BFS 对比
+
+| 特性 | v3 (混合策略) | v3_BFS (纯BFS+A*) |
+|------|---------------|-------------------|
+| **近距离策略** | 贪心 + 区域BFS | 全局BFS+A* |
+| **远距离策略** | 全局BFS+A* | 全局BFS+A* |
+| **距离计算** | 曼哈顿距离 / 真实距离 | 始终真实距离 |
+| **策略切换** | 自动判断（阈值） | 无切换，统一策略 |
+| **车辆移动** | 贪心 → 区域BFS → 全局BFS+A* | 全局BFS+A* |
+| **绕箱到推箱位** | 车辆模式 → 箱子模式 → 全局BFS+A* | 全局BFS+A* |
+| **路径质量** | 较优 | 最优 |
+| **计算性能** | 快（近距离） | 稳定 |
+| **推荐场景** | 通用场景 | 复杂环境/最优解 |
+
+#### 何时使用 v3_BFS 版本？
+
+1. **复杂障碍环境**：障碍物密集，需要精确路径规划
+2. **要求最优路径**：对路径长度有严格要求
+3. **v3版本失败**：混合策略无法找到解时
+4. **性能稳定性**：需要可预测的性能表现
+5. **调试和验证**：作为基准对照，验证其他算法
+
+#### 何时使用 v3 版本？
+
+1. **大多数场景**：通用推箱规划，平衡速度和质量
+2. **实时性要求**：需要快速响应
+3. **简单到中等复杂度**：障碍物分布合理的地图
+
 ### 算法特点说明
+
+#### v3_BFS 版本核心特点
+
+1. **纯BFS+A*策略**：
+   - **完全移除贪心算法**：无曼哈顿距离估算，所有距离都是BFS真实距离
+   - **统一路径规划**：所有箱子都使用相同的全局BFS+A*策略
+   - **无阈值判断**：不论距离远近，始终使用全局最优算法
+   - **从目标点BFS**：每个箱子开始前，从目标点做一次全局BFS，计算 `dist[x][y]`
+   - **A*启发函数**：使用预计算的真实距离 `h(x,y) = dist[x][y]`（非估计值）
+
+2. **车辆移动策略**：
+   - **全局BFS+A***：所有车辆移动都使用 `planner_v3_bfs_car_move_with_global_astar`
+   - **流程**：
+     1. 从目标推箱位做全局BFS，计算距离数组
+     2. 使用A*搜索，启发函数为真实距离
+     3. 不会被打断，必须完整搜索到目标
+   - **优势**：路径全局最优，避免绕远路
+
+3. **推箱方向评分**：
+   - **评分公式**：`score = dist_after × 10 + adj_pen × 5 + reverse_pen + car_to_push × 2`
+   - **dist_after**：始终使用真实距离 `target_dist[new_box_idx]`
+   - **自动避免死路**：无法到达的方向dist=∞，评分极高，自动排除
+   - **多方向尝试**：按评分排序，从最优到次优依次尝试
+
+4. **绕箱换推箱位**：
+   - **全局BFS+A***：使用 `planner_v3_bfs_follow_box_with_global_astar`
+   - **流程**：
+     1. 找出所有有效推箱位（死点检测过滤）
+     2. 按距离排序推箱位
+     3. 对每个推箱位：从推箱位做全局BFS → A*搜索车路径
+     4. 找到第一个可达的推箱位即返回
+   - **可靠性高**：保证找到最优绕箱路径
+
+5. **保留机制**：
+   - ✅ 箱子顺序贪心选择（仅用于顺序决策）
+   - ✅ 死点检测（BFS验证箱子可达性）
+   - ✅ 反向移动惩罚（5^n递进式）
+   - ✅ 邻域拥挤度评估
+   - ✅ 多推箱位尝试
+   - ✅ 路径连续性验证
+
+6. **性能特征**：
+   - **时间复杂度**：每个箱子 O(rows×cols) BFS + O(rows×cols×log(rows×cols)) A*
+   - **空间复杂度**：O(rows×cols) 距离数组（每个箱子复用）
+   - **稳定性**：不受地图布局影响，性能可预测
+   - **最优性**：所有路径都是全局最优
+
+#### v3 版本核心特点
 
 1. **贪心策略与目标分配**：
    - **初始分配**：使用贪心算法为每个箱子分配一个目标点（车到箱子+箱子到目标距离最小）
@@ -533,6 +701,74 @@ threshold = 14 / 2 = 7
 ---
 
 ## 更新历史
+
+### v3_BFS (2025-12-06) - 纯BFS+A*版本
+
+**文件**：`assigned_box_planner_greedy_2.c/h`
+
+#### 核心特性
+
+1. **完全移除贪心算法**：
+   - 移除 `planner_v3_greedy_car_move`（贪心车辆移动）
+   - 移除 `planner_v3_car_greedy_to_target`（贪心到目标）
+   - 移除区域BFS绕行函数（`planner_v3_follow_obstacle_ex` 及其包装）
+   - 移除区域BFS绕箱函数（`planner_v3_follow_box_to_push_pos`）
+
+2. **统一使用全局BFS+A***：
+   - **所有箱子**：从目标点做全局BFS，预计算真实距离数组
+   - **推箱方向评分**：始终使用真实距离 `dist[x][y]`
+   - **车辆移动**：统一使用 `planner_v3_bfs_car_move_with_global_astar`
+   - **绕箱到推箱位**：统一使用 `planner_v3_bfs_follow_box_with_global_astar`
+
+3. **取消距离阈值判断**：
+   - 移除 `use_global_pathfinding` 标志
+   - 移除 `max_dim / 2` 的距离判断逻辑
+   - 所有场景使用相同的BFS+A*策略
+
+4. **保留核心机制**：
+   - ✅ 死点检测 (`planner_v3_bfs_can_reach_goal`)
+   - ✅ 箱子顺序贪心选择（按距离评分）
+   - ✅ 推箱方向多方向尝试
+   - ✅ 反向移动惩罚（5^n递进式）
+   - ✅ 邻域拥挤度评估
+   - ✅ 路径连续性验证
+
+#### 优势
+
+- ✅ **路径最优**：所有路径都是全局最优，无近似
+- ✅ **性能稳定**：不受距离远近影响，性能可预测
+- ✅ **搜索可靠**：BFS+A*保证找到解（如果存在）
+- ✅ **逻辑简单**：单一策略，易于理解和调试
+- ✅ **适合复杂环境**：障碍物密集场景下表现更好
+
+#### 劣势
+
+- ⚠️ **性能开销**：近距离场景比贪心策略慢
+- ⚠️ **内存占用**：每个箱子都需要完整的距离数组
+
+#### 使用建议
+
+```c
+#include "assigned_box_planner_greedy_2.h"
+
+// 使用方式与v3相同，只需改变头文件和函数名
+int ret = plan_boxes_greedy_v3_bfs(rows, cols, car,
+                                   boxes, box_count,
+                                   targets, target_count,
+                                   obstacles, obstacle_count,
+                                   path, path_capacity,
+                                   &steps, mapping);
+```
+
+#### 技术细节
+
+- 函数前缀：`planner_v3_bfs_*`（与v3的 `planner_v3_*` 区分）
+- 数据结构：`PlannerPointV3_BFS`（等价于 `Point`）
+- 常量前缀：`PLANNER_V3_BFS_*`
+- 全局BFS每个箱子执行一次，时间复杂度 O(rows × cols)
+- A*搜索时间复杂度 O(rows × cols × log(rows × cols))
+
+---
 
 ### v3.2 (2025-12-06) - 距离判断自动切换全局BFS+A*
 

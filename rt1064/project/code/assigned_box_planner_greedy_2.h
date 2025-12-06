@@ -1,0 +1,61 @@
+#ifndef ASSIGNED_BOX_PLANNER_GREEDY_2_H
+#define ASSIGNED_BOX_PLANNER_GREEDY_2_H
+
+#include <stddef.h>
+#include "assigned_box_planner_greedy.h"
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+typedef Point PlannerPointV3_BFS;
+
+/**
+ * 推箱规划算法 v3_BFS - 纯 BFS+A* 版本
+ * 
+ * 算法核心：
+ * - 从终点做全局BFS，计算每个可达格子到终点的真实距离 dist[x][y]
+ * - 使用A*搜索时，启发函数 h(x,y) = dist[x][y]
+ * - 完全移除贪心算法和区域BFS
+ * 
+ * 算法流程：
+ * 1. 按距离选择箱子推行顺序（车到箱子+箱子到目标距离最小优先）
+ * 2. 对每个箱子：
+ *    a. 从目标点做全局BFS，预计算 dist[x][y]
+ *    b. 车移动到推箱位：使用全局BFS+A*
+ *    c. 推箱方向评分：使用 dist[x][y] 作为箱子到目标的距离
+ *    d. 遇到死点需换推箱位：使用全局BFS+A*绕箱子
+ * 3. 所有路径搜索统一使用全局BFS+A*，无贪心，无区域限制
+ *
+ * @param rows/cols                 网格尺寸
+ * @param car                       小车初始坐标
+ * @param boxes/box_count           箱子列表（最多10个）/ 箱子数量
+ * @param targets/target_count      目标点列表 / 目标点数量
+ * @param obstacles/count           障碍物列表 / 数量
+ * @param path_buffer/path_capacity 输出路径缓存 / 容量
+ * @param out_steps                 实际路径步数
+ * @param out_box_target_indices    箱子到目标的映射（可选，传NULL则不输出），未分配为SIZE_MAX
+ *
+ * @return 0  成功
+ *         -1 参数为空
+ *         -2 箱子或目标为空
+ *         -3 箱子数超限(10)
+ *         -4 路径缓存为0
+ *         -5 单箱迭代超步数
+ *         -6 无可行推动方向
+ *         -7 路径缓存不足
+ *         -8 目标数少于箱子数
+ */
+int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
+                             const PlannerPointV3_BFS *boxes, size_t box_count,
+                             const PlannerPointV3_BFS *targets, size_t target_count,
+                             const PlannerPointV3_BFS *obstacles,
+                             size_t obstacle_count, PlannerPointV3_BFS *path_buffer,
+                             size_t path_capacity, size_t *out_steps,
+                             size_t *out_box_target_indices);
+
+#ifdef __cplusplus
+}
+#endif
+
+#endif
