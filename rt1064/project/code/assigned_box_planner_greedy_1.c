@@ -188,10 +188,264 @@ static int planner_v3_greedy_car_move(int rows, int cols, Point car, Point targe
   return 1;
 }
 
-// BFS绕行：在限定区域内使用BFS搜索路径
-// allow_greedy_resume: 是否允许在绕行中途恢复贪心
-//   = 1: 车辆绕行模式 - 允许中途检测并恢复贪心（通畅后立即恢复）
-//   = 0: 箱子绕行模式 - 禁止中途打断，必须到达目标推箱位才停止
+// 全局BFS：从终点开始，计算每个可达格子到终点的真实距离
+// 返回值：1=成功，0=失败
+static int planner_v3_global_bfs_from_target(int rows, int cols, Point target,
+                                             const Point *obstacles, size_t obstacle_count,
+                                             const Point *boxes, size_t box_count,
+                                             int dist[PLANNER_V3_MAX_CELLS]) {
+  int total_cells = rows * cols;
+  if (total_cells > PLANNER_V3_MAX_CELLS || total_cells <= 0) {
+    return 0;
+  }
+  
+  // 初始化距离为无穷大
+  for (int i = 0; i < total_cells; ++i) {
+    dist[i] = INT_MAX;
+  }
+  
+  uint8_t visited[PLANNER_V3_MAX_CELLS];
+  int queue[PLANNER_V3_MAX_CELLS];
+  memset(visited, 0, sizeof(visited));
+  
+  int head = 0;
+  int tail = 0;
+  
+  // 从终点开始BFS
+  int target_idx = target.row * cols + target.col;
+  queue[tail++] = target_idx;
+  visited[target_idx] = 1;
+  dist[target_idx] = 0;
+  
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  
+  while (head < tail) {
+    if (head >= PLANNER_V3_MAX_CELLS) break;
+    
+    int curr_idx = queue[head++];
+    int curr_row = curr_idx / cols;
+    int curr_col = curr_idx % cols;
+    int curr_dist = dist[curr_idx];
+    
+    for (int d = 0; d < 4; ++d) {
+      int nr = curr_row + dirs[d][0];
+      int nc = curr_col + dirs[d][1];
+      
+      if (!planner_v3_in_bounds(rows, cols, nr, nc)) {
+        continue;
+      }
+      
+      // 检查障碍物和箱子
+      if (planner_v3_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+        continue;
+      }
+      if (planner_v3_is_box_at(boxes, box_count, nr, nc, box_count)) {
+        continue;
+      }
+      
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) {
+        continue;
+      }
+      
+      if (!visited[next_idx]) {
+        visited[next_idx] = 1;
+        dist[next_idx] = curr_dist + 1;
+        if (tail < PLANNER_V3_MAX_CELLS) {
+          queue[tail++] = next_idx;
+        }
+      }
+    }
+  }
+  
+  return 1;
+}
+
+// A*搜索：使用预计算的距离作为启发函数
+// 这是一个完整的A*实现，不会被贪心打断，必须搜索到目标或确认无解
+// 返回值：1=成功找到路径，0=失败
+static int planner_v3_astar_with_dist(int rows, int cols, Point start, Point target,
+                                      const Point *obstacles, size_t obstacle_count,
+                                      const Point *boxes, size_t box_count,
+                                      const int dist[PLANNER_V3_MAX_CELLS],
+                                      Point *path, size_t path_cap, size_t *path_len) {
+  int total_cells = rows * cols;
+  if (total_cells > PLANNER_V3_MAX_CELLS || total_cells <= 0) {
+    return 0;
+  }
+  
+  if (start.row == target.row && start.col == target.col) {
+    if (path_cap < 1) return 0;
+    path[0] = start;
+    *path_len = 1;
+    return 1;
+  }
+  
+  // A*数据结构
+  typedef struct {
+    int idx;
+    int f_score;  // f = g + h
+  } AStarNode;
+  
+  int g_score[PLANNER_V3_MAX_CELLS];
+  int parent[PLANNER_V3_MAX_CELLS];
+  uint8_t in_open[PLANNER_V3_MAX_CELLS];
+  uint8_t in_closed[PLANNER_V3_MAX_CELLS];
+  
+  for (int i = 0; i < total_cells; ++i) {
+    g_score[i] = INT_MAX;
+    parent[i] = -1;
+    in_open[i] = 0;
+    in_closed[i] = 0;
+  }
+  
+  // 简单的优先队列（数组实现）
+  AStarNode open_set[PLANNER_V3_MAX_CELLS];
+  int open_count = 0;
+  
+  int start_idx = start.row * cols + start.col;
+  int target_idx = target.row * cols + target.col;
+  
+  // 检查起点到终点的距离是否有效
+  if (dist[start_idx] == INT_MAX) {
+    return 0;  // 起点无法到达终点
+  }
+  
+  g_score[start_idx] = 0;
+  open_set[open_count].idx = start_idx;
+  open_set[open_count].f_score = dist[start_idx];  // f = g + h = 0 + h
+  open_count++;
+  in_open[start_idx] = 1;
+  
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  
+  while (open_count > 0) {
+    // 找到f_score最小的节点
+    int best_idx = 0;
+    for (int i = 1; i < open_count; ++i) {
+      if (open_set[i].f_score < open_set[best_idx].f_score) {
+        best_idx = i;
+      }
+    }
+    
+    AStarNode current = open_set[best_idx];
+    int curr_idx = current.idx;
+    
+    // 从open_set中移除
+    for (int i = best_idx; i < open_count - 1; ++i) {
+      open_set[i] = open_set[i + 1];
+    }
+    open_count--;
+    in_open[curr_idx] = 0;
+    in_closed[curr_idx] = 1;
+    
+    // 到达目标
+    if (curr_idx == target_idx) {
+      // 回溯路径
+      int path_indices[PLANNER_V3_MAX_PATH_LEN];
+      int path_count = 0;
+      int idx = target_idx;
+      
+      while (idx != -1 && path_count < PLANNER_V3_MAX_PATH_LEN) {
+        path_indices[path_count++] = idx;
+        idx = parent[idx];
+      }
+      
+      // 反转路径
+      *path_len = 0;
+      for (int i = path_count - 1; i >= 0 && *path_len < path_cap; --i) {
+        int pidx = path_indices[i];
+        path[*path_len].row = pidx / cols;
+        path[*path_len].col = pidx % cols;
+        (*path_len)++;
+      }
+      
+      return (*path_len > 0) ? 1 : 0;
+    }
+    
+    int curr_row = curr_idx / cols;
+    int curr_col = curr_idx % cols;
+    
+    // 扩展邻居
+    for (int d = 0; d < 4; ++d) {
+      int nr = curr_row + dirs[d][0];
+      int nc = curr_col + dirs[d][1];
+      
+      if (!planner_v3_in_bounds(rows, cols, nr, nc)) {
+        continue;
+      }
+      
+      if (planner_v3_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+        continue;
+      }
+      if (planner_v3_is_box_at(boxes, box_count, nr, nc, box_count)) {
+        continue;
+      }
+      
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) {
+        continue;
+      }
+      
+      if (in_closed[next_idx]) {
+        continue;
+      }
+      
+      int tentative_g = g_score[curr_idx] + 1;
+      
+      if (!in_open[next_idx]) {
+        // 新节点
+        g_score[next_idx] = tentative_g;
+        parent[next_idx] = curr_idx;
+        
+        // h = dist[next_idx]（预计算的真实距离）
+        int h = dist[next_idx];
+        if (h == INT_MAX) {
+          continue;  // 该点无法到达终点，跳过
+        }
+        
+        int f = tentative_g + h;
+        
+        if (open_count < PLANNER_V3_MAX_CELLS) {
+          open_set[open_count].idx = next_idx;
+          open_set[open_count].f_score = f;
+          open_count++;
+          in_open[next_idx] = 1;
+        }
+      } else if (tentative_g < g_score[next_idx]) {
+        // 找到更好的路径
+        g_score[next_idx] = tentative_g;
+        parent[next_idx] = curr_idx;
+        
+        int h = dist[next_idx];
+        int f = tentative_g + h;
+        
+        // 更新open_set中的f_score
+        for (int i = 0; i < open_count; ++i) {
+          if (open_set[i].idx == next_idx) {
+            open_set[i].f_score = f;
+            break;
+          }
+        }
+      }
+    }
+  }
+  
+  // 没有找到路径
+  *path_len = 0;
+  return 0;
+}
+
+// BFS绕行：两级策略，区域BFS + 全局BFS+A*
+// 
+// 第一级：区域BFS（限定搜索区域，效率高）
+//   allow_greedy_resume参数控制是否允许中途恢复贪心：
+//     = 1: 车辆绕行模式 - 允许中途检测并恢复贪心（通畅后立即恢复）
+//     = 0: 箱子绕行模式 - 禁止中途打断，必须到达目标推箱位才停止
+// 
+// 第二级：全局BFS+A*（区域BFS失败时启用）
+//   不受allow_greedy_resume参数影响，必须完整搜索到目标，不会被贪心打断
+//
 static int planner_v3_follow_obstacle_ex(int rows, int cols, Point start, Point target,
                                          const Point *obstacles, size_t obstacle_count,
                                          const Point *boxes, size_t box_count,
@@ -366,8 +620,25 @@ static int planner_v3_follow_obstacle_ex(int rows, int cols, Point start, Point 
   }
   
   if (!found_target) {
-    *path_len = 0;
-    return 0;
+    // 区域BFS失败，使用全局BFS+A*
+    // 注意：全局BFS+A*不受allow_greedy_resume参数影响，必须完整搜索到目标
+    // 
+    // 第1步：从终点做全局BFS，计算每个可达格子到终点的真实距离
+    int dist[PLANNER_V3_MAX_CELLS];
+    if (!planner_v3_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
+                                           boxes, box_count, dist)) {
+      *path_len = 0;
+      return 0;
+    }
+    
+    // 第2步：使用A*，以预计算的距离作为启发函数
+    // A*算法保证找到完整路径，不会中途打断或恢复贪心
+    int astar_result = planner_v3_astar_with_dist(rows, cols, start, target,
+                                                   obstacles, obstacle_count,
+                                                   boxes, box_count, dist,
+                                                   path, path_cap, path_len);
+    
+    return astar_result;
   }
   
   // 回溯路径
@@ -527,6 +798,159 @@ static int planner_v3_check_adjacent(Point prev, Point curr) {
   int dr = planner_v3_abs(curr.row - prev.row);
   int dc = planner_v3_abs(curr.col - prev.col);
   return (dr + dc == 1);
+}
+
+// 使用全局BFS+A*绕箱子到另一个推箱位
+// 返回值：1=成功，0=失败，-7=路径缓存不足
+static int planner_v3_follow_box_with_global_astar(int rows, int cols, Point car, Point box,
+                                                     Point target, const Point *obstacles,
+                                                     size_t obstacle_count, const Point *boxes,
+                                                     size_t box_count, size_t moving_idx,
+                                                     Point *path, size_t path_cap,
+                                                     size_t *path_len, Point *out_push_pos) {
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  
+  // 找到所有有效的推箱位
+  Point valid_push_positions[4];
+  int valid_count = 0;
+  
+  for (int d = 0; d < 4; ++d) {
+    int push_r = box.row - dirs[d][0];
+    int push_c = box.col - dirs[d][1];
+    int new_box_r = box.row + dirs[d][0];
+    int new_box_c = box.col + dirs[d][1];
+    
+    if (!planner_v3_in_bounds(rows, cols, push_r, push_c)) continue;
+    if (!planner_v3_in_bounds(rows, cols, new_box_r, new_box_c)) continue;
+    if (planner_v3_is_obstacle(obstacles, obstacle_count, push_r, push_c)) continue;
+    if (planner_v3_is_obstacle(obstacles, obstacle_count, new_box_r, new_box_c)) continue;
+    if (planner_v3_is_box_at(boxes, box_count, new_box_r, new_box_c, moving_idx)) continue;
+    
+    // 检查推过去后箱子能否继续到目标
+    if (planner_v3_can_reach_goal(rows, cols, obstacles, obstacle_count, boxes,
+                                   box_count, moving_idx,
+                                   (Point){new_box_r, new_box_c}, target)) {
+      valid_push_positions[valid_count].row = push_r;
+      valid_push_positions[valid_count].col = push_c;
+      valid_count++;
+    }
+  }
+  
+  if (valid_count == 0) {
+    return 0;  // 没有有效的推箱位
+  }
+  
+  // 按距离排序推箱位
+  typedef struct {
+    Point pos;
+    int dist;
+  } PushPosWithDist;
+  
+  PushPosWithDist sorted_positions[4];
+  for (int i = 0; i < valid_count; ++i) {
+    sorted_positions[i].pos = valid_push_positions[i];
+    sorted_positions[i].dist = planner_v3_manhattan(car, valid_push_positions[i]);
+  }
+  
+  for (int i = 0; i < valid_count - 1; ++i) {
+    for (int j = 0; j < valid_count - 1 - i; ++j) {
+      if (sorted_positions[j].dist > sorted_positions[j + 1].dist) {
+        PushPosWithDist tmp = sorted_positions[j];
+        sorted_positions[j] = sorted_positions[j + 1];
+        sorted_positions[j + 1] = tmp;
+      }
+    }
+  }
+  
+  // 尝试所有有效推箱位，使用全局BFS+A*
+  for (int try_idx = 0; try_idx < valid_count; ++try_idx) {
+    Point target_push_pos = sorted_positions[try_idx].pos;
+    
+    // 第1步：从目标推箱位做全局BFS
+    int dist[PLANNER_V3_MAX_CELLS];
+    if (!planner_v3_global_bfs_from_target(rows, cols, target_push_pos, obstacles, 
+                                           obstacle_count, boxes, box_count, dist)) {
+      continue;  // BFS失败，尝试下一个推箱位
+    }
+    
+    // 第2步：使用A*搜索路径
+    if (!planner_v3_astar_with_dist(rows, cols, car, target_push_pos,
+                                    obstacles, obstacle_count,
+                                    boxes, box_count, dist,
+                                    path, path_cap, path_len)) {
+      continue;  // A*失败，尝试下一个推箱位
+    }
+    
+    if (*path_len > 0) {
+      Point last = path[*path_len - 1];
+      if (last.row == target_push_pos.row && last.col == target_push_pos.col) {
+        // 成功到达推箱位
+        out_push_pos->row = target_push_pos.row;
+        out_push_pos->col = target_push_pos.col;
+        return 1;
+      }
+    }
+  }
+  
+  // 所有推箱位都无法到达
+  return 0;
+}
+
+// 使用全局BFS+A*移动车到目标位置
+// 返回值：1=成功，0=失败，-7=路径缓存不足
+static int planner_v3_car_move_with_global_astar(int rows, int cols, Point *car_pos, 
+                                                  Point target,
+                                                  const Point *obstacles, size_t obstacle_count,
+                                                  const Point *boxes, size_t box_count,
+                                                  Point *path_buffer, size_t path_capacity,
+                                                  size_t *out_steps) {
+  if (car_pos->row == target.row && car_pos->col == target.col) {
+    return 1;  // 已在目标位置
+  }
+  
+  // 第1步：从目标做全局BFS
+  int dist[PLANNER_V3_MAX_CELLS];
+  if (!planner_v3_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
+                                         boxes, box_count, dist)) {
+    return 0;  // BFS失败
+  }
+  
+  // 第2步：使用A*搜索路径
+  Point temp_path[256];
+  size_t temp_len = 0;
+  
+  if (!planner_v3_astar_with_dist(rows, cols, *car_pos, target,
+                                  obstacles, obstacle_count,
+                                  boxes, box_count, dist,
+                                  temp_path, 256, &temp_len)) {
+    return 0;  // A*失败
+  }
+  
+  if (temp_len == 0) {
+    return 0;
+  }
+  
+  // 第3步：将路径添加到输出缓冲区（跳过起点）
+  for (size_t i = 1; i < temp_len; ++i) {
+    if (*out_steps >= path_capacity) {
+      return -7;  // 路径缓存不足
+    }
+    
+    // 验证与前一个点相邻
+    if (*out_steps > 0 && 
+        !planner_v3_check_adjacent(path_buffer[*out_steps - 1], temp_path[i])) {
+      return 0;  // 路径不连续
+    }
+    
+    path_buffer[(*out_steps)++] = temp_path[i];
+  }
+  
+  // 更新车位置
+  if (temp_len > 0) {
+    *car_pos = temp_path[temp_len - 1];
+  }
+  
+  return 1;
 }
 
 // 车贪心移动到目标位置，检测路径重复
@@ -773,6 +1197,31 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
       continue;
     }
 
+    // 判断是否需要使用全局BFS+A*策略
+    // 条件：车到箱子或箱子到目标的行/列距离超过地图最大维度的一半
+    int max_dim = (rows > cols) ? rows : cols;
+    int threshold = max_dim / 2;
+    
+    int car_to_box_row_dist = planner_v3_abs(current_car.row - box.row);
+    int car_to_box_col_dist = planner_v3_abs(current_car.col - box.col);
+    int box_to_target_row_dist = planner_v3_abs(box.row - target.row);
+    int box_to_target_col_dist = planner_v3_abs(box.col - target.col);
+    
+    int use_global_pathfinding = 0;
+    int target_dist[PLANNER_V3_MAX_CELLS];  // 从目标点的全局BFS距离
+    
+    if (car_to_box_row_dist > threshold || car_to_box_col_dist > threshold ||
+        box_to_target_row_dist > threshold || box_to_target_col_dist > threshold) {
+      use_global_pathfinding = 1;
+      
+      // 从目标点做全局BFS，计算每个格子到目标的真实距离
+      if (!planner_v3_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
+                                             current_boxes, goal_count, target_dist)) {
+        // BFS失败，回退到使用曼哈顿距离
+        use_global_pathfinding = 0;
+      }
+    }
+
     // 推箱子到目标
     int step_count = 0;
     int last_dr = 0;
@@ -861,7 +1310,22 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
 
         Point push_from = {push_row, push_col};
         
-        int dist_after = planner_v3_manhattan((Point){new_box_row, new_box_col}, target);
+        // 计算箱子推到新位置后到目标的距离
+        int dist_after;
+        if (use_global_pathfinding) {
+          // 使用全局BFS计算的真实距离
+          int idx = new_box_row * cols + new_box_col;
+          if (idx >= 0 && idx < rows * cols && target_dist[idx] != INT_MAX) {
+            dist_after = target_dist[idx];
+          } else {
+            // 该位置无法到达目标，使用一个很大的值
+            dist_after = INT_MAX / 100;
+          }
+        } else {
+          // 使用曼哈顿距离
+          dist_after = planner_v3_manhattan((Point){new_box_row, new_box_col}, target);
+        }
+        
         int adj_pen = planner_v3_adjacent_blockers(
             rows, cols, obstacles, obstacle_count, current_boxes, goal_count,
             box_idx, new_box_row, new_box_col);
@@ -917,17 +1381,27 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
         Point detour_path[256];
         size_t detour_len = 0;
         Point new_push_pos;
+        int detour_ok = 0;
         
-        int detour_ok = planner_v3_follow_box_to_push_pos(
-            rows, cols, current_car, box, target, obstacles, obstacle_count,
-            current_boxes, goal_count, box_idx, 1, detour_path, 256, 
-            &detour_len, &new_push_pos);
-        
-        if (!detour_ok || detour_len == 0) {
+        if (use_global_pathfinding) {
+          // 使用全局BFS+A*绕箱子
+          detour_ok = planner_v3_follow_box_with_global_astar(
+              rows, cols, current_car, box, target, obstacles, obstacle_count,
+              current_boxes, goal_count, box_idx, detour_path, 256, 
+              &detour_len, &new_push_pos);
+        } else {
+          // 使用区域BFS+贪心恢复策略
           detour_ok = planner_v3_follow_box_to_push_pos(
               rows, cols, current_car, box, target, obstacles, obstacle_count,
-              current_boxes, goal_count, box_idx, 0, detour_path, 256, 
+              current_boxes, goal_count, box_idx, 1, detour_path, 256, 
               &detour_len, &new_push_pos);
+          
+          if (!detour_ok || detour_len == 0) {
+            detour_ok = planner_v3_follow_box_to_push_pos(
+                rows, cols, current_car, box, target, obstacles, obstacle_count,
+                current_boxes, goal_count, box_idx, 0, detour_path, 256, 
+                &detour_len, &new_push_pos);
+          }
         }
         
         if (!detour_ok || detour_len == 0) {
@@ -1010,12 +1484,32 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
           break;
         }
         
-        // 尝试贪心移动车到推箱位
-        int car_result = planner_v3_car_greedy_to_target(
-            rows, cols, &current_car, candidate.push_from, obstacles, obstacle_count,
-            current_boxes, goal_count, path_buffer, path_capacity, out_steps);
+        // 根据策略选择车辆移动方式
+        int car_result;
+        if (use_global_pathfinding) {
+          // 使用全局BFS+A*直接移动
+          car_result = planner_v3_car_move_with_global_astar(
+              rows, cols, &current_car, candidate.push_from, obstacles, obstacle_count,
+              current_boxes, goal_count, path_buffer, path_capacity, out_steps);
+          
+          if (car_result == -7) {
+            return -7;  // 路径缓存不足
+          }
+          
+          if (car_result == 0) {
+            // 全局BFS+A*失败，回退状态，尝试下一个方向
+            current_car = car_before;
+            *out_steps = steps_before;
+            continue;
+          }
+        } else {
+          // 使用贪心+绕行策略
+          car_result = planner_v3_car_greedy_to_target(
+              rows, cols, &current_car, candidate.push_from, obstacles, obstacle_count,
+              current_boxes, goal_count, path_buffer, path_capacity, out_steps);
+        }
         
-        if (car_result == 0) {
+        if (car_result == 0 && !use_global_pathfinding) {
           // 贪心失败（遇障碍或重复），使用绕行
           current_car = car_before;
           *out_steps = steps_before;
