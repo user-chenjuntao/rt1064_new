@@ -810,7 +810,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
 
         Point push_from = {push_row, push_col};
         
-        // 【核心修改】使用全局BFS计算的真实距离
+        // 【核心修改】使用全局BFS计算的真实距离 - 箱子到目标
         int dist_after;
         int idx = new_box_row * cols + new_box_col;
         if (idx >= 0 && idx < rows * cols && target_dist[idx] != INT_MAX) {
@@ -835,8 +835,23 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           reverse_pen = power;
         }
         
-        // 考虑车到推箱位的距离（权重较小）
-        int car_to_push = planner_v3_bfs_manhattan(current_car, push_from);
+        // 【核心修改】使用BFS真实距离 - 车到推箱位
+        int car_to_push;
+        int car_to_push_dist[PLANNER_V3_BFS_MAX_CELLS];
+        if (planner_v3_bfs_global_bfs_from_target(rows, cols, push_from, obstacles, 
+                                                   obstacle_count, current_boxes, 
+                                                   goal_count, car_to_push_dist)) {
+          int car_idx = current_car.row * cols + current_car.col;
+          if (car_idx >= 0 && car_idx < rows * cols && car_to_push_dist[car_idx] != INT_MAX) {
+            car_to_push = car_to_push_dist[car_idx];
+          } else {
+            // 车无法到达推箱位，使用极大值
+            car_to_push = INT_MAX / 100;
+          }
+        } else {
+          // BFS失败，回退到曼哈顿距离估算
+          car_to_push = planner_v3_bfs_manhattan(current_car, push_from);
+        }
 
         int score = dist_after * 10 + adj_pen * 5 + reverse_pen + car_to_push * 2;
         
