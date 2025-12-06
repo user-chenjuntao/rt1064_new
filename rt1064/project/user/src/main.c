@@ -70,19 +70,19 @@ uint16 timer_box_cnt = 0;
 //	{3,7},{6,2},{6,6}
 //};
 
-PlannerPointV3 car = {1, 2};
-PlannerPointV3 boxes[3] = {
+PlannerPointV3_BFS car = {1, 2};
+PlannerPointV3_BFS boxes[3] = {
     {1, 7},  // 箱子1
     {7, 4},  // 箱子2
 	{10, 4}
 };
-PlannerPointV3 targets[3] = {
+PlannerPointV3_BFS targets[3] = {
     {9, 5},  // 目标池位A
     {9, 6},  // 目标池位B
     {9, 7}  // 预留额外目标位
 };  // 任意箱子可去任一未使用目标
 
-PlannerPointV3 obstacles[31] = {
+PlannerPointV3_BFS obstacles[31] = {
 
     {5, 1}, {6, 1}, {7, 1}, 
 	{8, 1}, {0, 7}, {2, 7},
@@ -101,7 +101,7 @@ PlannerPointV3 obstacles[31] = {
 //Point car = {5,1};
 size_t steps;
 int res;
-PlannerPointV3 path[GREEDY_AREA];
+PlannerPointV3_BFS path[GREEDY_AREA];
 
 int main(void)
 {
@@ -138,7 +138,7 @@ int main(void)
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
 
-	res = plan_boxes_greedy_v3(14, 10, car, boxes, 3,targets,3, obstacles, 31, path, GREEDY_AREA, &steps, NULL);
+	res = plan_boxes_greedy_v3_bfs(14, 10, car, boxes, 3,targets,3, obstacles, 31, path, GREEDY_AREA, &steps, NULL);
 	if (steps)
 	{
 		ips200_show_string(0, 16, "path init.");
