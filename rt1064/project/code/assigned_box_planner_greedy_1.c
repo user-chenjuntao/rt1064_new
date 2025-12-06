@@ -188,7 +188,7 @@ static int planner_v3_greedy_car_move(int rows, int cols, Point car, Point targe
   return 1;
 }
 
-// 贴着障碍物绕行（右手法则或左手法则）
+// BFS绕行：在限定区域内使用BFS搜索路径
 // allow_greedy_resume: 是否允许在绕行中途恢复贪心
 //   = 1: 车辆绕行模式 - 允许中途检测并恢复贪心（通畅后立即恢复）
 //   = 0: 箱子绕行模式 - 禁止中途打断，必须到达目标推箱位才停止
@@ -198,6 +198,8 @@ static int planner_v3_follow_obstacle_ex(int rows, int cols, Point start, Point 
                                          int prefer_right, int allow_greedy_resume,
                                          Point *path, size_t path_cap,
                                          size_t *path_len) {
+  (void)prefer_right;  // 新BFS实现不需要此参数
+  
   if (start.row == target.row && start.col == target.col) {
     if (path_cap < 1) return 0;
     path[0] = start;
@@ -205,78 +207,189 @@ static int planner_v3_follow_obstacle_ex(int rows, int cols, Point start, Point 
     return 1;
   }
   
-  const int dirs[4][2] = {{-1, 0}, {0, 1}, {1, 0}, {0, -1}};  // 上右下左
-  Point cur = start;
-  size_t steps = 0;
-  path[steps++] = cur;
+  // 计算搜索区域：以起点到终点的行、列距离+1为基础
+  int row_dist = planner_v3_abs(target.row - start.row);
+  int col_dist = planner_v3_abs(target.col - start.col);
   
-  int current_dir = 0;  // 初始朝上
-  uint8_t visited[PLANNER_V3_MAX_CELLS] = {0};
+  // 基础距离 = 行距离+1 和 列距离+1
+  int row_base = row_dist + 1;
+  int col_base = col_dist + 1;
+  
+  // 如果其中一个为0，则以另一个距离来画区域
+  if (col_dist == 0) {
+    col_base = row_base;
+  }
+  if (row_dist == 0) {
+    row_base = col_base;
+  }
+  
+  // 计算起点到地图边界的距离，如果基础距离超出边界则以边界为准
+  int dist_to_top = start.row;                    // 起点到上边界
+  int dist_to_bottom = rows - 1 - start.row;      // 起点到下边界
+  int dist_to_left = start.col;                   // 起点到左边界
+  int dist_to_right = cols - 1 - start.col;       // 起点到右边界
+  
+  // 限制基础距离不超过边界
+  if (row_base > dist_to_top) {
+    row_base = dist_to_top;
+  }
+  if (row_base > dist_to_bottom) {
+    row_base = dist_to_bottom;
+  }
+  if (col_base > dist_to_left) {
+    col_base = dist_to_left;
+  }
+  if (col_base > dist_to_right) {
+    col_base = dist_to_right;
+  }
+  
+  // 确定矩形搜索区域的边界
+  int min_row = start.row - row_base;
+  int max_row = start.row + row_base;
+  int min_col = start.col - col_base;
+  int max_col = start.col + col_base;
+  
+  // 分区限制：以起点行坐标为中点
+  // 确定终点在上半区还是下半区
+  int target_in_upper = (target.row < start.row);
+  
+  // 另一半区只保留2格行距离
+  if (target_in_upper) {
+    // 终点在上半区，下半区限制到start.row + 2
+    if (max_row > start.row + 2) {
+      max_row = start.row + 2;
+    }
+  } else {
+    // 终点在下半区或同行，上半区限制到start.row - 2
+    if (min_row < start.row - 2) {
+      min_row = start.row - 2;
+    }
+  }
+  
+  // 边界裁剪到网格范围内
+  if (min_row < 0) min_row = 0;
+  if (max_row >= rows) max_row = rows - 1;
+  if (min_col < 0) min_col = 0;
+  if (max_col >= cols) max_col = cols - 1;
+  
+  // BFS搜索
   int total_cells = rows * cols;
   if (total_cells > PLANNER_V3_MAX_CELLS) {
     total_cells = PLANNER_V3_MAX_CELLS;
   }
   
-  for (int iter = 0; iter < PLANNER_V3_OBSTACLE_FOLLOW_STEPS && steps < path_cap; ++iter) {
-    // 检查是否可以直接贪心到达目标（仅当允许时）
-    if (allow_greedy_resume) {
-      Point greedy_next;
-      if (planner_v3_greedy_car_move(rows, cols, cur, target, obstacles, obstacle_count,
-                                     boxes, box_count, &greedy_next)) {
-        int greedy_dist = planner_v3_manhattan(greedy_next, target);
-        int cur_dist = planner_v3_manhattan(cur, target);
-        if (greedy_dist < cur_dist) {
-          // 可以继续贪心，停止绕行（不添加贪心点，由调用方继续）
-          *path_len = steps;
-          return 1;
-        }
-      }
+  uint8_t visited[PLANNER_V3_MAX_CELLS];
+  int parent[PLANNER_V3_MAX_CELLS];  // 记录父节点用于回溯路径
+  int queue[PLANNER_V3_MAX_CELLS];
+  
+  memset(visited, 0, sizeof(visited));
+  for (int i = 0; i < total_cells; ++i) {
+    parent[i] = -1;
+  }
+  
+  int head = 0;
+  int tail = 0;
+  
+  int start_idx = start.row * cols + start.col;
+  queue[tail++] = start_idx;
+  visited[start_idx] = 1;
+  
+  int found_target = 0;
+  int target_idx = target.row * cols + target.col;
+  
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  
+  while (head < tail && !found_target) {
+    if (head >= PLANNER_V3_MAX_CELLS) break;
+    
+    int curr_idx = queue[head++];
+    int curr_row = curr_idx / cols;
+    int curr_col = curr_idx % cols;
+    
+    if (curr_idx == target_idx) {
+      found_target = 1;
+      break;
     }
     
-    // 贴障碍绕行：尝试右手法则或左手法则
-    int tried_dirs = 0;
-    int found = 0;
-    
-    while (tried_dirs < 4) {
-      int try_dir = prefer_right ? (current_dir + 4 - 1) % 4 : (current_dir + 1) % 4;
-      
-      for (int rot = 0; rot < 4; ++rot) {
-        int test_dir = (try_dir + (prefer_right ? rot : (4 - rot))) % 4;
-        int nr = cur.row + dirs[test_dir][0];
-        int nc = cur.col + dirs[test_dir][1];
-        
-        if (planner_v3_in_bounds(rows, cols, nr, nc) &&
-            !planner_v3_is_obstacle(obstacles, obstacle_count, nr, nc) &&
-            !planner_v3_is_box_at(boxes, box_count, nr, nc, box_count)) {
-          cur.row = nr;
-          cur.col = nc;
-          current_dir = test_dir;
-          found = 1;
+    // 检查是否可以贪心恢复（仅当允许时）
+    if (allow_greedy_resume) {
+      Point curr_pos = {curr_row, curr_col};
+      Point greedy_next;
+      if (planner_v3_greedy_car_move(rows, cols, curr_pos, target, obstacles, obstacle_count,
+                                     boxes, box_count, &greedy_next)) {
+        int greedy_dist = planner_v3_manhattan(greedy_next, target);
+        int curr_dist = planner_v3_manhattan(curr_pos, target);
+        if (greedy_dist < curr_dist) {
+          // 可以恢复贪心，回溯路径到当前位置，然后返回
+          found_target = 1;
+          target_idx = curr_idx;
           break;
         }
       }
+    }
+    
+    for (int d = 0; d < 4; ++d) {
+      int nr = curr_row + dirs[d][0];
+      int nc = curr_col + dirs[d][1];
       
-      if (found) break;
-      tried_dirs++;
-    }
-    
-    if (!found) {
-      *path_len = steps;
-      return 0;
-    }
-    
-    if (steps < path_cap) {
-      path[steps++] = cur;
-    }
-    
-    if (cur.row == target.row && cur.col == target.col) {
-      *path_len = steps;
-      return 1;
+      // 检查是否在搜索区域内
+      if (nr < min_row || nr > max_row || nc < min_col || nc > max_col) {
+        continue;
+      }
+      
+      // 检查是否在网格边界内
+      if (!planner_v3_in_bounds(rows, cols, nr, nc)) {
+        continue;
+      }
+      
+      // 检查是否是障碍物或箱子
+      if (planner_v3_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+        continue;
+      }
+      if (planner_v3_is_box_at(boxes, box_count, nr, nc, box_count)) {
+        continue;
+      }
+      
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) {
+        continue;
+      }
+      
+      if (!visited[next_idx]) {
+        visited[next_idx] = 1;
+        parent[next_idx] = curr_idx;
+        if (tail < PLANNER_V3_MAX_CELLS) {
+          queue[tail++] = next_idx;
+        }
+      }
     }
   }
   
-  *path_len = steps;
-  return 0;
+  if (!found_target) {
+    *path_len = 0;
+    return 0;
+  }
+  
+  // 回溯路径
+  int path_indices[PLANNER_V3_MAX_PATH_LEN];
+  int path_count = 0;
+  int idx = target_idx;
+  
+  while (idx != -1 && path_count < PLANNER_V3_MAX_PATH_LEN) {
+    path_indices[path_count++] = idx;
+    idx = parent[idx];
+  }
+  
+  // 反转路径（从起点到终点）
+  *path_len = 0;
+  for (int i = path_count - 1; i >= 0 && *path_len < path_cap; --i) {
+    int pidx = path_indices[i];
+    path[*path_len].row = pidx / cols;
+    path[*path_len].col = pidx % cols;
+    (*path_len)++;
+  }
+  
+  return (*path_len > 0) ? 1 : 0;
 }
 
 // 贴着障碍物绕行（包装函数，默认允许贪心恢复）
@@ -291,7 +404,7 @@ static int planner_v3_follow_obstacle(int rows, int cols, Point start, Point tar
 }
 
 // 贴着箱子绕行到另一个推箱位
-// 注意：整个绕行过程不会被贪心打断，必须完整到达有效的推箱位才返回
+// 策略：先尝试车辆模式（允许贪心恢复），如果未到达推箱位则使用箱子模式（禁止贪心恢复）
 static int planner_v3_follow_box_to_push_pos(int rows, int cols, Point car, Point box,
                                              Point target, const Point *obstacles,
                                              size_t obstacle_count, const Point *boxes,
@@ -358,10 +471,26 @@ static int planner_v3_follow_box_to_push_pos(int rows, int cols, Point car, Poin
   for (int try_idx = 0; try_idx < valid_count; ++try_idx) {
     Point target_push_pos = sorted_positions[try_idx].pos;
     
-    // 使用贴障碍绕行到目标推箱位，禁止中途贪心恢复
+    // 先使用车辆模式：允许贪心恢复，提高效率
     int detour_ok = planner_v3_follow_obstacle_ex(rows, cols, car, target_push_pos,
                                                   obstacles, obstacle_count, boxes, box_count,
-                                                  prefer_right, 0, path, path_cap, path_len);
+                                                  prefer_right, 1, path, path_cap, path_len);
+    
+    if (detour_ok && *path_len > 0) {
+      Point last = path[*path_len - 1];
+      if (last.row == target_push_pos.row && last.col == target_push_pos.col) {
+        // 成功到达推箱位
+        out_push_pos->row = target_push_pos.row;
+        out_push_pos->col = target_push_pos.col;
+        return 1;
+      }
+      // 车辆模式未到达推箱位，从起点重新尝试箱子模式
+    }
+    
+    // 使用箱子模式：禁止贪心恢复，确保到达推箱位
+    detour_ok = planner_v3_follow_obstacle_ex(rows, cols, car, target_push_pos,
+                                              obstacles, obstacle_count, boxes, box_count,
+                                              prefer_right, 0, path, path_cap, path_len);
     
     if (detour_ok && *path_len > 0) {
       Point last = path[*path_len - 1];
@@ -371,7 +500,7 @@ static int planner_v3_follow_box_to_push_pos(int rows, int cols, Point car, Poin
         return 1;
       }
     }
-    // 如果失败，继续尝试下一个推箱位
+    // 如果仍然失败，继续尝试下一个推箱位
   }
   
   // 所有有效推箱位都尝试过，仍然无法到达
@@ -648,6 +777,7 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
     int step_count = 0;
     int last_dr = 0;
     int last_dc = 0;
+    int reverse_count = 0;  // 连续反向移动次数
     
     Point recent_positions[PLANNER_V3_LOOP_WINDOW];
     for (int i = 0; i < PLANNER_V3_LOOP_WINDOW; ++i) {
@@ -705,37 +835,23 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
           continue;
         }
 
-        // 特殊情况：如果新位置就是目标点，简化检查逻辑
-        // 问题：箱子在目标点旁边，推最后一步时可能被错误阻止
-        // 原因：原来的代码对目标点也做障碍/箱子检测，但目标点：
-        //   1. 不应该是障碍（如果是，那是用户输入错误）
-        //   2. 即使有其他箱子，那个箱子应该已"消失"（标记为-1）
-        //   3. 不需要死点检测（已经是终点）
-        // 解决：只检查推箱位，不检查目标点本身
+        if (planner_v3_is_obstacle(obstacles, obstacle_count, new_box_row, new_box_col) ||
+            planner_v3_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+          continue;
+        }
+
+        if (planner_v3_is_box_at(current_boxes, goal_count, new_box_row, new_box_col,
+                      box_idx) ||
+            planner_v3_is_box_at(current_boxes, goal_count, push_row, push_col,
+                      box_idx)) {
+          continue;
+        }
+
+        // 特殊处理：如果推到目标点，跳过死点检测
         if (new_box_row == target.row && new_box_col == target.col) {
-          // 目标点不检查障碍，只检查推箱位是否可达
-          if (planner_v3_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
-            continue;  // 推箱位是障碍，无法推
-          }
-          if (planner_v3_is_box_at(current_boxes, goal_count, push_row, push_col, box_idx)) {
-            continue;  // 推箱位有其他箱子
-          }
-          // 推箱位OK，允许推进目标点（跳过死点检测和目标点检查）
+          // 推到目标点，不需要死点检测
         } else {
-          // 非目标点，正常检查
-          if (planner_v3_is_obstacle(obstacles, obstacle_count, new_box_row, new_box_col) ||
-              planner_v3_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
-            continue;
-          }
-
-          if (planner_v3_is_box_at(current_boxes, goal_count, new_box_row, new_box_col,
-                        box_idx) ||
-              planner_v3_is_box_at(current_boxes, goal_count, push_row, push_col,
-                        box_idx)) {
-            continue;
-          }
-
-          // 检查是否会死锁（非目标点才需要检查）
+          // 非目标点，进行严格的死点检测
           if (!planner_v3_can_reach_goal(rows, cols, obstacles, obstacle_count, 
                                          current_boxes, goal_count, box_idx,
                                          (Point){new_box_row, new_box_col}, target)) {
@@ -750,9 +866,21 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
             rows, cols, obstacles, obstacle_count, current_boxes, goal_count,
             box_idx, new_box_row, new_box_col);
 
-        int reverse_pen = (last_dr == -dirs[i][0] && last_dc == -dirs[i][1]) ? 50 : 0;
+        // 反向移动惩罚：5的n次方，n为连续反向次数
+        int reverse_pen = 0;
+        if (last_dr == -dirs[i][0] && last_dc == -dirs[i][1]) {
+          // 计算5的(reverse_count+1)次方
+          int power = 5;
+          for (int p = 0; p < reverse_count; ++p) {
+            power *= 5;
+          }
+          reverse_pen = power;
+        }
+        
+        // 新增：考虑车到推箱位的距离（权重较小，避免过度影响箱子到目标的距离）
+        int car_to_push = planner_v3_manhattan(current_car, push_from);
 
-        int score = dist_after + adj_pen * 5 + reverse_pen;
+        int score = dist_after * 10 + adj_pen * 5 + reverse_pen + car_to_push * 2;
         
         candidates[i].dist = dist_after;
         candidates[i].adj_pen = adj_pen;
@@ -847,6 +975,41 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
         Point car_before = current_car;
         size_t steps_before = *out_steps;
         
+        // 特殊情况：车已经在推箱位，无需移动
+        if (current_car.row == candidate.push_from.row && 
+            current_car.col == candidate.push_from.col) {
+          // 车已在推箱位，但需确保路径连续性
+          // 检查路径缓冲区的最后一个点是否是当前车位置
+          if (*out_steps == 0) {
+            // 路径为空，添加车的当前位置作为起点
+            if (*out_steps >= path_capacity) {
+              return -7;
+            }
+            path_buffer[(*out_steps)++] = current_car;
+          } else {
+            Point last = path_buffer[*out_steps - 1];
+            if (last.row != current_car.row || last.col != current_car.col) {
+              // 最后一个点不是车当前位置，检查是否相邻
+              if (!planner_v3_check_adjacent(last, current_car)) {
+                // 不相邻，这个方向不可行
+                current_car = car_before;
+                *out_steps = steps_before;
+                continue;
+              }
+              // 相邻但不同，添加车的当前位置
+              if (*out_steps >= path_capacity) {
+                return -7;
+              }
+              path_buffer[(*out_steps)++] = current_car;
+            }
+            // 如果last就是current_car，不需要添加
+          }
+          // 车已在推箱位，直接成功
+          chosen = candidate;
+          push_success = 1;
+          break;
+        }
+        
         // 尝试贪心移动车到推箱位
         int car_result = planner_v3_car_greedy_to_target(
             rows, cols, &current_car, candidate.push_from, obstacles, obstacle_count,
@@ -859,15 +1022,34 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
           
           Point detour_path[256];
           size_t detour_len = 0;
+          int detour_ok = 0;
           
-          int detour_ok = planner_v3_follow_obstacle(
+          // 第一次尝试：车辆模式（允许贪心恢复，提高效率）
+          detour_ok = planner_v3_follow_obstacle_ex(
               rows, cols, current_car, candidate.push_from, obstacles, obstacle_count,
-              current_boxes, goal_count, 1, detour_path, 256, &detour_len);
+              current_boxes, goal_count, 1, 1, detour_path, 256, &detour_len);
           
+          // 验证是否到达推箱位
+          if (detour_ok && detour_len > 0) {
+            Point last = detour_path[detour_len - 1];
+            if (last.row != candidate.push_from.row || last.col != candidate.push_from.col) {
+              // 车辆模式未到达推箱位，从起点重新尝试箱子模式
+              detour_ok = 0;
+            }
+          }
+          
+          // 第二次尝试：箱子模式（禁止贪心恢复，确保到达推箱位）
           if (!detour_ok || detour_len == 0) {
-            detour_ok = planner_v3_follow_obstacle(
+            detour_ok = planner_v3_follow_obstacle_ex(
                 rows, cols, current_car, candidate.push_from, obstacles, obstacle_count,
-                current_boxes, goal_count, 0, detour_path, 256, &detour_len);
+                current_boxes, goal_count, 1, 0, detour_path, 256, &detour_len);
+          }
+          
+          // 第三次尝试：换个方向的箱子模式
+          if (!detour_ok || detour_len == 0) {
+            detour_ok = planner_v3_follow_obstacle_ex(
+                rows, cols, current_car, candidate.push_from, obstacles, obstacle_count,
+                current_boxes, goal_count, 0, 0, detour_path, 256, &detour_len);
           }
           
           if (!detour_ok || detour_len == 0) {
@@ -957,6 +1139,15 @@ static int planner_v3_run_assigned(int rows, int cols, Point car,
       }
       path_buffer[(*out_steps)++] = current_car;
 
+      // 更新反向移动计数
+      if (last_dr == -chosen.dr && last_dc == -chosen.dc && (last_dr != 0 || last_dc != 0)) {
+        // 本次移动是反向移动
+        reverse_count++;
+      } else {
+        // 不是反向移动，重置计数器
+        reverse_count = 0;
+      }
+      
       last_dr = chosen.dr;
       last_dc = chosen.dc;
     }
