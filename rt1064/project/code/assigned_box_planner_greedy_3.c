@@ -417,10 +417,25 @@ static int planner_v3_bomb_calc_plan_path(int rows, int cols, Point car,
       Point single_box = all_items[i];
       Point single_target = all_targets[i];
       
+      // 将其余未处理的箱子当作障碍物
+      Point temp_obstacles_with_boxes[MAX_OBSTACLES_V3];
+      size_t temp_obstacle_count = current_obstacle_count;
+      if (temp_obstacle_count > MAX_OBSTACLES_V3) {
+        temp_obstacle_count = MAX_OBSTACLES_V3;
+      }
+      memcpy(temp_obstacles_with_boxes, g_current_obstacles, temp_obstacle_count * sizeof(Point));
+      
+      // 添加后续未处理的箱子（不是炸弹）作为障碍
+      for (size_t j = i + 1; j < all_count && temp_obstacle_count < MAX_OBSTACLES_V3; ++j) {
+        if (!is_bomb[j]) {
+          temp_obstacles_with_boxes[temp_obstacle_count++] = all_items[j];
+        }
+      }
+      
       int ret = plan_boxes_greedy_v3_bfs(rows, cols, current_car,
                                           &single_box, 1,
                                           &single_target, 1,
-                                          g_current_obstacles, current_obstacle_count,
+                                          temp_obstacles_with_boxes, temp_obstacle_count,
                                           g_temp_path, 512, &temp_steps, NULL);
       if (ret != 0) {
         return ret;
@@ -477,13 +492,17 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
                                                obstacle_count, g_baseline_path, 2048,
                                                &baseline_steps, out_box_target_indices);
   
+  // 记录最优方案信息
   size_t best_steps = SIZE_MAX;
   ExecutionPlan best_plan = {0};
-  int best_has_plan = 0;
+  int best_has_plan = 0;           // 是否有任何成功的方案
+  int best_uses_bomb = 0;          // 最优方案是否使用炸弹
+  int baseline_success = (baseline_ret == 0);  // baseline是否成功
   
-  if (baseline_ret == 0) {
+  if (baseline_success) {
     best_steps = baseline_steps;
     best_has_plan = 1;
+    best_uses_bomb = 0;  // baseline不使用炸弹
   }
   
   // 如果没有炸弹，直接返回基准路径
@@ -557,10 +576,15 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
         continue;  // 中心不是障碍，跳过
       }
       
-      // 优化的距离剪枝：根据地图大小动态调整
-      int dist = planner_v3_bomb_manhattan(bombs[bi], segments[si].center);
-      int max_dist = (rows + cols) / 2;  // 动态阈值
-      if (dist > max_dist) {
+      // 【优化】距离剪枝：考虑炸弹的最佳推位，而不是直接距离
+      // 计算炸弹到炸段中心的基础距离（用于初步筛选）
+      int bomb_to_target_dist = planner_v3_bomb_manhattan(bombs[bi], segments[si].center);
+      
+      // 动态阈值：允许一定的绕路空间
+      int max_dist = (rows + cols) / 2 + 5;  // 适当放宽阈值
+      
+      // 初步距离剪枝（避免明显不合理的组合）
+      if (bomb_to_target_dist > max_dist) {
         continue;  // 距离太远，跳过
       }
       
@@ -629,6 +653,20 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
               temp_obstacles[obstacle_count_for_step++] = g_current_obstacles[k];
             }
             obstacles_for_step = temp_obstacles;
+          } else {
+            // 普通箱子：将其余未处理的箱子当作障碍物
+            obstacle_count_for_step = 0;
+            // 先复制当前障碍物
+            for (size_t k = 0; k < current_obstacle_count_test && obstacle_count_for_step < MAX_OBSTACLES_V3; ++k) {
+              temp_obstacles[obstacle_count_for_step++] = g_current_obstacles[k];
+            }
+            // 添加后续未处理的箱子（不是炸弹）作为障碍
+            for (size_t j = ti + 1; j < test_count && obstacle_count_for_step < MAX_OBSTACLES_V3; ++j) {
+              if (!test_is_bomb[j]) {
+                temp_obstacles[obstacle_count_for_step++] = test_items[j];
+              }
+            }
+            obstacles_for_step = temp_obstacles;
           }
 
           int ret = plan_boxes_greedy_v3_bfs(rows, cols, current_car_test,
@@ -662,8 +700,9 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
           best_steps = test_steps;
           best_plan = test_plan;
           best_has_plan = 1;
+          best_uses_bomb = 1;  // 标记使用了炸弹
           
-          // 保存最优路径
+          // 保存最优路径（炸弹方案）
           size_t copy_len = test_steps < path_capacity ? test_steps : path_capacity;
           memcpy(path_buffer, g_test_path, copy_len * sizeof(Point));
           *out_steps = copy_len;
@@ -689,24 +728,30 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
   }
   
 finish_enumeration:
-  // 用户要求：优先返回炸弹方案（包含推炸弹路径）
+  // 决策逻辑：
+  // 1. 优先选择无错误的方案（baseline vs 炸弹方案）
+  // 2. 如果都成功，选择步数少的
+  // 3. 如果只有一个成功，选择成功的
+  // 4. 如果都失败，返回baseline的错误码
+  
   if (best_has_plan) {
-    // 炸弹方案成功（路径已包含推炸弹步骤）
-    return 0;
-  }
-  
-  // 炸弹方案失败，返回baseline作为后备
-  if (baseline_ret == 0) {
-    size_t copy_len = baseline_steps < path_capacity ? baseline_steps : path_capacity;
-    memcpy(path_buffer, g_baseline_path, copy_len * sizeof(Point));
-    *out_steps = copy_len;
-    if (out_used_bomb_count) {
-      *out_used_bomb_count = 0;  // baseline不使用炸弹
+    // 有至少一个成功的方案
+    
+    // 如果最优方案是baseline（不使用炸弹），需要复制baseline路径
+    if (!best_uses_bomb) {
+      size_t copy_len = baseline_steps < path_capacity ? baseline_steps : path_capacity;
+      memcpy(path_buffer, g_baseline_path, copy_len * sizeof(Point));
+      *out_steps = copy_len;
+      if (out_used_bomb_count) {
+        *out_used_bomb_count = 0;  // baseline不使用炸弹
+      }
     }
+    // 如果使用炸弹，路径已经在枚举时保存到path_buffer了（700-703行）
+    
     return 0;
   }
   
-  // 两种方案都失败
+  // 两种方案都失败，返回baseline的错误码
   return baseline_ret;
 }
 
