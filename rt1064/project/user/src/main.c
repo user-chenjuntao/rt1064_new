@@ -70,19 +70,19 @@ uint16 timer_box_cnt = 0;
 //	{3,7},{6,2},{6,6}
 //};
 
-PlannerPointV3_BFS car = {1, 2};
-PlannerPointV3_BFS boxes[3] = {
-    {1, 7},  // 箱子1
+PlannerPointV3_Bomb car = {1, 2};
+PlannerPointV3_Bomb boxes[3] = {
+    {6, 7},  // 箱子1
     {7, 4},  // 箱子2
 	{10, 4}
 };
-PlannerPointV3_BFS targets[3] = {
+PlannerPointV3_Bomb targets[3] = {
     {9, 5},  // 目标池位A
     {9, 6},  // 目标池位B
     {9, 7}  // 预留额外目标位
 };  // 任意箱子可去任一未使用目标
 
-PlannerPointV3_BFS obstacles[31] = {
+PlannerPointV3_Bomb obstacles[32] = {
 
     {5, 1}, {6, 1}, {7, 1}, 
 	{8, 1}, {0, 7}, {2, 7},
@@ -94,14 +94,19 @@ PlannerPointV3_BFS obstacles[31] = {
 	{12, 7},{12, 6},{12, 5},
 	{12, 4},{12, 3},{11, 3},
 	{10, 3},{10, 6},{10, 5},
-	{1, 9}
+	{1, 9},{1,7}
 
 };//
+
+PlannerPointV3_Bomb bombs[1] = {{3, 3}};
 	//
 //Point car = {5,1};
 size_t steps;
 int res;
-PlannerPointV3_BFS path[GREEDY_AREA];
+PlannerPointV3_Bomb path[GREEDY_AREA];
+size_t used_bomb_count = 0;
+size_t box_target_mapping[3];
+size_t used_bombs[1];
 
 int main(void)
 {
@@ -138,10 +143,14 @@ int main(void)
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
 
-	res = plan_boxes_greedy_v3_bfs(14, 10, car, boxes, 3,targets,3, obstacles, 31, path, GREEDY_AREA, &steps, NULL);
-	if (steps)
+	res = plan_boxes_with_bombs_v3(15, 11, car, boxes, 3,targets,3,bombs,1 ,obstacles, 32, path, GREEDY_AREA, &steps, box_target_mapping, used_bombs, &used_bomb_count);
+	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
+	}
+	else
+	{
+		ips200_show_string(0, 16, "path reinit.");
 	}
 //	system_delay_ms(1000);
 	imu963ra_init();
