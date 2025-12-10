@@ -636,7 +636,7 @@ static int planner_v3_bfs_validate_push_positions(int rows, int cols,
                                               const Point *boxes, size_t box_count,
                                               size_t moving_idx) {
   if (!path_info || path_info->len < 2) {
-    return 0;
+    return 1;
   }
 
   for (size_t step = 1; step < path_info->len; ++step) {
@@ -837,6 +837,248 @@ static int planner_v3_bfs_execute_single_box_path(int rows, int cols, size_t box
     current_boxes[box_idx] = next;
     *current_car = old_pos;
     path_buffer[(*out_steps)++] = *current_car;
+  }
+
+  current_boxes[box_idx].row = -1;
+  current_boxes[box_idx].col = -1;
+  return 0;
+}
+
+static int planner_v3_bfs_push_single_box_scored(
+    int rows, int cols, size_t box_idx, size_t target_idx, const Point *targets,
+    const Point *obstacles, size_t obstacle_count, Point *current_car, Point *current_boxes,
+    size_t box_count, Point *path_buffer, size_t path_capacity, size_t *out_steps) {
+  if (target_idx == SIZE_MAX) {
+    return -6;
+  }
+  Point target = targets[target_idx];
+  Point box = current_boxes[box_idx];
+  if (box.row == target.row && box.col == target.col) {
+    current_boxes[box_idx].row = -1;
+    current_boxes[box_idx].col = -1;
+    return 0;
+  }
+
+  int target_dist[PLANNER_V3_BFS_MAX_CELLS];
+  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
+                                             current_boxes, box_count, target_dist)) {
+    return -6;
+  }
+
+  int step_count = 0;
+  int last_dr = 0;
+  int last_dc = 0;
+  int reverse_count = 0;
+
+  while (box.row != target.row || box.col != target.col) {
+    if (step_count++ >= PLANNER_V3_BFS_MAX_GREEDY_STEPS) {
+      return -5;
+    }
+
+    typedef struct {
+      int dr;
+      int dc;
+      int dist;
+      int adj_pen;
+      int score;
+      int feasible;
+      Point push_from;
+      Point box_next;
+    } DirCandidate;
+
+    DirCandidate candidates[4];
+    const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+
+    for (int i = 0; i < 4; ++i) {
+      candidates[i].dr = dirs[i][0];
+      candidates[i].dc = dirs[i][1];
+      candidates[i].feasible = 0;
+      candidates[i].score = INT_MAX;
+
+      int new_box_row = box.row + dirs[i][0];
+      int new_box_col = box.col + dirs[i][1];
+      int push_row = box.row - dirs[i][0];
+      int push_col = box.col - dirs[i][1];
+
+      if (!planner_v3_bfs_in_bounds(rows, cols, new_box_row, new_box_col) ||
+          !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
+        continue;
+      }
+
+      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_box_row, new_box_col) ||
+          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+        continue;
+      }
+
+      if (planner_v3_bfs_is_box_at(current_boxes, box_count, new_box_row, new_box_col, box_idx) ||
+          planner_v3_bfs_is_box_at(current_boxes, box_count, push_row, push_col, box_idx)) {
+        continue;
+      }
+
+      if (new_box_row == target.row && new_box_col == target.col) {
+        // ok
+      } else {
+        if (!planner_v3_bfs_can_reach_goal(rows, cols, obstacles, obstacle_count, current_boxes,
+                                           box_count, box_idx, (Point){new_box_row, new_box_col},
+                                           target)) {
+          continue;
+        }
+      }
+
+      Point push_from = {push_row, push_col};
+
+      int dist_after;
+      int idx = new_box_row * cols + new_box_col;
+      if (idx >= 0 && idx < rows * cols && target_dist[idx] != INT_MAX) {
+        dist_after = target_dist[idx];
+      } else {
+        dist_after = INT_MAX / 100;
+      }
+
+      int adj_pen = planner_v3_bfs_adjacent_blockers(rows, cols, obstacles, obstacle_count,
+                                                     current_boxes, box_count, box_idx,
+                                                     new_box_row, new_box_col);
+
+      int reverse_pen = 0;
+      if (last_dr == -dirs[i][0] && last_dc == -dirs[i][1]) {
+        int power = 5;
+        for (int p = 0; p < reverse_count; ++p) {
+          power *= 5;
+        }
+        reverse_pen = power;
+      }
+
+      int car_to_push;
+      int car_to_push_dist[PLANNER_V3_BFS_MAX_CELLS];
+      if (planner_v3_bfs_global_bfs_from_target(rows, cols, push_from, obstacles, obstacle_count,
+                                                current_boxes, box_count, car_to_push_dist)) {
+        int car_idx = current_car->row * cols + current_car->col;
+        if (car_idx >= 0 && car_idx < rows * cols && car_to_push_dist[car_idx] != INT_MAX) {
+          car_to_push = car_to_push_dist[car_idx];
+        } else {
+          car_to_push = INT_MAX / 100;
+        }
+      } else {
+        car_to_push = planner_v3_bfs_manhattan(*current_car, push_from);
+      }
+
+      int score = dist_after * 10 + adj_pen * 5 + reverse_pen + car_to_push * 2;
+
+      candidates[i].dist = dist_after;
+      candidates[i].adj_pen = adj_pen;
+      candidates[i].score = score;
+      candidates[i].feasible = 1;
+      candidates[i].push_from = push_from;
+      candidates[i].box_next.row = new_box_row;
+      candidates[i].box_next.col = new_box_col;
+    }
+
+    int sorted_dirs[4];
+    int sorted_count = 0;
+    for (int i = 0; i < 4; ++i) {
+      if (candidates[i].feasible) {
+        sorted_dirs[sorted_count++] = i;
+      }
+    }
+    for (int i = 0; i < sorted_count - 1; ++i) {
+      for (int j = 0; j < sorted_count - 1 - i; ++j) {
+        if (candidates[sorted_dirs[j]].score > candidates[sorted_dirs[j + 1]].score) {
+          int tmp = sorted_dirs[j];
+          sorted_dirs[j] = sorted_dirs[j + 1];
+          sorted_dirs[j + 1] = tmp;
+        }
+      }
+    }
+
+    if (sorted_count == 0) {
+      return -6;
+    }
+
+    int push_success = 0;
+    DirCandidate chosen;
+    for (int try_idx = 0; try_idx < sorted_count; ++try_idx) {
+      int dir_idx = sorted_dirs[try_idx];
+      DirCandidate candidate = candidates[dir_idx];
+
+      Point car_before = *current_car;
+      size_t steps_before = *out_steps;
+
+      if (current_car->row == candidate.push_from.row &&
+          current_car->col == candidate.push_from.col) {
+        if (*out_steps == 0) {
+          if (*out_steps >= path_capacity) {
+            return -7;
+          }
+          path_buffer[(*out_steps)++] = *current_car;
+        } else {
+          Point last = path_buffer[*out_steps - 1];
+          if (last.row != current_car->row || last.col != current_car->col) {
+            if (!planner_v3_bfs_check_adjacent(last, *current_car)) {
+              *current_car = car_before;
+              *out_steps = steps_before;
+              continue;
+            }
+            if (*out_steps >= path_capacity) {
+              return -7;
+            }
+            path_buffer[(*out_steps)++] = *current_car;
+          }
+        }
+        chosen = candidate;
+        push_success = 1;
+        break;
+      }
+
+      int car_result = planner_v3_bfs_car_move_with_global_astar(
+          rows, cols, current_car, candidate.push_from, obstacles, obstacle_count, current_boxes,
+          box_count, path_buffer, path_capacity, out_steps);
+      if (car_result == -7) {
+        return -7;
+      }
+      if (car_result == 0) {
+        *current_car = car_before;
+        *out_steps = steps_before;
+        continue;
+      }
+      chosen = candidate;
+      push_success = 1;
+      break;
+    }
+
+    if (!push_success) {
+      return -6;
+    }
+
+    if (current_car->row != chosen.push_from.row || current_car->col != chosen.push_from.col) {
+      return -6;
+    }
+
+    int dist_to_box = planner_v3_bfs_manhattan(*current_car, box);
+    if (dist_to_box != 1) {
+      return -6;
+    }
+
+    Point box_old_pos = box;
+    box = chosen.box_next;
+    current_boxes[box_idx] = box;
+
+    *current_car = box_old_pos;
+    if (*out_steps >= path_capacity) {
+      return -7;
+    }
+    if (*out_steps > 0 &&
+        !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], *current_car)) {
+      return -6;
+    }
+    path_buffer[(*out_steps)++] = *current_car;
+
+    if (last_dr == -chosen.dr && last_dc == -chosen.dc && (last_dr != 0 || last_dc != 0)) {
+      reverse_count++;
+    } else {
+      reverse_count = 0;
+    }
+    last_dr = chosen.dr;
+    last_dc = chosen.dc;
   }
 
   current_boxes[box_idx].row = -1;
@@ -1112,17 +1354,58 @@ static int planner_v3_bfs_push_primary_with_chain(
     }
   }
 
+  int has_secondary = 0;
+  for (size_t s = 0; s < box_count; ++s) {
+    if (overlaps[s].valid && overlaps[s].primary == primary_idx) {
+      has_secondary = 1;
+      break;
+    }
+  }
+
+  if (!has_secondary) {
+    return planner_v3_bfs_push_single_box_scored(
+        rows, cols, primary_idx, box_targets[primary_idx], targets, obstacles, obstacle_count,
+        current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+  }
+
   for (size_t step = 1; step < path->len; ++step) {
     Point curr = current_boxes[primary_idx];
     Point next = path->path[step];
     Point dir = {next.row - curr.row, next.col - curr.col};
     Point push_pos = {curr.row - dir.row, curr.col - dir.col};
+    int retried = 0;
 
+retry_push:
     if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
         planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col) ||
         planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos.row, push_pos.col,
                                  primary_idx)) {
-      return -6;
+      if (retried) {
+        return -6;
+      }
+      Point detour_path[256];
+      size_t detour_len = 0;
+      Point new_push_pos;
+      int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
+          rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
+          box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
+      if (!detour_ok || detour_len == 0) {
+        return -6;
+      }
+      for (size_t i = 1; i < detour_len; ++i) {
+        if (*out_steps >= path_capacity) {
+          return -7;
+        }
+        if (*out_steps > 0 &&
+            !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
+          return -6;
+        }
+        path_buffer[(*out_steps)++] = detour_path[i];
+      }
+      *current_car = detour_path[detour_len - 1];
+      push_pos = *current_car;
+      retried = 1;
+      goto retry_push;
     }
 
     int car_result = planner_v3_bfs_car_move_with_global_astar(
@@ -1132,7 +1415,32 @@ static int planner_v3_bfs_push_primary_with_chain(
       return -7;
     }
     if (car_result == 0) {
-      return -6;
+      if (retried) {
+        return -6;
+      }
+      Point detour_path[256];
+      size_t detour_len = 0;
+      Point new_push_pos;
+      int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
+          rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
+          box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
+      if (!detour_ok || detour_len == 0) {
+        return -6;
+      }
+      for (size_t i = 1; i < detour_len; ++i) {
+        if (*out_steps >= path_capacity) {
+          return -7;
+        }
+        if (*out_steps > 0 &&
+            !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
+          return -6;
+        }
+        path_buffer[(*out_steps)++] = detour_path[i];
+      }
+      *current_car = detour_path[detour_len - 1];
+      push_pos = *current_car;
+      retried = 1;
+      goto retry_push;
     }
 
     if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
