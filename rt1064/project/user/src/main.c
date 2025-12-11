@@ -70,24 +70,22 @@ uint16 timer_box_cnt = 0;
 //	{3,7},{6,2},{6,6}
 //};
 
-PlannerPointV3_Bomb car = {1, 2};
-PlannerPointV3_Bomb boxes[3] = {
-    {6, 7},  // 箱子1
-    {7, 4},  // 箱子2
-	{10, 4}
+PlannerPointV3_BFS car = {1, 2};
+PlannerPointV3_BFS boxes[3] = {
+    {6, 2},  // ??×ó1
+    {7, 2},  // ??×ó2
+	{8, 2}
 };
-PlannerPointV3_Bomb targets[3] = {
-    {9, 5},  // 目标池位A
-    {9, 6},  // 目标池位B
-    {9, 7}  // 预留额外目标位
-};  // 任意箱子可去任一未使用目标
+PlannerPointV3_BFS targets[3] = {
+    {9, 5},  // ??±ê3???A
+    {9, 6},  // ??±ê3???B
+    {9, 7}  // ?¤á???ía??±ê??
+};  // è?òa??×ó?éè￥è?ò??′ê1ó???±ê
 
-PlannerPointV3_Bomb obstacles[32] = {
+PlannerPointV3_BFS obstacles[25] = {
 
-    {5, 1}, {6, 1}, {7, 1}, 
-	{8, 1}, {0, 7}, {2, 7},
+	{0, 7}, {2, 7},
 	{3, 7}, {4, 7}, {4, 6}, 
-	{4, 5}, {5, 5}, {6, 5},
 	{7, 5}, {8, 5}, {8, 6},
 	{8, 7}, {8, 8}, {9, 8},
 	{10, 8},{11, 8},{12, 8},
@@ -103,7 +101,7 @@ PlannerPointV3_Bomb bombs[1] = {{3, 3}};
 //Point car = {5,1};
 size_t steps;
 int res;
-PlannerPointV3_Bomb path[GREEDY_AREA];
+PlannerPointV3_BFS path[GREEDY_AREA];
 size_t used_bomb_count = 0;
 size_t box_target_mapping[3];
 size_t used_bombs[1];
@@ -143,7 +141,7 @@ int main(void)
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
 
-	res = plan_boxes_with_bombs_v3(15, 11, car, boxes, 3,targets,3,bombs,1 ,obstacles, 32, path, GREEDY_AREA, &steps, box_target_mapping, used_bombs, &used_bomb_count);
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
@@ -171,11 +169,14 @@ int main(void)
 		process_blob_data();
 		color_distance_handle();
         // 此处编写需要循环执行的代码
+		/*
 		if(mt9v03x_finish_flag)
 		{
 			image_process();
 			mt9v03x_finish_flag=0;
 		}
+		*/
+		
 		
 		
         menu_switch();
@@ -216,33 +217,23 @@ void pit_0_handler (void)
 
 void pit_1_handler (void)
 {
-    encoder_data_1 = encoder_get_count(ENCODER_1);                              // 获取编码器计数
-    encoder_clear_count(ENCODER_1);                                             // 清空编码器计数
+//    encoder_read_filtered(&encoder_data_1, &encoder_data_2, &encoder_data_3, &encoder_data_4);
 
-    encoder_data_2 = -encoder_get_count(ENCODER_2);                              // 获取编码器计数
-    encoder_clear_count(ENCODER_2);                                             // 清空编码器计数
+    speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
+
+    if (car_go_flag == 1 && car_stop_flag == 0)
+    {//修改位置在这里
+        motor_control(speed_encoder);
+    }
+    else if (car_go_flag == 1 && car_stop_flag == 1)
+    {
+        motor_control(car_stop_array);
+    }
+    else
+    {
+        motor_pwm(0,0,0,0);
+    }
     
-    encoder_data_3 = -encoder_get_count(ENCODER_3);                              // 获取编码器计数
-    encoder_clear_count(ENCODER_3);                                             // 清空编码器计数
-
-    encoder_data_4 = encoder_get_count(ENCODER_4);                              // 获取编码器计数
-    encoder_clear_count(ENCODER_4);                                             // 清空编码器计数
-	
-	speed_strategy();
-	
-	if (car_go_flag == 1 && car_stop_flag == 0)
-	{
-		motor_control(speed_encoder);
-	}
-	else if (car_go_flag == 1 && car_stop_flag == 1)
-	{
-		motor_control(car_stop_array);
-	}
-	else
-	{
-		motor_pwm(0,0,0,0);
-	}
-	
 }
 
 void pit_2_handler (void)

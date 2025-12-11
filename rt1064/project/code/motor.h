@@ -61,8 +61,8 @@ int Limit_int(int left_limit, int target_num, int right_limit);
 void motor_pwm(int up_left_speed,int up_right_speed,int down_left_speed,int down_right_speed);
 void motor_control(int* input_speed_encoder);
 
-void encoder_read_filtered(int *enc1, int *enc2, int *enc3, int *enc4);
-
+//void encoder_read_filtered(int *enc1, int *enc2, int *enc3, int *enc4);
+int16 Lowpass(int16 X_last,int16 X_new);
 void Kinematics_Init(void);
 void Kinematics_Inverse(int* input, int* output);
 
