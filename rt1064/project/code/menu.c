@@ -38,11 +38,11 @@ typedef struct
     uint8 flash_result;
 } menu_runtime_t;
 
-float level[5] = {100, 10, 1, 0.1f, 0.01f};
-uint8 level_i = 2;                // 默认步进设为1，避免上电误调过大
-menu_runtime_t menu_rt = {0};     // 菜单运行时状态
-uint8 display_mode = 0;           // 0:调试模式(刷新) 1:高速模式(发车后不刷新)
-uint8 path_index_visible = 1;     // 路径序号显示开关
+static const float level[] = {100, 10, 1, 0.1f, 0.01f};
+static uint8 level_i = 2;                // 默认步进设为1，避免上电误调过大
+static menu_runtime_t menu_rt = {0};     // 菜单运行时状态
+static uint8 display_mode = 0;           // 0:调试模式(刷新) 1:高速模式(发车后不刷新)
+static uint8 path_index_visible = 1;     // 路径序号显示开关
 extern int encoder_data_1;
 extern int encoder_data_2;
 extern int encoder_data_3;
@@ -114,72 +114,72 @@ void draw_image_preview(void);
 void draw_display_mode(void);
 
 // menu tree definitions
-menu_item_t main_menu;
-menu_item_t cargo_menu;
-menu_item_t param_menu;
-menu_item_t param_speed_menu;
-menu_item_t param_servo_menu;
-menu_item_t param_pid_menu;
-menu_item_t status_menu;
-menu_item_t status_flash_menu;
-menu_item_t status_imu_view;
-menu_item_t image_menu;
-menu_item_t display_menu;
+static menu_item_t main_menu;
+static menu_item_t cargo_menu;
+static menu_item_t param_menu;
+static menu_item_t param_speed_menu;
+static menu_item_t param_servo_menu;
+static menu_item_t param_pid_menu;
+static menu_item_t status_menu;
+static menu_item_t status_flash_menu;
+static menu_item_t status_imu_view;
+static menu_item_t image_menu;
+static menu_item_t display_menu;
 
-menu_item_t cargo_start_item;
-menu_item_t cargo_stop_item;
+static menu_item_t cargo_start_item;
+static menu_item_t cargo_stop_item;
 
-menu_item_t base_speed_item;
-menu_item_t turn_speed_item;
-menu_item_t speed_k_item;
-menu_item_t speed_limit_item;
-menu_item_t yuanhuan_speed_item;
-menu_item_t gyro_kp_item;
-menu_item_t gyro_ki_item;
-menu_item_t gyro_kd_item;
+static menu_item_t base_speed_item;
+static menu_item_t turn_speed_item;
+static menu_item_t speed_k_item;
+static menu_item_t speed_limit_item;
+static menu_item_t yuanhuan_speed_item;
+static menu_item_t gyro_kp_item;
+static menu_item_t gyro_ki_item;
+static menu_item_t gyro_kd_item;
 
-menu_item_t up_left_speed_item;
-menu_item_t up_right_speed_item;
-menu_item_t down_left_speed_item;
-menu_item_t down_right_speed_item;
-menu_item_t start_acc_item;
-menu_item_t end_decel_item;
-menu_item_t slow_turn_item;
-menu_item_t turn_num_item;
+static menu_item_t up_left_speed_item;
+static menu_item_t up_right_speed_item;
+static menu_item_t down_left_speed_item;
+static menu_item_t down_right_speed_item;
+static menu_item_t start_acc_item;
+static menu_item_t end_decel_item;
+static menu_item_t slow_turn_item;
+static menu_item_t turn_num_item;
 
-menu_item_t yaw_kp_item;
-menu_item_t yaw_ki_item;
-menu_item_t yaw_kd_item;
-menu_item_t camx_kp_item;
-menu_item_t camx_ki_item;
-menu_item_t camx_kd_item;
-menu_item_t camy_kp_item;
-menu_item_t camy_ki_item;
-menu_item_t camy_kd_item;
+static menu_item_t yaw_kp_item;
+static menu_item_t yaw_ki_item;
+static menu_item_t yaw_kd_item;
+static menu_item_t camx_kp_item;
+static menu_item_t camx_ki_item;
+static menu_item_t camx_kd_item;
+static menu_item_t camy_kp_item;
+static menu_item_t camy_ki_item;
+static menu_item_t camy_kd_item;
 
-menu_item_t status_camera_view;
-menu_item_t status_path_view;
-menu_item_t status_pid_view;
-menu_item_t flash_save_item;
-menu_item_t flash_load_item;
-menu_item_t flash_clear_item;
+static menu_item_t status_camera_view;
+static menu_item_t status_path_view;
+static menu_item_t status_pid_view;
+static menu_item_t flash_save_item;
+static menu_item_t flash_load_item;
+static menu_item_t flash_clear_item;
 
-menu_item_t image_binary_view;
-menu_item_t image_variable_view;
-menu_item_t display_debug_mode_item;
-menu_item_t display_high_mode_item;
+static menu_item_t image_binary_view;
+static menu_item_t image_variable_view;
+static menu_item_t display_debug_mode_item;
+static menu_item_t display_high_mode_item;
 
-menu_item_t *const main_children[] = {&cargo_menu, &param_menu, &status_menu, &image_menu, &display_menu};
-menu_item_t *const cargo_children[] = {&cargo_start_item, &cargo_stop_item};
-menu_item_t *const param_children[] = {&param_speed_menu, &param_servo_menu, &param_pid_menu};
-menu_item_t *const speed_children[] = {&base_speed_item, &turn_speed_item, &speed_k_item, &speed_limit_item, &yuanhuan_speed_item, &gyro_kp_item, &gyro_ki_item, &gyro_kd_item};
-menu_item_t *const servo_children[] = {&up_left_speed_item, &up_right_speed_item, &down_left_speed_item, &down_right_speed_item, &start_acc_item, &end_decel_item, &slow_turn_item, &turn_num_item};
-menu_item_t *const pid_children[] = {&yaw_kp_item, &yaw_ki_item, &yaw_kd_item, &camx_kp_item, &camx_ki_item, &camx_kd_item, &camy_kp_item, &camy_ki_item, &camy_kd_item};
-menu_item_t *const status_children[] = {&status_camera_view, &status_path_view, &status_pid_view, &status_imu_view, &status_flash_menu};
-menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
-menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
-menu_item_t *const display_children[] = {&display_debug_mode_item, &display_high_mode_item};
-menu_item_t main_menu = {
+static const menu_item_t *const main_children[] = {&cargo_menu, &param_menu, &status_menu, &image_menu, &display_menu};
+static const menu_item_t *const cargo_children[] = {&cargo_start_item, &cargo_stop_item};
+static const menu_item_t *const param_children[] = {&param_speed_menu, &param_servo_menu, &param_pid_menu};
+static const menu_item_t *const speed_children[] = {&base_speed_item, &turn_speed_item, &speed_k_item, &speed_limit_item, &yuanhuan_speed_item, &gyro_kp_item, &gyro_ki_item, &gyro_kd_item};
+static const menu_item_t *const servo_children[] = {&up_left_speed_item, &up_right_speed_item, &down_left_speed_item, &down_right_speed_item, &start_acc_item, &end_decel_item, &slow_turn_item, &turn_num_item};
+static const menu_item_t *const pid_children[] = {&yaw_kp_item, &yaw_ki_item, &yaw_kd_item, &camx_kp_item, &camx_ki_item, &camx_kd_item, &camy_kp_item, &camy_ki_item, &camy_kd_item};
+static const menu_item_t *const status_children[] = {&status_camera_view, &status_path_view, &status_pid_view, &status_imu_view, &status_flash_menu};
+static const menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
+static const menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
+static const menu_item_t *const display_children[] = {&display_debug_mode_item, &display_high_mode_item};
+static menu_item_t main_menu = {
     .title = "Main",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)main_children,
@@ -188,7 +188,7 @@ menu_item_t main_menu = {
     .draw = draw_main_info,
 };
 
-menu_item_t cargo_menu = {
+static menu_item_t cargo_menu = {
     .title = "CarGo",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)cargo_children,
@@ -196,42 +196,42 @@ menu_item_t cargo_menu = {
     .draw = draw_cargo_info,
 };
 
-menu_item_t param_menu = {
+static menu_item_t param_menu = {
     .title = "Parameter",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)param_children,
     .child_count = sizeof(param_children) / sizeof(param_children[0]),
 };
 
-menu_item_t param_speed_menu = {
+static menu_item_t param_speed_menu = {
     .title = "Speed",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)speed_children,
     .child_count = sizeof(speed_children) / sizeof(speed_children[0]),
 };
 
-menu_item_t param_servo_menu = {
+static menu_item_t param_servo_menu = {
     .title = "Servo",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)servo_children,
     .child_count = sizeof(servo_children) / sizeof(servo_children[0]),
 };
 
-menu_item_t param_pid_menu = {
+static menu_item_t param_pid_menu = {
     .title = "PID",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)pid_children,
     .child_count = sizeof(pid_children) / sizeof(pid_children[0]),
 };
 
-menu_item_t status_menu = {
+static menu_item_t status_menu = {
     .title = "Status",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)status_children,
     .child_count = sizeof(status_children) / sizeof(status_children[0]),
 };
 
-menu_item_t status_flash_menu = {
+static menu_item_t status_flash_menu = {
     .title = "Flash",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)flash_children,
@@ -239,242 +239,242 @@ menu_item_t status_flash_menu = {
     .draw = draw_flash_status,
 };
 
-menu_item_t image_menu = {
+static menu_item_t image_menu = {
     .title = "Image",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)image_children,
     .child_count = sizeof(image_children) / sizeof(image_children[0]),
 };
 
-menu_item_t cargo_start_item = {
+static menu_item_t cargo_start_item = {
     .title = "Start",
     .type = MENU_ITEM_ACTION,
     .action = action_start_car,
 };
 
-menu_item_t cargo_stop_item = {
+static menu_item_t cargo_stop_item = {
     .title = "Stop",
     .type = MENU_ITEM_ACTION,
     .action = action_stop_car,
 };
 
-menu_item_t base_speed_item = {
+static menu_item_t base_speed_item = {
     .title = "base_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &straight_speed, .min = -2000, .max = 2000, .width = 5},
 };
 
-menu_item_t turn_speed_item = {
+static menu_item_t turn_speed_item = {
     .title = "turn_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &turn_speed, .min = -2000, .max = 2000, .width = 5},
 };
 
-menu_item_t speed_k_item = {
+static menu_item_t speed_k_item = {
     .title = "speed_k",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &speed_k, .min = 0, .max = 5, .precision = 2, .width = 3},
 };
 
-menu_item_t speed_limit_item = {
+static menu_item_t speed_limit_item = {
     .title = "speed_limit",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &speed_limit, .min = 0, .max = 2000, .width = 5},
 };
 
-menu_item_t yuanhuan_speed_item = {
+static menu_item_t yuanhuan_speed_item = {
     .title = "yuanhuan_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &yuanhuan_speed, .min = -2000, .max = 2000, .width = 5},
 };
 
-menu_item_t gyro_kp_item = {
+static menu_item_t gyro_kp_item = {
     .title = "Gy_kp",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Gyro_rotate_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t gyro_ki_item = {
+static menu_item_t gyro_ki_item = {
     .title = "Gy_ki",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Gyro_rotate_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t gyro_kd_item = {
+static menu_item_t gyro_kd_item = {
     .title = "Gy_kd",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Gyro_rotate_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t up_left_speed_item = {
+static menu_item_t up_left_speed_item = {
     .title = "up_left_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &speed_encoder[0], .read_only = 1, .width = 5},
 };
 
-menu_item_t up_right_speed_item = {
+static menu_item_t up_right_speed_item = {
     .title = "up_right_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &speed_encoder[1], .read_only = 1, .width = 5},
 };
 
-menu_item_t down_left_speed_item = {
+static menu_item_t down_left_speed_item = {
     .title = "down_left_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &speed_encoder[2], .read_only = 1, .width = 5},
 };
 
-menu_item_t down_right_speed_item = {
+static menu_item_t down_right_speed_item = {
     .title = "down_right_speed",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &speed_encoder[3], .read_only = 1, .width = 5},
 };
 
-menu_item_t start_acc_item = {
+static menu_item_t start_acc_item = {
     .title = "start_acc",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &start_accelerate, .min = 0, .max = 4000, .width = 5},
 };
 
-menu_item_t end_decel_item = {
+static menu_item_t end_decel_item = {
     .title = "end_decel",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &end_decelerate, .min = 0, .max = 4000, .width = 5},
 };
 
-menu_item_t slow_turn_item = {
+static menu_item_t slow_turn_item = {
     .title = "slow_turn",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &slow_turn_speed, .min = -2000, .max = 2000, .width = 5},
 };
 
-menu_item_t turn_num_item = {
+static menu_item_t turn_num_item = {
     .title = "turn_num",
     .type = MENU_ITEM_PARAM_INT,
     .param = {.value_ptr = &turn_num, .min = 0, .max = 255, .width = 3},
 };
 
-menu_item_t yaw_kp_item = {
+static menu_item_t yaw_kp_item = {
     .title = "SKp",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Yawpid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t yaw_ki_item = {
+static menu_item_t yaw_ki_item = {
     .title = "SKi",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Yawpid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t yaw_kd_item = {
+static menu_item_t yaw_kd_item = {
     .title = "SKd",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Yawpid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camx_kp_item = {
+static menu_item_t camx_kp_item = {
     .title = "xkp",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_x_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camx_ki_item = {
+static menu_item_t camx_ki_item = {
     .title = "xki",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_x_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camx_kd_item = {
+static menu_item_t camx_kd_item = {
     .title = "xkd",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_x_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camy_kp_item = {
+static menu_item_t camy_kp_item = {
     .title = "ykp",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_y_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camy_ki_item = {
+static menu_item_t camy_ki_item = {
     .title = "yki",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_y_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t camy_kd_item = {
+static menu_item_t camy_kd_item = {
     .title = "ykd",
     .type = MENU_ITEM_PARAM_FLOAT,
     .param = {.value_ptr = &Camera_y_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
 };
 
-menu_item_t status_camera_view = {
+static menu_item_t status_camera_view = {
     .title = "Camera",
     .type = MENU_ITEM_VIEW,
     .draw = draw_status_camera,
 };
 
-menu_item_t status_path_view = {
+static menu_item_t status_path_view = {
     .title = "Path",
     .type = MENU_ITEM_VIEW,
     .draw = draw_status_path,
 };
 
-menu_item_t status_pid_view = {
+static menu_item_t status_pid_view = {
     .title = "PID",
     .type = MENU_ITEM_VIEW,
     .draw = draw_status_pid,
 };
 
-menu_item_t status_imu_view = {
+static menu_item_t status_imu_view = {
     .title = "IMU",
     .type = MENU_ITEM_VIEW,
     .draw = draw_status_imu,
 };
 
-menu_item_t flash_save_item = {
+static menu_item_t flash_save_item = {
     .title = "Save",
     .type = MENU_ITEM_ACTION,
     .action = action_save_flash,
 };
 
-menu_item_t flash_load_item = {
+static menu_item_t flash_load_item = {
     .title = "Load",
     .type = MENU_ITEM_ACTION,
     .action = action_load_flash,
 };
 
-menu_item_t flash_clear_item = {
+static menu_item_t flash_clear_item = {
     .title = "Clear",
     .type = MENU_ITEM_ACTION,
     .action = action_clear_flash,
 };
 
-menu_item_t image_binary_view = {
+static menu_item_t image_binary_view = {
     .title = "BinaryImage",
     .type = MENU_ITEM_VIEW,
     .draw = draw_image_preview,
 };
 
-menu_item_t image_variable_view = {
+static menu_item_t image_variable_view = {
     .title = "Variable",
     .type = MENU_ITEM_VIEW,
     .draw = draw_image_preview,
 };
 
-menu_item_t display_debug_mode_item = {
+static menu_item_t display_debug_mode_item = {
     .title = "DebugMode",
     .type = MENU_ITEM_ACTION,
     .action = action_set_debug_mode,
 };
 
-menu_item_t display_high_mode_item = {
+static menu_item_t display_high_mode_item = {
     .title = "HighSpeedMode",
     .type = MENU_ITEM_ACTION,
     .action = action_set_high_mode,
 };
 
-menu_item_t display_menu = {
+static menu_item_t display_menu = {
     .title = "Display",
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)display_children,

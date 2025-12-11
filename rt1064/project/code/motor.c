@@ -42,6 +42,156 @@ void encoder_init(void)
     encoder_quad_init(ENCODER_4, ENCODER_4_A, ENCODER_4_B);                     // 初始化编码器模块与引脚 正交解码编码器模式
 }
 
+float speed_L_up[2];
+float speed_L_down[2];
+float speed_R_up[2];
+float speed_R_down[2];
+
+int all=0;
+int16 up_L_all=0;
+int16 down_L_all=0;
+int16 up_R_all=0;
+int16 down_R_all=0;//编码器积分变量
+int32 encoder_all=0;
+int16 encoders_average;//积分平均值
+
+int16 encoder_data_quaddec1 = 0;//编码器的值
+int16 encoder_data_quaddec2 = 0;
+int16 encoder_data_quaddec3 = 0;
+int16 encoder_data_quaddec4 = 0;
+
+/**************************************************************************
+函数功能：编码器滤波
+**************************************************************************/                                      
+void encoder_get(void)
+{
+	static int16 encoder_L_up[5],encoder_R_up[5],encoder_L_down[5],encoder_R_down[5];
+	encoder_data_quaddec1 = encoder_get_count(ENCODER_1);                  // 获取编码器计数 右上
+	encoder_data_quaddec2 = encoder_get_count(ENCODER_2);                  // 获取编码器计数 左下
+	encoder_data_quaddec3 = encoder_get_count(ENCODER_3);                  // 获取编码器计数 左上
+	encoder_data_quaddec4 = encoder_get_count(ENCODER_4);                  // 获取编码器计数 右下
+	
+	
+	encoder_L_up[4]=encoder_L_up[3];//左上编码器
+	encoder_L_up[3]=encoder_L_up[2];
+	encoder_L_up[2]=encoder_L_up[1];
+	encoder_L_up[1]=encoder_L_up[0];
+	encoder_L_up[0]=-encoder_data_quaddec3/2;   //输入第一刻数
+	speed_L_up[1]=speed_L_up[0];
+	speed_L_up[0]=(encoder_L_up[4]*0.5f+encoder_L_up[3]*0.5f+encoder_L_up[2]*2.0f+encoder_L_up[1]*3.0f+encoder_L_up[0]*4.0f)/10.0f;
+	up_L_all=Lowpass(speed_L_up[1],speed_L_up[0]);
+	
+	encoder_R_up[4]=encoder_R_up[3];//右上编码器
+	encoder_R_up[3]=encoder_R_up[2];
+	encoder_R_up[2]=encoder_R_up[1];
+	encoder_R_up[1]=encoder_R_up[0];
+	encoder_R_up[0]=encoder_data_quaddec1/2;
+	speed_R_up[1]=speed_R_up[0];
+	speed_R_up[0]=(encoder_R_up[4]*0.5f+encoder_R_up[3]*0.5f+encoder_R_up[2]*2+encoder_R_up[1]*3.0f+encoder_R_up[0]*4.0f)/10.0f;
+	up_R_all=Lowpass(speed_R_up[1],speed_R_up[0]);
+	
+	encoder_L_down[4]=encoder_L_down[3];//左下编码器
+	encoder_L_down[3]=encoder_L_down[2];
+	encoder_L_down[2]=encoder_L_down[1];
+	encoder_L_down[1]=encoder_L_down[0];
+	encoder_L_down[0]=-encoder_data_quaddec2/2;
+	speed_L_down[1]=speed_L_down[0];
+	speed_L_down[0]=(encoder_L_down[4]*0.5f+encoder_L_down[3]*0.5f+encoder_L_down[2]*2+encoder_L_down[1]*3.0f+encoder_L_down[0]*4.0f)/10.0f;
+	down_L_all=Lowpass(speed_L_down[1],speed_L_down[0]);
+	
+	encoder_R_down[4]=encoder_R_down[3];//右下编码器
+	encoder_R_down[3]=encoder_R_down[2];
+	encoder_R_down[2]=encoder_R_down[1];
+	encoder_R_down[1]=encoder_R_down[0];
+	encoder_R_down[0]=encoder_data_quaddec4/2;
+	speed_R_down[1]=speed_R_down[0];
+	speed_R_down[0]=(encoder_R_down[4]*0.5f+encoder_R_down[3]*0.5f+encoder_R_down[2]*2+encoder_R_down[1]*3.0f+encoder_R_down[0]*4.0f)/10.0f;
+	down_R_all=Lowpass(speed_R_down[1],speed_R_down[0]);
+	
+	encoder_clear_count(ENCODER_1);                                       // 清空编码器计数
+	encoder_clear_count(ENCODER_2);                                       // 清空编码器计数
+	encoder_clear_count(ENCODER_3);                                       // 清空编码器计数
+	encoder_clear_count(ENCODER_4);
+
+	all = all + down_R_all+down_L_all+up_L_all+up_R_all;
+	encoders_average=(up_L_all+up_R_all+down_L_all+down_R_all)/4.0f;
+	
+    // Position_yaw.add +=	(float)(-down_R_all+down_L_all+up_L_all-up_R_all);
+
+}
+
+/**************************************************************************
+函数功能：低通滤波
+入口参数：旧X，新X
+返回  值：新值
+**************************************************************************/
+int16 Lowpass(int16 X_last,int16 X_new)
+{ 
+		int16 new_value,add,count;
+	
+    add = (X_new - X_last)*0.7f;
+    new_value = add + X_last;
+			 
+		return new_value;
+} 
+// // Complementary filter smooths encoder counts
+// static int encoder_round_to_int(float value)
+// {
+//     return (value >= 0.0f) ? (int)(value + 0.5f) : (int)(value - 0.5f);
+// }
+
+// void encoder_read_filtered(int *enc1, int *enc2, int *enc3, int *enc4)
+// {
+//     int raw[4];
+//     raw[0] = encoder_get_count(ENCODER_1);
+//     encoder_clear_count(ENCODER_1);
+
+//     raw[1] = -encoder_get_count(ENCODER_2);
+//     encoder_clear_count(ENCODER_2);
+    
+//     raw[2] = -encoder_get_count(ENCODER_3);
+//     encoder_clear_count(ENCODER_3);
+
+//     raw[3] = encoder_get_count(ENCODER_4);
+//     encoder_clear_count(ENCODER_4);
+
+//     static float filtered[4];
+//     static uint8 initialized = 0;
+
+//     if (!initialized)
+//     {
+//         for (uint8 i = 0; i < 4; i++)
+//         {
+//             filtered[i] = raw[i];
+//         }
+//         initialized = 1;
+//     }
+//     else
+//     {
+//         for (uint8 i = 0; i < 4; i++)
+//         {
+//             filtered[i] += ENCODER_FILTER_ALPHA * ((float)raw[i] - filtered[i]);
+//         }
+//     }
+
+//     if (enc1)
+//     {
+//         *enc1 = encoder_round_to_int(filtered[0]);
+//     }
+//     if (enc2)
+//     {
+//         *enc2 = encoder_round_to_int(filtered[1]);
+//     }
+//     if (enc3)
+//     {
+//         *enc3 = encoder_round_to_int(filtered[2]);
+//     }
+//     if (enc4)
+//     {
+//         *enc4 = encoder_round_to_int(filtered[3]);
+//     }
+// }
+
 void motor_pwm(int up_left_speed,int up_right_speed,int down_left_speed,int down_right_speed)
 {
 	if(up_left_speed >= 0)                                                           // 正转
@@ -108,7 +258,7 @@ int Limit_int(int left_limit, int target_num, int right_limit)
 		return target_num;
 	}
 }
-
+//在这里修改
 void motor_control(int* input_speed_encoder)
 {
 	int motorUL_pwm_value = 0;

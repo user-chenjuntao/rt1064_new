@@ -45,6 +45,7 @@
 
 #define LIMIT_ENCODER_MIN          -400
 #define LIMIT_ENCODER_MAX           400
+#define ENCODER_FILTER_ALPHA       0.35f
 
 extern int up_left_speed;
 extern int up_right_speed;
@@ -59,6 +60,8 @@ void encoder_init(void);
 int Limit_int(int left_limit, int target_num, int right_limit);
 void motor_pwm(int up_left_speed,int up_right_speed,int down_left_speed,int down_right_speed);
 void motor_control(int* input_speed_encoder);
+
+void encoder_read_filtered(int *enc1, int *enc2, int *enc3, int *enc4);
 
 void Kinematics_Init(void);
 void Kinematics_Inverse(int* input, int* output);
