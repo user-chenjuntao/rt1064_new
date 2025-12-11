@@ -1,4 +1,4 @@
-#include "assigned_box_planner_greedy_2.h"
+﻿#include "assigned_box_planner_greedy_2.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -32,6 +32,15 @@ typedef struct {
   Point dir;
   int valid;
 } PlannerBoxOverlap;
+
+// 链式箱子结构（本地定义，与头文件一致）
+typedef struct {
+  size_t indices[PLANNER_V3_BFS_MAX_BOXES];       // 链中箱子的索引，从主箱开始
+  size_t overlap_lens[PLANNER_V3_BFS_MAX_BOXES];  // 每个箱子的重叠路径长度
+  size_t steps_walked[PLANNER_V3_BFS_MAX_BOXES];  // 每个箱子已走的步数
+  size_t count;                                    // 链的长度（包含主箱）
+  Point dir;                                       // 当前推动方向
+} PlannerChainLocal;
 
 static PlannerBoxPathInfo g_planner_free_paths[PLANNER_V3_BFS_MAX_BOXES];
 static PlannerBoxPathInfo g_planner_planned_paths[PLANNER_V3_BFS_MAX_BOXES];
@@ -777,6 +786,497 @@ static void planner_v3_bfs_detect_overlaps(const PlannerBoxPathInfo *free_paths,
   }
 }
 
+// 从主箱开始，沿着推动方向构建完整的链
+// 返回链的长度（包含主箱），0表示无链
+static size_t planner_v3_bfs_build_chain_from_primary(
+    size_t primary_idx, Point push_dir, const Point *current_boxes, size_t box_count,
+    const PlannerBoxOverlap *overlaps, PlannerChainLocal *chain) {
+  if (!chain) return 0;
+  
+  chain->count = 0;
+  chain->dir = push_dir;
+  
+  // 主箱是链的第一个，重叠长度为0（它是主箱），已走步数为0
+  chain->indices[chain->count] = primary_idx;
+  chain->overlap_lens[chain->count] = 0;  // 主箱没有重叠长度限制
+  chain->steps_walked[chain->count] = 0;
+  chain->count++;
+  
+  // 沿着推动方向查找连续的副箱子
+  Point expected_pos = current_boxes[primary_idx];
+  expected_pos.row += push_dir.row;
+  expected_pos.col += push_dir.col;
+  
+  size_t current_in_chain = primary_idx;
+  
+  while (chain->count < PLANNER_V3_BFS_MAX_BOXES) {
+    size_t found = SIZE_MAX;
+    size_t found_overlap_len = 0;
+    
+    // 查找在expected_pos位置的副箱子
+    for (size_t s = 0; s < box_count; ++s) {
+      if (s == current_in_chain) continue;
+      
+      // 检查是否已经在链中
+      int already_in_chain = 0;
+      for (size_t c = 0; c < chain->count; ++c) {
+        if (chain->indices[c] == s) {
+          already_in_chain = 1;
+          break;
+        }
+      }
+      if (already_in_chain) continue;
+      
+      Point box_pos = current_boxes[s];
+      if (box_pos.row < 0 || box_pos.col < 0) continue;
+      
+      if (box_pos.row == expected_pos.row && box_pos.col == expected_pos.col) {
+        // 检查这个箱子的重叠信息是否表明它是当前箱子的副箱（同方向）
+        if (overlaps && overlaps[s].valid && overlaps[s].primary == current_in_chain &&
+            overlaps[s].dir.row == push_dir.row && overlaps[s].dir.col == push_dir.col) {
+          found = s;
+          found_overlap_len = overlaps[s].overlap_len;
+          break;
+        }
+        // 即使没有重叠信息，只要位置对就认为是链中的一员（重叠长度设为1）
+        found = s;
+        found_overlap_len = 1;
+        break;
+      }
+    }
+    
+    if (found == SIZE_MAX) {
+      break;  // 没有更多副箱子了
+    }
+    
+    chain->indices[chain->count] = found;
+    chain->overlap_lens[chain->count] = found_overlap_len;
+    chain->steps_walked[chain->count] = 0;
+    chain->count++;
+    current_in_chain = found;
+    
+    // 更新期望位置
+    expected_pos.row += push_dir.row;
+    expected_pos.col += push_dir.col;
+  }
+  
+  return chain->count;
+}
+
+// 检查链中是否有箱子到达目标点并剔除
+// 只有到达目标点的箱子才被剔除
+// 返回被剔除的箱子数量
+static size_t planner_v3_bfs_chain_remove_finished_ex(
+    PlannerChainLocal *chain, Point *current_boxes, const size_t *box_targets,
+    const Point *targets, size_t box_count, int check_overlap) {
+  if (!chain || chain->count == 0) return 0;
+  
+  (void)check_overlap;  // 不再使用此参数，但保持接口兼容
+  
+  size_t removed = 0;
+  size_t write_idx = 0;
+  
+  for (size_t i = 0; i < chain->count; ++i) {
+    size_t box_idx = chain->indices[i];
+    Point box_pos = current_boxes[box_idx];
+    
+    int should_remove = 0;
+    
+    // 只检查是否到达目标点
+    if (box_targets[box_idx] != SIZE_MAX && box_pos.row >= 0 && box_pos.col >= 0) {
+      Point target = targets[box_targets[box_idx]];
+      if (box_pos.row == target.row && box_pos.col == target.col) {
+        should_remove = 1;
+        // 标记箱子为已完成
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+    }
+    
+    if (should_remove) {
+      removed++;
+    } else {
+      // 保留在链中，复制数据
+      chain->indices[write_idx] = chain->indices[i];
+      chain->overlap_lens[write_idx] = chain->overlap_lens[i];
+      chain->steps_walked[write_idx] = chain->steps_walked[i];
+      write_idx++;
+    }
+  }
+  
+  chain->count = write_idx;
+  return removed;
+}
+
+// 兼容函数：检查走完重叠路径或到达目标（直行时使用）
+static size_t planner_v3_bfs_chain_remove_finished(
+    PlannerChainLocal *chain, Point *current_boxes, const size_t *box_targets,
+    const Point *targets, size_t box_count) {
+  return planner_v3_bfs_chain_remove_finished_ex(chain, current_boxes, box_targets, 
+                                                  targets, box_count, 1);
+}
+
+// 只检查到达目标（拐弯时使用）
+static size_t planner_v3_bfs_chain_remove_arrived_only(
+    PlannerChainLocal *chain, Point *current_boxes, const size_t *box_targets,
+    const Point *targets, size_t box_count) {
+  return planner_v3_bfs_chain_remove_finished_ex(chain, current_boxes, box_targets,
+                                                  targets, box_count, 0);
+}
+
+// 链式直行推动：所有链中的箱子同时向push_dir方向移动一格
+// 返回：0=成功, -6=失败, -7=缓存不足
+static int planner_v3_bfs_chain_push_straight(
+    int rows, int cols, PlannerChainLocal *chain, Point push_dir,
+    const Point *obstacles, size_t obstacle_count,
+    Point *current_car, Point *current_boxes, size_t box_count,
+    const size_t *box_targets, const Point *targets,
+    Point *path_buffer, size_t path_capacity, size_t *out_steps) {
+  if (!chain || chain->count == 0) return -6;
+  
+  // 主箱索引
+  size_t primary_idx = chain->indices[0];
+  Point primary_pos = current_boxes[primary_idx];
+  
+  // 计算推箱位（主箱的反方向）
+  Point push_pos = {primary_pos.row - push_dir.row, primary_pos.col - push_dir.col};
+  
+  // 检查推箱位有效性
+  if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
+      planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col)) {
+    return -6;
+  }
+  
+  // 检查推箱位是否被非链内箱子占用
+  for (size_t bi = 0; bi < box_count; ++bi) {
+    int in_chain = 0;
+    for (size_t c = 0; c < chain->count; ++c) {
+      if (chain->indices[c] == bi) {
+        in_chain = 1;
+        break;
+      }
+    }
+    if (in_chain) continue;
+    
+    Point b = current_boxes[bi];
+    if (b.row >= 0 && b.col >= 0 && b.row == push_pos.row && b.col == push_pos.col) {
+      return -6;
+    }
+  }
+  
+  // 检查链尾移动后的位置是否有效
+  size_t tail_idx = chain->indices[chain->count - 1];
+  Point tail_pos = current_boxes[tail_idx];
+  Point tail_next = {tail_pos.row + push_dir.row, tail_pos.col + push_dir.col};
+  
+  if (!planner_v3_bfs_in_bounds(rows, cols, tail_next.row, tail_next.col) ||
+      planner_v3_bfs_is_obstacle(obstacles, obstacle_count, tail_next.row, tail_next.col)) {
+    return -6;
+  }
+  
+  // 检查链尾移动位置是否被非链内箱子占用
+  for (size_t bi = 0; bi < box_count; ++bi) {
+    int in_chain = 0;
+    for (size_t c = 0; c < chain->count; ++c) {
+      if (chain->indices[c] == bi) {
+        in_chain = 1;
+        break;
+      }
+    }
+    if (in_chain) continue;
+    
+    Point b = current_boxes[bi];
+    if (b.row >= 0 && b.col >= 0 && b.row == tail_next.row && b.col == tail_next.col) {
+      return -6;
+    }
+  }
+  
+  // 车移动到推箱位
+  if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
+    int car_res = planner_v3_bfs_car_move_with_global_astar(
+        rows, cols, current_car, push_pos, obstacles, obstacle_count,
+        current_boxes, box_count, path_buffer, path_capacity, out_steps);
+    if (car_res == -7) return -7;
+    if (car_res == 0) return -6;
+  }
+  
+  if (*out_steps >= path_capacity) return -7;
+  
+  // 从链尾开始，依次更新所有箱子的位置
+  for (int i = (int)chain->count - 1; i >= 0; --i) {
+    size_t idx = chain->indices[i];
+    current_boxes[idx].row += push_dir.row;
+    current_boxes[idx].col += push_dir.col;
+    // 更新已走步数
+    chain->steps_walked[i]++;
+  }
+  
+  // 车移动到原主箱位置
+  *current_car = primary_pos;
+  path_buffer[(*out_steps)++] = *current_car;
+  
+  // 检查并剔除走完重叠路径或到达目标的箱子
+  planner_v3_bfs_chain_remove_finished(chain, current_boxes, box_targets, targets, box_count);
+  
+  return 0;
+}
+
+// 链式拐弯推动：处理链在拐弯点的复杂情况
+// 拐弯逻辑（严格按用户要求）：
+// 1. 车去推动拐弯点的副箱子朝拐弯方向移动一格
+// 2. 车回到主箱推箱位推动主箱朝拐弯点移动一格（整个链朝原方向移动）
+// 3. 此时又有一个副箱到达拐弯点
+// 4. 重复1-3直到主箱到达拐弯点
+// 在拐弯过程中只有箱子到达目标点的情况才可以被剔除
+// 返回：0=成功, -6=失败, -7=缓存不足
+static int planner_v3_bfs_chain_push_turn(
+    int rows, int cols, PlannerChainLocal *chain, Point old_dir, Point new_dir,
+    Point bend_point,
+    const Point *obstacles, size_t obstacle_count, Point *current_car,
+    Point *current_boxes, size_t box_count, const size_t *box_targets,
+    const Point *targets, Point *path_buffer, size_t path_capacity,
+    size_t *out_steps) {
+  if (!chain || chain->count == 0) return -6;
+
+  while (chain->count > 0) {
+    size_t primary_idx = chain->indices[0];
+    Point primary_pos = current_boxes[primary_idx];
+
+    if (primary_pos.row == bend_point.row && primary_pos.col == bend_point.col) {
+      chain->dir = new_dir;
+      return 0;
+    }
+
+    size_t box_at_bend = SIZE_MAX;
+    int box_at_bend_chain_idx = -1;
+    for (size_t i = 0; i < chain->count; ++i) {
+      size_t idx = chain->indices[i];
+      Point pos = current_boxes[idx];
+      if (pos.row == bend_point.row && pos.col == bend_point.col) {
+        box_at_bend = idx;
+        box_at_bend_chain_idx = (int)i;
+        break;
+      }
+    }
+
+    if (box_at_bend == SIZE_MAX) {
+      return -6;
+    }
+
+    // ===== 步骤1：推动拐弯点的箱子朝新方向一格 =====
+    Point box_at_bend_pos = current_boxes[box_at_bend];
+    Point box_next = {box_at_bend_pos.row + new_dir.row, box_at_bend_pos.col + new_dir.col};
+    Point push_pos = {box_at_bend_pos.row - new_dir.row, box_at_bend_pos.col - new_dir.col};
+
+    // 检查推箱位和目标位有效性
+    if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
+        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col)) {
+      return -6;
+    }
+    if (!planner_v3_bfs_in_bounds(rows, cols, box_next.row, box_next.col) ||
+        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, box_next.row, box_next.col)) {
+      return -6;
+    }
+
+    // 检查是否被非链内箱子占用
+    for (size_t bi = 0; bi < box_count; ++bi) {
+      int in_chain = 0;
+      for (size_t c = 0; c < chain->count; ++c) {
+        if (chain->indices[c] == bi) {
+          in_chain = 1;
+          break;
+        }
+      }
+      if (in_chain) continue;
+      Point b = current_boxes[bi];
+      if (b.row >= 0 && b.col >= 0) {
+        if ((b.row == push_pos.row && b.col == push_pos.col) ||
+            (b.row == box_next.row && b.col == box_next.col)) {
+          return -6;
+        }
+      }
+    }
+
+    if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
+      int car_res = planner_v3_bfs_car_move_with_global_astar(
+          rows, cols, current_car, push_pos, obstacles, obstacle_count, current_boxes, box_count,
+          path_buffer, path_capacity, out_steps);
+      if (car_res == -7) return -7;
+      if (car_res == 0) return -6;
+    }
+
+    if (*out_steps >= path_capacity) return -7;
+
+    Point old_box_pos = box_at_bend_pos;
+    current_boxes[box_at_bend] = box_next;
+    *current_car = old_box_pos;
+    path_buffer[(*out_steps)++] = *current_car;
+    if (box_at_bend_chain_idx >= 0 && box_at_bend_chain_idx < (int)chain->count) {
+      chain->steps_walked[box_at_bend_chain_idx]++;
+    }
+
+    if (box_targets[box_at_bend] != SIZE_MAX) {
+      Point target = targets[box_targets[box_at_bend]];
+      if (box_next.row == target.row && box_next.col == target.col) {
+        current_boxes[box_at_bend].row = -1;
+        current_boxes[box_at_bend].col = -1;
+        for (size_t j = box_at_bend_chain_idx; j < chain->count - 1; ++j) {
+          chain->indices[j] = chain->indices[j + 1];
+          chain->overlap_lens[j] = chain->overlap_lens[j + 1];
+          chain->steps_walked[j] = chain->steps_walked[j + 1];
+        }
+        chain->count--;
+      }
+    }
+
+    if (chain->count == 0) return 0;
+
+    primary_idx = chain->indices[0];
+    primary_pos = current_boxes[primary_idx];
+
+    if (primary_pos.row == bend_point.row && primary_pos.col == bend_point.col) {
+      chain->dir = new_dir;
+      return 0;
+    }
+
+    // ===== 步骤2：推主箱朝原方向（拐弯点方向）移动一格 =====
+    Point primary_next = {primary_pos.row + old_dir.row, primary_pos.col + old_dir.col};
+    Point push_primary_pos = {primary_pos.row - old_dir.row, primary_pos.col - old_dir.col};
+
+    if (!planner_v3_bfs_in_bounds(rows, cols, push_primary_pos.row, push_primary_pos.col) ||
+        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_primary_pos.row,
+                                   push_primary_pos.col)) {
+      return -6;
+    }
+    if (!planner_v3_bfs_in_bounds(rows, cols, primary_next.row, primary_next.col) ||
+        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, primary_next.row,
+                                   primary_next.col)) {
+      return -6;
+    }
+
+    for (size_t bi = 0; bi < box_count; ++bi) {
+      int in_chain = 0;
+      for (size_t c = 0; c < chain->count; ++c) {
+        if (chain->indices[c] == bi) {
+          in_chain = 1;
+          break;
+        }
+      }
+      if (in_chain) continue;
+      Point b = current_boxes[bi];
+      if (b.row >= 0 && b.col >= 0 &&
+          b.row == push_primary_pos.row && b.col == push_primary_pos.col) {
+        return -6;
+      }
+    }
+
+    if (current_car->row != push_primary_pos.row || current_car->col != push_primary_pos.col) {
+      int car_res = planner_v3_bfs_car_move_with_global_astar(
+          rows, cols, current_car, push_primary_pos, obstacles, obstacle_count, current_boxes,
+          box_count, path_buffer, path_capacity, out_steps);
+      if (car_res == -7) return -7;
+      if (car_res == 0) return -6;
+    }
+
+    if (*out_steps >= path_capacity) return -7;
+
+    int bend_idx = box_at_bend_chain_idx;
+    if (bend_idx >= (int)chain->count) {
+      bend_idx = (int)chain->count - 1;
+    }
+    if (bend_idx < 0) {
+      bend_idx = 0;
+    }
+
+    uint8_t chain_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
+    for (size_t ci = 0; ci < chain->count; ++ci) {
+      chain_mask[chain->indices[ci]] = 1;
+    }
+
+    Point planned[PLANNER_V3_BFS_MAX_BOXES];
+    for (size_t bi = 0; bi < box_count; ++bi) {
+      planned[bi] = current_boxes[bi];
+    }
+
+    for (int i = (int)chain->count - 1; i > bend_idx; --i) {
+      size_t idx = chain->indices[i];
+      planned[idx].row += new_dir.row;
+      planned[idx].col += new_dir.col;
+    }
+
+    for (int i = bend_idx - 1; i >= 0; --i) {
+      size_t idx = chain->indices[i];
+      planned[idx].row += old_dir.row;
+      planned[idx].col += old_dir.col;
+    }
+
+    for (size_t ci = 0; ci < chain->count; ++ci) {
+      size_t idx = chain->indices[ci];
+      Point np = planned[idx];
+      if (!planner_v3_bfs_in_bounds(rows, cols, np.row, np.col) ||
+          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, np.row, np.col)) {
+        return -6;
+      }
+      for (size_t bi = 0; bi < box_count; ++bi) {
+        if (chain_mask[bi]) {
+          continue;
+        }
+        Point b = current_boxes[bi];
+        if (b.row >= 0 && b.col >= 0 && b.row == np.row && b.col == np.col) {
+          return -6;
+        }
+      }
+    }
+
+    for (size_t a = 0; a < chain->count; ++a) {
+      size_t idx_a = chain->indices[a];
+      Point pa = planned[idx_a];
+      for (size_t b = a + 1; b < chain->count; ++b) {
+        size_t idx_b = chain->indices[b];
+        Point pb = planned[idx_b];
+        if (pa.row == pb.row && pa.col == pb.col) {
+          return -6;
+        }
+      }
+    }
+
+    for (int i = (int)chain->count - 1; i > bend_idx; --i) {
+      size_t idx = chain->indices[i];
+      current_boxes[idx] = planned[idx];
+      chain->steps_walked[i]++;
+    }
+
+    for (int i = bend_idx - 1; i >= 0; --i) {
+      size_t idx = chain->indices[i];
+      current_boxes[idx] = planned[idx];
+      chain->steps_walked[i]++;
+    }
+
+    *current_car = primary_pos;
+    path_buffer[(*out_steps)++] = *current_car;
+
+    for (int i = (int)chain->count - 1; i >= 0; --i) {
+      size_t idx = chain->indices[i];
+      Point pos = current_boxes[idx];
+      if (box_targets[idx] != SIZE_MAX && pos.row >= 0 && pos.col >= 0) {
+        Point target = targets[box_targets[idx]];
+        if (pos.row == target.row && pos.col == target.col) {
+          current_boxes[idx].row = -1;
+          current_boxes[idx].col = -1;
+          for (size_t j = i; j < chain->count - 1; ++j) {
+            chain->indices[j] = chain->indices[j + 1];
+            chain->overlap_lens[j] = chain->overlap_lens[j + 1];
+            chain->steps_walked[j] = chain->steps_walked[j + 1];
+          }
+          chain->count--;
+        }
+      }
+    }
+  }
+
+  return 0;
+}
+
 static int planner_v3_bfs_execute_single_box_path(int rows, int cols, size_t box_idx,
                                               const PlannerBoxPathInfo *path_info,
                                               const Point *obstacles, size_t obstacle_count,
@@ -1086,6 +1586,53 @@ static int planner_v3_bfs_push_single_box_scored(
   return 0;
 }
 
+// 解散链并逐个推送链中所有箱子到各自目标
+static int planner_v3_bfs_split_chain_and_finish(
+    int rows, int cols, const PlannerChainLocal *chain,
+    const size_t *box_targets, const Point *targets,
+    const Point *obstacles, size_t obstacle_count,
+    Point *current_car, Point *current_boxes, size_t box_count,
+    Point *path_buffer, size_t path_capacity, size_t *out_steps) {
+  if (!chain || chain->count == 0) return 0;
+  
+  // 从链尾开始，逐个推送到目标
+  for (int i = (int)chain->count - 1; i >= 0; --i) {
+    size_t box_idx = chain->indices[i];
+    Point box_pos = current_boxes[box_idx];
+    
+    // 跳过已完成的箱子
+    if (box_pos.row < 0 || box_pos.col < 0) continue;
+    if (box_targets[box_idx] == SIZE_MAX) continue;
+    
+    Point target = targets[box_targets[box_idx]];
+    
+    // 如果已在目标位置
+    if (box_pos.row == target.row && box_pos.col == target.col) {
+      current_boxes[box_idx].row = -1;
+      current_boxes[box_idx].col = -1;
+      continue;
+    }
+    
+    PlannerBoxPathInfo path_info;
+    if (!planner_v3_bfs_compute_box_path_with_mask(
+            rows, cols, box_pos, target, obstacles, obstacle_count,
+            current_boxes, box_count, NULL, box_idx, &path_info)) {
+      return -6;
+    }
+    
+    int res = planner_v3_bfs_execute_single_box_path(
+        rows, cols, box_idx, &path_info, obstacles, obstacle_count,
+        current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+    if (res != 0) return res;
+    
+    current_boxes[box_idx].row = -1;
+    current_boxes[box_idx].col = -1;
+  }
+  
+  return 0;
+}
+
+// 旧版兼容函数
 static int planner_v3_bfs_split_then_finish(int rows, int cols, size_t primary_idx,
                                         size_t secondary_idx, const size_t *box_targets,
                                         const Point *targets, const Point *obstacles,
@@ -1093,248 +1640,357 @@ static int planner_v3_bfs_split_then_finish(int rows, int cols, size_t primary_i
                                         Point *current_boxes, size_t box_count,
                                         Point *path_buffer, size_t path_capacity,
                                         size_t *out_steps) {
-  if (box_targets[primary_idx] == SIZE_MAX || box_targets[secondary_idx] == SIZE_MAX) {
-    return -6;
-  }
-
-  PlannerBoxPathInfo sec_path;
-  if (!planner_v3_bfs_compute_box_path_with_mask(
-          rows, cols, current_boxes[secondary_idx], targets[box_targets[secondary_idx]],
-          obstacles, obstacle_count, current_boxes, box_count, NULL, secondary_idx, &sec_path)) {
-    return -6;
-  }
-
-  int res = planner_v3_bfs_execute_single_box_path(rows, cols, secondary_idx, &sec_path,
-                                                   obstacles, obstacle_count, current_car,
-                                                   current_boxes, box_count, path_buffer,
-                                                   path_capacity, out_steps);
-  if (res != 0) {
-    return res;
-  }
-
-  current_boxes[secondary_idx].row = -1;
-  current_boxes[secondary_idx].col = -1;
-
-  PlannerBoxPathInfo pri_path;
-  if (!planner_v3_bfs_compute_box_path_with_mask(
-          rows, cols, current_boxes[primary_idx], targets[box_targets[primary_idx]], obstacles,
-          obstacle_count, current_boxes, box_count, NULL, primary_idx, &pri_path)) {
-    return -6;
-  }
-
-  return planner_v3_bfs_execute_single_box_path(rows, cols, primary_idx, &pri_path, obstacles,
-                                                obstacle_count, current_car, current_boxes,
-                                                box_count, path_buffer, path_capacity, out_steps);
+  PlannerChainLocal chain;
+  chain.count = 2;
+  chain.indices[0] = primary_idx;
+  chain.indices[1] = secondary_idx;
+  chain.overlap_lens[0] = 0;
+  chain.overlap_lens[1] = 0;  // 解散链时不需要检查重叠
+  chain.steps_walked[0] = 0;
+  chain.steps_walked[1] = 0;
+  chain.dir.row = 0;
+  chain.dir.col = 0;
+  
+  return planner_v3_bfs_split_chain_and_finish(
+      rows, cols, &chain, box_targets, targets, obstacles, obstacle_count,
+      current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
 }
 
-static int planner_v3_bfs_execute_chain_then_targets(
-    int rows, int cols, size_t primary_idx, size_t secondary_idx,
-    const PlannerBoxPathInfo *planned_paths, const size_t *box_targets,
-    const Point *targets, const Point *obstacles, size_t obstacle_count,
-    Point *current_car, Point *current_boxes, size_t box_count, Point *path_buffer,
-    size_t path_capacity, size_t *out_steps) {
-  if (box_targets[primary_idx] == SIZE_MAX || box_targets[secondary_idx] == SIZE_MAX) {
-    return -6;
-  }
-
-  const PlannerBoxPathInfo *secondary_path = &planned_paths[secondary_idx];
-  if (!secondary_path->valid || secondary_path->len < 2) {
-    return -6;
-  }
-
-  size_t sec_idx = 0;
-  for (; sec_idx < secondary_path->len; ++sec_idx) {
-    if (secondary_path->path[sec_idx].row == current_boxes[secondary_idx].row &&
-        secondary_path->path[sec_idx].col == current_boxes[secondary_idx].col) {
+// 新版多副箱子链式推动函数
+// 支持主箱推副箱1，副箱1推副箱2...的链式推动
+// 直行时：所有链中箱子同时移动一格
+// 拐弯时：车推链尾副箱朝新方向，然后推主箱朝原方向，循环直到主箱到拐弯点
+static int planner_v3_bfs_execute_multi_chain(
+    int rows, int cols, PlannerChainLocal *chain,
+    const PlannerBoxPathInfo *planned_paths, const PlannerBoxOverlap *overlaps,
+    const size_t *box_targets, const Point *targets, const Point *obstacles,
+    size_t obstacle_count, Point *current_car, Point *current_boxes,
+    size_t box_count, Point *path_buffer, size_t path_capacity,
+    size_t *out_steps) {
+  if (!chain || chain->count == 0) return -6;
+  
+  // 获取链尾箱子的路径（链尾决定整个链的移动方向）
+  size_t tail_idx = chain->indices[chain->count - 1];
+  if (box_targets[tail_idx] == SIZE_MAX) return -6;
+  
+  const PlannerBoxPathInfo *tail_path = &planned_paths[tail_idx];
+  if (!tail_path->valid || tail_path->len < 2) return -6;
+  
+  // 找到链尾当前位置在路径中的索引
+  size_t path_idx = 0;
+  for (; path_idx < tail_path->len; ++path_idx) {
+    if (tail_path->path[path_idx].row == current_boxes[tail_idx].row &&
+        tail_path->path[path_idx].col == current_boxes[tail_idx].col) {
       break;
     }
   }
-  if (sec_idx >= secondary_path->len) {
-    return -6;
-  }
-
-  Point last_dir = {0, 0};
-  for (; sec_idx + 1 < secondary_path->len; ++sec_idx) {
-    Point sec_curr = current_boxes[secondary_idx];
-    Point sec_next = secondary_path->path[sec_idx + 1];
-    Point dir = {sec_next.row - sec_curr.row, sec_next.col - sec_curr.col};
-
+  if (path_idx >= tail_path->len) return -6;
+  
+  Point last_dir = chain->dir;
+  
+  while (path_idx + 1 < tail_path->len && chain->count > 0) {
+    Point tail_curr = current_boxes[tail_idx];
+    Point tail_next = tail_path->path[path_idx + 1];
+    Point dir = {tail_next.row - tail_curr.row, tail_next.col - tail_curr.col};
+    
+    // 检查是否有新的箱子要加入链尾（在tail_next位置）
+    size_t new_tail = SIZE_MAX;
+    for (size_t t = 0; t < box_count; ++t) {
+      // 检查是否已在链中
+      int in_chain = 0;
+      for (size_t c = 0; c < chain->count; ++c) {
+        if (chain->indices[c] == t) { in_chain = 1; break; }
+      }
+      if (in_chain) continue;
+      
+      Point tb = current_boxes[t];
+      if (tb.row < 0 || tb.col < 0) continue;
+      
+      if (tb.row == tail_next.row && tb.col == tail_next.col) {
+        // 检查重叠信息
+        if (overlaps && overlaps[t].valid && overlaps[t].primary == tail_idx &&
+            overlaps[t].dir.row == dir.row && overlaps[t].dir.col == dir.col) {
+          new_tail = t;
+          break;
+        }
+        // 即使没有明确的重叠信息，位置对也认为是新链尾
+        new_tail = t;
+        break;
+      }
+    }
+    
+    if (new_tail != SIZE_MAX && chain->count < PLANNER_V3_BFS_MAX_BOXES) {
+      // 将新箱子加入链尾
+      size_t prev_tail_idx = chain->indices[chain->count - 1];
+      size_t new_overlap_len = 0;
+      
+      // 从overlaps获取重叠长度
+      if (overlaps && overlaps[new_tail].valid && overlaps[new_tail].primary == prev_tail_idx &&
+          overlaps[new_tail].dir.row == dir.row && overlaps[new_tail].dir.col == dir.col) {
+        new_overlap_len = overlaps[new_tail].overlap_len;
+      } else {
+        new_overlap_len = 1;  // 默认重叠长度为1
+      }
+      
+      chain->indices[chain->count] = new_tail;
+      chain->overlap_lens[chain->count] = new_overlap_len;
+      chain->steps_walked[chain->count] = 0;
+      chain->count++;
+      tail_idx = new_tail;
+      
+      // 获取新链尾的路径
+      if (box_targets[tail_idx] == SIZE_MAX) {
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+      }
+      
+      // 重新计算新链尾的路径
+      PlannerBoxPathInfo new_tail_path;
+      uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
+      for (size_t c = 0; c < chain->count - 1; ++c) {
+        ignore_mask[chain->indices[c]] = 1;
+      }
+      if (!planner_v3_bfs_compute_box_path_with_mask(
+              rows, cols, current_boxes[tail_idx], targets[box_targets[tail_idx]],
+              obstacles, obstacle_count, current_boxes, box_count, ignore_mask, tail_idx,
+              &new_tail_path)) {
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+      }
+      g_planner_planned_paths[tail_idx] = new_tail_path;
+      tail_path = &g_planner_planned_paths[tail_idx];
+      
+      // 重新查找路径索引
+      path_idx = 0;
+      for (; path_idx < tail_path->len; ++path_idx) {
+        if (tail_path->path[path_idx].row == current_boxes[tail_idx].row &&
+            tail_path->path[path_idx].col == current_boxes[tail_idx].col) {
+          break;
+        }
+      }
+      if (path_idx >= tail_path->len) {
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+      }
+      
+      last_dir.row = 0;
+      last_dir.col = 0;
+      continue;
+    }
+    
+    // 判断是否拐弯
     int turning = (last_dir.row != 0 || last_dir.col != 0) &&
                   (last_dir.row != dir.row || last_dir.col != dir.col);
-
+    
     if (turning) {
-      // 拐弯：车先推副箱到新方向，再推主箱到拐弯点
-      Point push_pos_sec = {sec_curr.row - dir.row, sec_curr.col - dir.col};
-      if (!planner_v3_bfs_in_bounds(rows, cols, sec_next.row, sec_next.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, sec_next.row, sec_next.col) ||
-          planner_v3_bfs_is_box_at(current_boxes, box_count, sec_next.row, sec_next.col,
-                                   primary_idx) ||
-          !planner_v3_bfs_in_bounds(rows, cols, push_pos_sec.row, push_pos_sec.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos_sec.row, push_pos_sec.col) ||
-          planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos_sec.row, push_pos_sec.col,
-                                   secondary_idx)) {
-        return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx, box_targets,
-                                                targets, obstacles, obstacle_count, current_car,
-                                                current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
+      // ===== 拐弯处理 =====
+      // 拐弯点就是链尾当前位置
+      Point bend_point = tail_curr;
+      
+      // 使用链式拐弯推动
+      int turn_res = planner_v3_bfs_chain_push_turn(
+          rows, cols, chain, last_dir, dir, bend_point,
+          obstacles, obstacle_count, current_car, current_boxes, box_count,
+          box_targets, targets, path_buffer, path_capacity, out_steps);
+      
+      if (turn_res != 0) {
+        if (turn_res == -7) return -7;
+        // 拐弯失败，解散链
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
       }
-      if (current_car->row != push_pos_sec.row || current_car->col != push_pos_sec.col) {
-        int car_res = planner_v3_bfs_car_move_with_global_astar(
-            rows, cols, current_car, push_pos_sec, obstacles, obstacle_count, current_boxes,
-            box_count, path_buffer, path_capacity, out_steps);
-        if (car_res <= 0) {
-          return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                  box_targets, targets, obstacles, obstacle_count,
-                                                  current_car, current_boxes, box_count,
-                                                  path_buffer, path_capacity, out_steps);
+      
+      // 拐弯结束，更新链尾和方向
+      if (chain->count == 0) return 0;
+      
+      // 检查链中是否还有未完成的箱子
+      int has_unfinished = 0;
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        Point box_pos = current_boxes[box_idx];
+        if (box_pos.row >= 0 && box_pos.col >= 0) {
+          if (box_targets[box_idx] != SIZE_MAX) {
+            Point target = targets[box_targets[box_idx]];
+            if (box_pos.row != target.row || box_pos.col != target.col) {
+              has_unfinished = 1;
+              break;
+            }
+          }
         }
       }
-      if (*out_steps >= path_capacity) {
-        return -7;
+      if (!has_unfinished) {
+        // 所有箱子都已完成，标记为完成并返回
+        for (size_t c = 0; c < chain->count; ++c) {
+          size_t box_idx = chain->indices[c];
+          current_boxes[box_idx].row = -1;
+          current_boxes[box_idx].col = -1;
+        }
+        return 0;
       }
-      Point old_sec = sec_curr;
-      current_boxes[secondary_idx] = sec_next;
-      *current_car = old_sec;
-      path_buffer[(*out_steps)++] = *current_car;
-
-      if (last_dir.row == 0 && last_dir.col == 0) {
-        return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx, box_targets,
-                                                targets, obstacles, obstacle_count, current_car,
-                                                current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
-      }
-      Point primary_curr = current_boxes[primary_idx];
-      Point bend_target = sec_curr;
-      Point push_pos_primary = {primary_curr.row - last_dir.row,
-                                primary_curr.col - last_dir.col};
-      if (!planner_v3_bfs_in_bounds(rows, cols, push_pos_primary.row, push_pos_primary.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos_primary.row,
-                                     push_pos_primary.col) ||
-          planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos_primary.row,
-                                   push_pos_primary.col, primary_idx)) {
-        return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                box_targets, targets, obstacles, obstacle_count,
-                                                current_car, current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
-      }
-      if (current_car->row != push_pos_primary.row || current_car->col != push_pos_primary.col) {
-        int car_res = planner_v3_bfs_car_move_with_global_astar(
-            rows, cols, current_car, push_pos_primary, obstacles, obstacle_count, current_boxes,
-            box_count, path_buffer, path_capacity, out_steps);
-        if (car_res <= 0) {
-          return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                  box_targets, targets, obstacles, obstacle_count,
-                                                  current_car, current_boxes, box_count,
-                                                  path_buffer, path_capacity, out_steps);
+      
+      // 更新链尾和路径索引
+      tail_idx = chain->indices[chain->count - 1];
+      tail_path = &g_planner_planned_paths[tail_idx];
+      
+      // 重新查找路径索引
+      path_idx = 0;
+      for (; path_idx < tail_path->len; ++path_idx) {
+        if (tail_path->path[path_idx].row == current_boxes[tail_idx].row &&
+            tail_path->path[path_idx].col == current_boxes[tail_idx].col) {
+          break;
         }
       }
-      if (*out_steps >= path_capacity) {
-        return -7;
+      if (path_idx >= tail_path->len) {
+        // 如果找不到路径索引，检查是否所有箱子都已完成
+        int all_finished = 1;
+        for (size_t c = 0; c < chain->count; ++c) {
+          size_t box_idx = chain->indices[c];
+          Point box_pos = current_boxes[box_idx];
+          if (box_pos.row >= 0 && box_pos.col >= 0) {
+            if (box_targets[box_idx] != SIZE_MAX) {
+              Point target = targets[box_targets[box_idx]];
+              if (box_pos.row != target.row || box_pos.col != target.col) {
+                all_finished = 0;
+                break;
+              }
+            }
+          }
+        }
+        if (all_finished) {
+          // 所有箱子都已完成，标记为完成并返回
+          for (size_t c = 0; c < chain->count; ++c) {
+            size_t box_idx = chain->indices[c];
+            current_boxes[box_idx].row = -1;
+            current_boxes[box_idx].col = -1;
+          }
+          return 0;
+        }
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
       }
-      Point old_primary = primary_curr;
-      current_boxes[primary_idx] = bend_target;
-      *current_car = old_primary;
-      path_buffer[(*out_steps)++] = *current_car;
+      
+      last_dir = chain->dir;
+      
     } else {
-      // 直行：主箱推副箱
-      Point primary_curr = current_boxes[primary_idx];
-      Point expect_primary = {sec_curr.row - dir.row, sec_curr.col - dir.col};
-      if (primary_curr.row != expect_primary.row || primary_curr.col != expect_primary.col) {
-        int align_res = planner_v3_bfs_car_move_with_global_astar(
-            rows, cols, current_car, expect_primary, obstacles, obstacle_count, current_boxes,
-            box_count, path_buffer, path_capacity, out_steps);
-        if (align_res <= 0) {
-          return (align_res == -7) ? -7 : -6;
-        }
-        primary_curr = current_boxes[primary_idx];
-        if (primary_curr.row != expect_primary.row || primary_curr.col != expect_primary.col) {
-          return -6;
-        }
+      // ===== 直行处理 =====
+      // 所有链中箱子同时向dir方向移动一格
+      chain->dir = dir;
+      
+      int push_res = planner_v3_bfs_chain_push_straight(
+          rows, cols, chain, dir, obstacles, obstacle_count,
+          current_car, current_boxes, box_count, box_targets, targets,
+          path_buffer, path_capacity, out_steps);
+      
+      if (push_res != 0) {
+        if (push_res == -7) return -7;
+        // 直行失败，解散链
+        return planner_v3_bfs_split_chain_and_finish(
+            rows, cols, chain, box_targets, targets, obstacles, obstacle_count,
+            current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
       }
-
-      Point push_pos = {primary_curr.row - dir.row, primary_curr.col - dir.col};
-      if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col) ||
-          planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos.row, push_pos.col,
-                                   primary_idx)) {
-        return -6;
-      }
-      if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
-        int car_res = planner_v3_bfs_car_move_with_global_astar(
-            rows, cols, current_car, push_pos, obstacles, obstacle_count, current_boxes, box_count,
-            path_buffer, path_capacity, out_steps);
-        if (car_res <= 0) {
-          return (car_res == -7) ? -7 : -6;
-        }
-      }
-
-      if (!planner_v3_bfs_in_bounds(rows, cols, sec_next.row, sec_next.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, sec_next.row, sec_next.col)) {
-        return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                box_targets, targets, obstacles, obstacle_count,
-                                                current_car, current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
-      }
-      for (size_t bi = 0; bi < box_count; ++bi) {
-        if (bi == primary_idx || bi == secondary_idx) {
-          continue;
-        }
-        Point b = current_boxes[bi];
-        if (b.row == sec_next.row && b.col == sec_next.col) {
-          return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                  box_targets, targets, obstacles, obstacle_count,
-                                                  current_car, current_boxes, box_count,
-                                                  path_buffer, path_capacity, out_steps);
-        }
-      }
-
-      Point temp_boxes[PLANNER_V3_BFS_MAX_BOXES];
-      for (size_t bi = 0; bi < box_count; ++bi) {
-        temp_boxes[bi] = current_boxes[bi];
-      }
-      temp_boxes[secondary_idx] = sec_next;
-      temp_boxes[primary_idx] = sec_curr;
-      uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
-      ignore_mask[primary_idx] = 1;
-      if (!planner_v3_bfs_can_reach_goal_mask(
-              rows, cols, obstacles, obstacle_count, temp_boxes, box_count, secondary_idx,
-              ignore_mask, sec_next, targets[box_targets[secondary_idx]])) {
-        return planner_v3_bfs_split_then_finish(rows, cols, primary_idx, secondary_idx,
-                                                box_targets, targets, obstacles, obstacle_count,
-                                                current_car, current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
-      }
-
-      if (*out_steps >= path_capacity) {
-        return -7;
-      }
-
-      Point old_primary = primary_curr;
-      Point old_secondary = sec_curr;
-      current_boxes[secondary_idx] = sec_next;
-      current_boxes[primary_idx] = old_secondary;
-      *current_car = old_primary;
-      path_buffer[(*out_steps)++] = *current_car;
+      
+      // 更新链尾（可能有箱子被剔除）
+      if (chain->count == 0) return 0;
+      tail_idx = chain->indices[chain->count - 1];
+      
+      last_dir = dir;
+      path_idx++;
     }
-
-    last_dir = dir;
+    
+    // 更新tail_path指针（可能chain被修改了）
+    if (chain->count > 0) {
+      tail_idx = chain->indices[chain->count - 1];
+      tail_path = &g_planner_planned_paths[tail_idx];
+    }
   }
-
-  current_boxes[secondary_idx].row = -1;
-  current_boxes[secondary_idx].col = -1;
-
-  PlannerBoxPathInfo primary_follow;
-  uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
-  if (!planner_v3_bfs_compute_box_path_with_mask(
-          rows, cols, current_boxes[primary_idx], targets[box_targets[primary_idx]], obstacles,
-          obstacle_count, current_boxes, box_count, ignore_mask, primary_idx, &primary_follow)) {
-    return -6;
+  
+  // 检查链中是否所有箱子都已完成
+  if (chain->count > 0) {
+    int all_finished = 1;
+    for (size_t c = 0; c < chain->count; ++c) {
+      size_t box_idx = chain->indices[c];
+      Point box_pos = current_boxes[box_idx];
+      if (box_pos.row >= 0 && box_pos.col >= 0) {
+        if (box_targets[box_idx] != SIZE_MAX) {
+          Point target = targets[box_targets[box_idx]];
+          if (box_pos.row != target.row || box_pos.col != target.col) {
+            all_finished = 0;
+            break;
+          }
+        } else {
+          all_finished = 0;
+          break;
+        }
+      }
+    }
+    if (all_finished) {
+      // 所有箱子都已完成，标记为完成
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
+    
+    // 链尾到达目标，标记完成
+    tail_idx = chain->indices[chain->count - 1];
+    Point tail_pos = current_boxes[tail_idx];
+    if (box_targets[tail_idx] != SIZE_MAX) {
+      Point target = targets[box_targets[tail_idx]];
+      if (tail_pos.row == target.row && tail_pos.col == target.col) {
+        current_boxes[tail_idx].row = -1;
+        current_boxes[tail_idx].col = -1;
+        chain->count--;
+      }
+    }
   }
+  
+  return 0;
+}
 
-  return planner_v3_bfs_execute_single_box_path(rows, cols, primary_idx, &primary_follow,
-                                                obstacles, obstacle_count, current_car,
-                                                current_boxes, box_count, path_buffer,
-                                                path_capacity, out_steps);
+// 旧版兼容函数（保持接口兼容）
+static int planner_v3_bfs_execute_chain_then_targets(
+    int rows, int cols, size_t primary_idx, size_t secondary_idx,
+    const PlannerBoxPathInfo *planned_paths, const PlannerBoxOverlap *overlaps,
+    const size_t *box_targets, const Point *targets, const Point *obstacles,
+    size_t obstacle_count, Point *current_car, Point *current_boxes,
+    size_t box_count, Point *path_buffer, size_t path_capacity,
+    size_t *out_steps) {
+  // 构建初始链：主箱 + 副箱
+  PlannerChainLocal chain;
+  chain.count = 2;
+  chain.indices[0] = primary_idx;
+  chain.indices[1] = secondary_idx;
+  
+  // 初始化重叠长度和已走步数
+  chain.overlap_lens[0] = 0;  // 主箱
+  chain.steps_walked[0] = 0;
+  
+  // 获取副箱的重叠长度
+  if (overlaps && overlaps[secondary_idx].valid && overlaps[secondary_idx].primary == primary_idx) {
+    chain.overlap_lens[1] = overlaps[secondary_idx].overlap_len;
+  } else {
+    chain.overlap_lens[1] = 1;  // 默认重叠长度为1
+  }
+  chain.steps_walked[1] = 0;
+  
+  // 计算初始方向
+  Point primary_pos = current_boxes[primary_idx];
+  Point secondary_pos = current_boxes[secondary_idx];
+  chain.dir.row = secondary_pos.row - primary_pos.row;
+  chain.dir.col = secondary_pos.col - primary_pos.col;
+  
+  // 调用新的多副箱子链式推动函数
+  return planner_v3_bfs_execute_multi_chain(
+      rows, cols, &chain, planned_paths, overlaps, box_targets, targets,
+      obstacles, obstacle_count, current_car, current_boxes, box_count,
+      path_buffer, path_capacity, out_steps);
 }
 
 static int planner_v3_bfs_push_primary_with_chain(
@@ -1342,11 +1998,6 @@ static int planner_v3_bfs_push_primary_with_chain(
     const PlannerBoxOverlap *overlaps, const size_t *box_targets, const Point *targets,
     const Point *obstacles, size_t obstacle_count, Point *current_car, Point *current_boxes,
     size_t box_count, Point *path_buffer, size_t path_capacity, size_t *out_steps) {
-  const PlannerBoxPathInfo *path = &planned_paths[primary_idx];
-  if (!path->valid || path->len < 2) {
-    return -6;
-  }
-
   uint8_t deadlock_ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
   for (size_t s = 0; s < box_count; ++s) {
     if (overlaps[s].valid && overlaps[s].primary == primary_idx) {
@@ -1368,146 +2019,266 @@ static int planner_v3_bfs_push_primary_with_chain(
         current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
   }
 
-  for (size_t step = 1; step < path->len; ++step) {
-    Point curr = current_boxes[primary_idx];
-    Point next = path->path[step];
-    Point dir = {next.row - curr.row, next.col - curr.col};
-    Point push_pos = {curr.row - dir.row, curr.col - dir.col};
-    int retried = 0;
-
-retry_push:
-    if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
-        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col) ||
-        planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos.row, push_pos.col,
-                                 primary_idx)) {
-      if (retried) {
-        return -6;
-      }
-      Point detour_path[256];
-      size_t detour_len = 0;
-      Point new_push_pos;
-      int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
-          rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
-          box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
-      if (!detour_ok || detour_len == 0) {
-        return -6;
-      }
-      for (size_t i = 1; i < detour_len; ++i) {
-        if (*out_steps >= path_capacity) {
-          return -7;
-        }
-        if (*out_steps > 0 &&
-            !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
-          return -6;
-        }
-        path_buffer[(*out_steps)++] = detour_path[i];
-      }
-      *current_car = detour_path[detour_len - 1];
-      push_pos = *current_car;
-      retried = 1;
-      goto retry_push;
-    }
-
-    int car_result = planner_v3_bfs_car_move_with_global_astar(
-        rows, cols, current_car, push_pos, obstacles, obstacle_count, current_boxes, box_count,
-        path_buffer, path_capacity, out_steps);
-    if (car_result == -7) {
-      return -7;
-    }
-    if (car_result == 0) {
-      if (retried) {
-        return -6;
-      }
-      Point detour_path[256];
-      size_t detour_len = 0;
-      Point new_push_pos;
-      int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
-          rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
-          box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
-      if (!detour_ok || detour_len == 0) {
-        return -6;
-      }
-      for (size_t i = 1; i < detour_len; ++i) {
-        if (*out_steps >= path_capacity) {
-          return -7;
-        }
-        if (*out_steps > 0 &&
-            !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
-          return -6;
-        }
-        path_buffer[(*out_steps)++] = detour_path[i];
-      }
-      *current_car = detour_path[detour_len - 1];
-      push_pos = *current_car;
-      retried = 1;
-      goto retry_push;
-    }
-
-    if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
-      return -6;
-    }
-
-    size_t secondary = SIZE_MAX;
-    for (size_t s = 0; s < box_count; ++s) {
-      if (!overlaps[s].valid || overlaps[s].primary != primary_idx) {
-        continue;
-      }
-      Point sec_pos = current_boxes[s];
-      if (sec_pos.row == next.row && sec_pos.col == next.col &&
-          overlaps[s].dir.row == dir.row && overlaps[s].dir.col == dir.col) {
-        secondary = s;
-        break;
-      }
-    }
-
-    if (secondary != SIZE_MAX) {
-      return planner_v3_bfs_execute_chain_then_targets(
-          rows, cols, primary_idx, secondary, planned_paths, box_targets, targets, obstacles,
-          obstacle_count, current_car, current_boxes, box_count, path_buffer, path_capacity,
-          out_steps);
-    }
-
-    if (!planner_v3_bfs_in_bounds(rows, cols, next.row, next.col) ||
-        planner_v3_bfs_is_obstacle(obstacles, obstacle_count, next.row, next.col)) {
-      return -6;
-    }
-    for (size_t bi = 0; bi < box_count; ++bi) {
-      if (bi == primary_idx) {
-        continue;
-      }
-      Point b = current_boxes[bi];
-      if (b.row == next.row && b.col == next.col) {
-        return -6;
-      }
-    }
-
+  while (1) {
     if (box_targets[primary_idx] == SIZE_MAX) {
       return -6;
     }
-    Point temp_boxes[PLANNER_V3_BFS_MAX_BOXES];
-    for (size_t bi = 0; bi < box_count; ++bi) {
-      temp_boxes[bi] = current_boxes[bi];
+    PlannerBoxPathInfo path_local;
+    uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
+    for (size_t s = 0; s < box_count; ++s) {
+      if (overlaps[s].valid && overlaps[s].primary == primary_idx) {
+        ignore_mask[s] = 1;
+      }
     }
-    temp_boxes[primary_idx] = next;
-    if (!planner_v3_bfs_can_reach_goal_mask(
-            rows, cols, obstacles, obstacle_count, temp_boxes, box_count, primary_idx,
-            deadlock_ignore_mask, next, targets[box_targets[primary_idx]])) {
+    if (!planner_v3_bfs_compute_box_path_with_mask(
+            rows, cols, current_boxes[primary_idx], targets[box_targets[primary_idx]], obstacles,
+            obstacle_count, current_boxes, box_count, ignore_mask, primary_idx, &path_local)) {
       return -6;
     }
+    g_planner_planned_paths[primary_idx] = path_local;
 
-    if (*out_steps >= path_capacity) {
-      return -7;
+    if (!path_local.valid) {
+      return -6;
+    }
+    if (path_local.len < 2) {
+      current_boxes[primary_idx].row = -1;
+      current_boxes[primary_idx].col = -1;
+      return 0;
     }
 
-    Point old_pos = curr;
-    current_boxes[primary_idx] = next;
-    *current_car = old_pos;
-    path_buffer[(*out_steps)++] = *current_car;
-  }
+    int need_replan = 0;
+    for (size_t step = 1; step < path_local.len; ++step) {
+      Point curr = current_boxes[primary_idx];
+      Point next = path_local.path[step];
+      Point dir = {next.row - curr.row, next.col - curr.col};
+      Point push_pos = {curr.row - dir.row, curr.col - dir.col};
+      int retried = 0;
 
-  current_boxes[primary_idx].row = -1;
-  current_boxes[primary_idx].col = -1;
-  return 0;
+    retry_push_primary:
+      if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col) ||
+          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col) ||
+          planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos.row, push_pos.col,
+                                   primary_idx)) {
+        if (retried) {
+          return -6;
+        }
+        Point detour_path[256];
+        size_t detour_len = 0;
+        Point new_push_pos;
+        int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
+            rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
+            box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
+        if (!detour_ok || detour_len == 0) {
+          return -6;
+        }
+        for (size_t i = 1; i < detour_len; ++i) {
+          if (*out_steps >= path_capacity) {
+            return -7;
+          }
+          if (*out_steps > 0 &&
+              !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
+            return -6;
+          }
+          path_buffer[(*out_steps)++] = detour_path[i];
+        }
+        *current_car = detour_path[detour_len - 1];
+        push_pos = *current_car;
+        retried = 1;
+        goto retry_push_primary;
+      }
+
+      int car_result = planner_v3_bfs_car_move_with_global_astar(
+          rows, cols, current_car, push_pos, obstacles, obstacle_count, current_boxes, box_count,
+          path_buffer, path_capacity, out_steps);
+      if (car_result == -7) {
+        return -7;
+      }
+      if (car_result == 0) {
+        if (retried) {
+          return -6;
+        }
+        Point detour_path[256];
+        size_t detour_len = 0;
+        Point new_push_pos;
+        int detour_ok = planner_v3_bfs_follow_box_with_global_astar(
+            rows, cols, *current_car, curr, next, obstacles, obstacle_count, current_boxes,
+            box_count, primary_idx, detour_path, 256, &detour_len, &new_push_pos);
+        if (!detour_ok || detour_len == 0) {
+          return -6;
+        }
+        for (size_t i = 1; i < detour_len; ++i) {
+          if (*out_steps >= path_capacity) {
+            return -7;
+          }
+          if (*out_steps > 0 &&
+              !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], detour_path[i])) {
+            return -6;
+          }
+          path_buffer[(*out_steps)++] = detour_path[i];
+        }
+        *current_car = detour_path[detour_len - 1];
+        push_pos = *current_car;
+        retried = 1;
+        goto retry_push_primary;
+      }
+
+      if (current_car->row != push_pos.row || current_car->col != push_pos.col) {
+        return -6;
+      }
+
+      // 检测是否有副箱子在推动方向上
+      size_t secondary = SIZE_MAX;
+      for (size_t s = 0; s < box_count; ++s) {
+        if (!overlaps[s].valid || overlaps[s].primary != primary_idx) {
+          continue;
+        }
+        Point sec_pos = current_boxes[s];
+        if (sec_pos.row == next.row && sec_pos.col == next.col &&
+            overlaps[s].dir.row == dir.row && overlaps[s].dir.col == dir.col) {
+          secondary = s;
+          break;
+        }
+      }
+
+      if (secondary != SIZE_MAX) {
+        // 【新增】构建完整的链（可能包含多个副箱子）
+        PlannerChainLocal chain;
+        chain.count = 0;
+        chain.dir = dir;
+        
+        // 添加主箱
+        chain.indices[chain.count] = primary_idx;
+        chain.overlap_lens[chain.count] = 0;  // 主箱没有重叠长度限制
+        chain.steps_walked[chain.count] = 0;
+        chain.count++;
+        
+        // 沿着推动方向构建链
+        size_t current_in_chain = primary_idx;
+        Point expected_pos = next;
+        
+        while (chain.count < PLANNER_V3_BFS_MAX_BOXES) {
+          size_t found = SIZE_MAX;
+          size_t found_overlap_len = 0;
+          
+          // 在expected_pos位置查找副箱子
+          for (size_t s = 0; s < box_count; ++s) {
+            // 检查是否已在链中
+            int already_in = 0;
+            for (size_t c = 0; c < chain.count; ++c) {
+              if (chain.indices[c] == s) { already_in = 1; break; }
+            }
+            if (already_in) continue;
+            
+            Point box_pos = current_boxes[s];
+            if (box_pos.row < 0 || box_pos.col < 0) continue;
+            
+            if (box_pos.row == expected_pos.row && box_pos.col == expected_pos.col) {
+              // 检查重叠信息是否匹配
+              if (overlaps[s].valid && overlaps[s].primary == current_in_chain &&
+                  overlaps[s].dir.row == dir.row && overlaps[s].dir.col == dir.col) {
+                found = s;
+                found_overlap_len = overlaps[s].overlap_len;
+                break;
+              }
+              // 即使没有明确的重叠信息，位置匹配也加入链（重叠长度设为1）
+              found = s;
+              found_overlap_len = 1;
+              break;
+            }
+          }
+          
+          if (found == SIZE_MAX) break;
+          
+          chain.indices[chain.count] = found;
+          chain.overlap_lens[chain.count] = found_overlap_len;
+          chain.steps_walked[chain.count] = 0;
+          chain.count++;
+          current_in_chain = found;
+          expected_pos.row += dir.row;
+          expected_pos.col += dir.col;
+        }
+        
+        // 为链中所有箱子计算路径
+        for (size_t c = 1; c < chain.count; ++c) {
+          size_t box_idx = chain.indices[c];
+          if (box_targets[box_idx] == SIZE_MAX) continue;
+          
+          PlannerBoxPathInfo box_path;
+          uint8_t box_ignore[PLANNER_V3_BFS_MAX_BOXES] = {0};
+          // 忽略链中排在前面的箱子
+          for (size_t p = 0; p < c; ++p) {
+            box_ignore[chain.indices[p]] = 1;
+          }
+          if (!planner_v3_bfs_compute_box_path_with_mask(
+                  rows, cols, current_boxes[box_idx], targets[box_targets[box_idx]], obstacles,
+                  obstacle_count, current_boxes, box_count, box_ignore, box_idx, &box_path)) {
+            // 计算失败，尝试解散链
+            return planner_v3_bfs_split_chain_and_finish(
+                rows, cols, &chain, box_targets, targets, obstacles, obstacle_count,
+                current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+          }
+          g_planner_planned_paths[box_idx] = box_path;
+        }
+
+        // 调用新的多副箱子链式推动函数
+        int chain_res = planner_v3_bfs_execute_multi_chain(
+            rows, cols, &chain, planned_paths, overlaps, box_targets, targets,
+            obstacles, obstacle_count, current_car, current_boxes, box_count, path_buffer,
+            path_capacity, out_steps);
+        if (chain_res != 0) {
+          return chain_res;
+        }
+
+        need_replan = 1;
+        break;
+      }
+
+      if (!planner_v3_bfs_in_bounds(rows, cols, next.row, next.col) ||
+          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, next.row, next.col)) {
+        return -6;
+      }
+      for (size_t bi = 0; bi < box_count; ++bi) {
+        if (bi == primary_idx) {
+          continue;
+        }
+        Point b = current_boxes[bi];
+        if (b.row == next.row && b.col == next.col) {
+          return -6;
+        }
+      }
+
+      if (box_targets[primary_idx] == SIZE_MAX) {
+        return -6;
+      }
+      Point temp_boxes[PLANNER_V3_BFS_MAX_BOXES];
+      for (size_t bi = 0; bi < box_count; ++bi) {
+        temp_boxes[bi] = current_boxes[bi];
+      }
+      temp_boxes[primary_idx] = next;
+      if (!planner_v3_bfs_can_reach_goal_mask(
+              rows, cols, obstacles, obstacle_count, temp_boxes, box_count, primary_idx,
+              deadlock_ignore_mask, next, targets[box_targets[primary_idx]])) {
+        return -6;
+      }
+
+      if (*out_steps >= path_capacity) {
+        return -7;
+      }
+
+      Point old_pos = curr;
+      current_boxes[primary_idx] = next;
+      *current_car = old_pos;
+      path_buffer[(*out_steps)++] = *current_car;
+    }
+
+    if (need_replan) {
+      continue;
+    }
+
+    current_boxes[primary_idx].row = -1;
+    current_boxes[primary_idx].col = -1;
+    return 0;
+  }
 }
 
 static size_t planner_v3_bfs_collect_boxes(int rows, int cols, const Point *boxes,
