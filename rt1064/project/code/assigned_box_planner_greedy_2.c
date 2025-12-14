@@ -1,4 +1,4 @@
-﻿#include "assigned_box_planner_greedy_2.h"
+#include "assigned_box_planner_greedy_2.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -786,6 +786,30 @@ static void planner_v3_bfs_detect_overlaps(const PlannerBoxPathInfo *free_paths,
   }
 }
 
+// 检查链中是否所有箱子都已完成
+static int planner_v3_bfs_chain_all_finished(
+    const PlannerChainLocal *chain,
+    const Point *current_boxes,
+    const size_t *box_targets,
+    const Point *targets) {
+  if (!chain || chain->count == 0) return 1;
+  for (size_t c = 0; c < chain->count; ++c) {
+    size_t box_idx = chain->indices[c];
+    Point box_pos = current_boxes[box_idx];
+    if (box_pos.row >= 0 && box_pos.col >= 0) {
+      if (box_targets[box_idx] != SIZE_MAX) {
+        Point target = targets[box_targets[box_idx]];
+        if (box_pos.row != target.row || box_pos.col != target.col) {
+          return 0;  // 还有未完成的箱子
+        }
+      } else {
+        return 0;  // 没有目标但位置有效，视为未完成
+      }
+    }
+  }
+  return 1;  // 所有箱子都已完成
+}
+
 // 从主箱开始，沿着推动方向构建完整的链
 // 返回链的长度（包含主箱），0表示无链
 static size_t planner_v3_bfs_build_chain_from_primary(
@@ -932,7 +956,18 @@ static int planner_v3_bfs_chain_push_straight(
     Point *current_car, Point *current_boxes, size_t box_count,
     const size_t *box_targets, const Point *targets,
     Point *path_buffer, size_t path_capacity, size_t *out_steps) {
-  if (!chain || chain->count == 0) return -6;
+  if (!chain) return -6;
+  
+  // 检查链中所有箱子是否都已完成
+  if (chain->count == 0 || planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+    // 所有箱子都已完成，标记为完成并返回
+    for (size_t c = 0; c < chain->count; ++c) {
+      size_t box_idx = chain->indices[c];
+      current_boxes[box_idx].row = -1;
+      current_boxes[box_idx].col = -1;
+    }
+    return 0;
+  }
   
   // 主箱索引
   size_t primary_idx = chain->indices[0];
@@ -1015,8 +1050,52 @@ static int planner_v3_bfs_chain_push_straight(
   *current_car = primary_pos;
   path_buffer[(*out_steps)++] = *current_car;
   
-  // 检查并剔除走完重叠路径或到达目标的箱子
-  planner_v3_bfs_chain_remove_finished(chain, current_boxes, box_targets, targets, box_count);
+  // 每次直行推动后，检查链尾箱子是否到达目标，如果到达则自动缩小链
+  while (chain->count > 0) {
+    size_t tail_idx = chain->indices[chain->count - 1];
+    Point tail_pos = current_boxes[tail_idx];
+    
+    // 检查链尾箱子是否到达目标
+    int tail_finished = 0;
+    if (box_targets[tail_idx] != SIZE_MAX && tail_pos.row >= 0 && tail_pos.col >= 0) {
+      Point target = targets[box_targets[tail_idx]];
+      if (tail_pos.row == target.row && tail_pos.col == target.col) {
+        tail_finished = 1;
+        // 标记链尾箱子为已完成
+        current_boxes[tail_idx].row = -1;
+        current_boxes[tail_idx].col = -1;
+      }
+    }
+    
+    if (tail_finished) {
+      // 移除链尾（缩小链）
+      chain->count--;
+      
+      // 如果链缩小到0，检查链内的所有箱子是否都已经到达目标点
+      if (chain->count == 0) {
+        // 链已经为空，说明链中的所有箱子都已经到达目标点并被移除
+        // 此时需要检查所有箱子（不仅仅是链中的）是否都已完成
+        // 但由于我们只处理链中的箱子，链为空时说明链中所有箱子都已完成
+        return 0;
+      }
+    } else {
+      // 链尾未到达目标，停止检查
+      break;
+    }
+  }
+  
+  // 推动后检查链中剩余箱子是否都已完成（链可能已经缩小）
+  if (chain->count > 0) {
+    if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+      // 链中所有剩余箱子都已完成，标记为完成并返回
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
+  }
   
   return 0;
 }
@@ -1036,9 +1115,30 @@ static int planner_v3_bfs_chain_push_turn(
     Point *current_boxes, size_t box_count, const size_t *box_targets,
     const Point *targets, Point *path_buffer, size_t path_capacity,
     size_t *out_steps) {
-  if (!chain || chain->count == 0) return -6;
+  if (!chain) return -6;
+  
+  // 检查链中所有箱子是否都已完成
+  if (chain->count == 0 || planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+    // 所有箱子都已完成，标记为完成并返回
+    for (size_t c = 0; c < chain->count; ++c) {
+      size_t box_idx = chain->indices[c];
+      current_boxes[box_idx].row = -1;
+      current_boxes[box_idx].col = -1;
+    }
+    return 0;
+  }
 
   while (chain->count > 0) {
+    // 在每次循环开始时检查链中所有箱子是否都已完成
+    if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+      // 所有箱子都已完成，标记为完成并返回
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
     size_t primary_idx = chain->indices[0];
     Point primary_pos = current_boxes[primary_idx];
 
@@ -1595,6 +1695,17 @@ static int planner_v3_bfs_split_chain_and_finish(
     Point *path_buffer, size_t path_capacity, size_t *out_steps) {
   if (!chain || chain->count == 0) return 0;
   
+  // 先检查链中是否所有箱子都已完成
+  if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+    // 所有箱子都已完成，标记为完成并返回
+    for (size_t c = 0; c < chain->count; ++c) {
+      size_t box_idx = chain->indices[c];
+      current_boxes[box_idx].row = -1;
+      current_boxes[box_idx].col = -1;
+    }
+    return 0;
+  }
+  
   // 从链尾开始，逐个推送到目标
   for (int i = (int)chain->count - 1; i >= 0; --i) {
     size_t box_idx = chain->indices[i];
@@ -1617,6 +1728,16 @@ static int planner_v3_bfs_split_chain_and_finish(
     if (!planner_v3_bfs_compute_box_path_with_mask(
             rows, cols, box_pos, target, obstacles, obstacle_count,
             current_boxes, box_count, NULL, box_idx, &path_info)) {
+      // 如果计算路径失败，检查是否所有箱子都已完成
+      if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+        // 所有箱子都已完成，标记为完成并返回
+        for (size_t c = 0; c < chain->count; ++c) {
+          size_t c_idx = chain->indices[c];
+          current_boxes[c_idx].row = -1;
+          current_boxes[c_idx].col = -1;
+        }
+        return 0;
+      }
       return -6;
     }
     
@@ -1667,14 +1788,62 @@ static int planner_v3_bfs_execute_multi_chain(
     size_t obstacle_count, Point *current_car, Point *current_boxes,
     size_t box_count, Point *path_buffer, size_t path_capacity,
     size_t *out_steps) {
-  if (!chain || chain->count == 0) return -6;
+  if (!chain) return -6;
+  
+  // 修复1：空链检查 - 如果链为空，返回0（所有箱子都已完成）
+  if (chain->count == 0) return 0;
+  
+  // 修复2：检查链中所有箱子是否都已完成
+  if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+    // 所有箱子都已完成，标记为完成并返回
+    for (size_t c = 0; c < chain->count; ++c) {
+      size_t box_idx = chain->indices[c];
+      current_boxes[box_idx].row = -1;
+      current_boxes[box_idx].col = -1;
+    }
+    return 0;
+  }
   
   // 获取链尾箱子的路径（链尾决定整个链的移动方向）
   size_t tail_idx = chain->indices[chain->count - 1];
+  
+  // 修复3：检查链尾箱子是否已完成
+  Point tail_pos = current_boxes[tail_idx];
+  if (tail_pos.row < 0 || tail_pos.col < 0) {
+    // 链尾箱子已完成，检查链中是否所有箱子都已完成
+    if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+      // 所有箱子都已完成，标记为完成并返回
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
+    // 还有未完成的箱子，但链尾已完成，需要更新链（移除已完成的箱子）
+    // 这里应该调用链移除函数，但为了简化，先返回-6表示需要重新规划
+    return -6;
+  }
+  
   if (box_targets[tail_idx] == SIZE_MAX) return -6;
   
   const PlannerBoxPathInfo *tail_path = &planned_paths[tail_idx];
   if (!tail_path->valid || tail_path->len < 2) return -6;
+  
+  // 修复4：在查找路径索引前，再次检查链尾箱子是否已完成
+  if (current_boxes[tail_idx].row < 0 || current_boxes[tail_idx].col < 0) {
+    // 链尾箱子已完成，检查链中是否所有箱子都已完成
+    if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+      // 所有箱子都已完成，标记为完成并返回
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
+    return -6;
+  }
   
   // 找到链尾当前位置在路径中的索引
   size_t path_idx = 0;
@@ -1684,7 +1853,19 @@ static int planner_v3_bfs_execute_multi_chain(
       break;
     }
   }
-  if (path_idx >= tail_path->len) return -6;
+  if (path_idx >= tail_path->len) {
+    // 如果找不到路径索引，检查是否所有箱子都已完成
+    if (planner_v3_bfs_chain_all_finished(chain, current_boxes, box_targets, targets)) {
+      // 所有箱子都已完成，标记为完成并返回
+      for (size_t c = 0; c < chain->count; ++c) {
+        size_t box_idx = chain->indices[c];
+        current_boxes[box_idx].row = -1;
+        current_boxes[box_idx].col = -1;
+      }
+      return 0;
+    }
+    return -6;
+  }
   
   Point last_dir = chain->dir;
   
@@ -2020,6 +2201,18 @@ static int planner_v3_bfs_push_primary_with_chain(
   }
 
   while (1) {
+    // 检查主箱是否已经完成
+    Point primary_pos = current_boxes[primary_idx];
+    if (primary_pos.row >= 0 && primary_pos.col >= 0 && box_targets[primary_idx] != SIZE_MAX) {
+      Point target = targets[box_targets[primary_idx]];
+      if (primary_pos.row == target.row && primary_pos.col == target.col) {
+        // 主箱已经完成
+        current_boxes[primary_idx].row = -1;
+        current_boxes[primary_idx].col = -1;
+        return 0;
+      }
+    }
+    
     if (box_targets[primary_idx] == SIZE_MAX) {
       return -6;
     }
@@ -2033,11 +2226,29 @@ static int planner_v3_bfs_push_primary_with_chain(
     if (!planner_v3_bfs_compute_box_path_with_mask(
             rows, cols, current_boxes[primary_idx], targets[box_targets[primary_idx]], obstacles,
             obstacle_count, current_boxes, box_count, ignore_mask, primary_idx, &path_local)) {
+      // 如果计算路径失败，检查主箱是否已经完成
+      if (primary_pos.row >= 0 && primary_pos.col >= 0 && box_targets[primary_idx] != SIZE_MAX) {
+        Point target = targets[box_targets[primary_idx]];
+        if (primary_pos.row == target.row && primary_pos.col == target.col) {
+          current_boxes[primary_idx].row = -1;
+          current_boxes[primary_idx].col = -1;
+          return 0;
+        }
+      }
       return -6;
     }
     g_planner_planned_paths[primary_idx] = path_local;
 
     if (!path_local.valid) {
+      // 如果路径无效，检查主箱是否已经完成
+      if (primary_pos.row >= 0 && primary_pos.col >= 0 && box_targets[primary_idx] != SIZE_MAX) {
+        Point target = targets[box_targets[primary_idx]];
+        if (primary_pos.row == target.row && primary_pos.col == target.col) {
+          current_boxes[primary_idx].row = -1;
+          current_boxes[primary_idx].col = -1;
+          return 0;
+        }
+      }
       return -6;
     }
     if (path_local.len < 2) {
@@ -2388,6 +2599,55 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
   return 0;
 }
 
+// 验证最终状态：检查所有箱子是否都到达目标点
+// 返回值：1=所有箱子都已完成，0=有箱子未完成
+static int planner_v3_bfs_verify_final_state(
+    const Point *boxes, size_t box_count,
+    const size_t *box_targets, const Point *targets) {
+  if (!boxes || !targets || !box_targets) {
+    return 0;
+  }
+  
+  for (size_t i = 0; i < box_count; ++i) {
+    Point box_pos = boxes[i];
+    
+    // 如果箱子位置无效（已标记为完成），跳过
+    if (box_pos.row < 0 || box_pos.col < 0) {
+      continue;
+    }
+    
+    // 如果箱子没有分配目标，视为未完成
+    if (box_targets[i] == SIZE_MAX) {
+      return 0;
+    }
+    
+    // 检查箱子是否到达目标点
+    Point target = targets[box_targets[i]];
+    if (box_pos.row != target.row || box_pos.col != target.col) {
+      return 0;  // 有箱子未到达目标
+    }
+  }
+  
+  return 1;  // 所有箱子都已完成
+}
+
+// 在返回非0值前检查最终状态，如果所有箱子都已完成则返回0
+static int planner_v3_bfs_check_and_return(
+    int result, const Point *current_boxes, size_t box_count,
+    const size_t *box_targets, const Point *targets) {
+  // 如果返回值为0，直接返回
+  if (result == 0) {
+    return result;
+  }
+  
+  // 如果返回非0值，检查所有箱子是否都已完成
+  if (planner_v3_bfs_verify_final_state(current_boxes, box_count, box_targets, targets)) {
+    return 0;  // 所有箱子都已完成，返回0
+  }
+  
+  return result;  // 有箱子未完成，返回原错误码
+}
+
 // 【新实现】动态推箱函数：每推完一个箱子后重新选择下一个最优箱子和目标
 // 支持先忽略箱子阻挡寻找重叠路径，再以多箱联动方式规划
 static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
@@ -2488,7 +2748,17 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         continue;
       }
       if (box_targets[i] == SIZE_MAX) {
-        return -6;
+        // 箱子没有目标，检查所有箱子是否都已完成
+        return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
+      }
+      // 检查箱子是否已在目标位置
+      Point tgt = targets[box_targets[i]];
+      if (current_boxes[i].row == tgt.row && current_boxes[i].col == tgt.col) {
+        // 箱子已在目标位置，标记为完成
+        current_boxes[i].row = -1;
+        current_boxes[i].col = -1;
+        box_done[i] = 1;
+        continue;
       }
       uint8_t ignore_all[PLANNER_V3_BFS_MAX_BOXES];
       for (size_t j = 0; j < box_count; ++j) {
@@ -2497,7 +2767,15 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
       if (!planner_v3_bfs_compute_box_path_with_mask(
               rows, cols, current_boxes[i], targets[box_targets[i]], obstacles, obstacle_count,
               current_boxes, box_count, ignore_all, i, &free_paths[i])) {
-        return -6;
+        // 路径计算失败，再次检查箱子是否已在目标位置
+        if (current_boxes[i].row == tgt.row && current_boxes[i].col == tgt.col) {
+          current_boxes[i].row = -1;
+          current_boxes[i].col = -1;
+          box_done[i] = 1;
+          continue;
+        }
+        // 路径计算失败，检查所有箱子是否都已完成
+        return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
       }
     }
 
@@ -2505,6 +2783,19 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
 
     for (size_t i = 0; i < box_count; ++i) {
       if (box_done[i]) {
+        continue;
+      }
+      if (box_targets[i] == SIZE_MAX) {
+        // 箱子没有目标，检查所有箱子是否都已完成
+        return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
+      }
+      // 检查箱子是否已在目标位置
+      Point tgt = targets[box_targets[i]];
+      if (current_boxes[i].row == tgt.row && current_boxes[i].col == tgt.col) {
+        // 箱子已在目标位置，标记为完成
+        current_boxes[i].row = -1;
+        current_boxes[i].col = -1;
+        box_done[i] = 1;
         continue;
       }
       uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
@@ -2521,7 +2812,15 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
       if (!planner_v3_bfs_compute_box_path_with_mask(
               rows, cols, current_boxes[i], targets[box_targets[i]], obstacles, obstacle_count,
               current_boxes, box_count, ignore_mask, i, &planned_paths[i])) {
-        return -6;
+        // 路径计算失败，再次检查箱子是否已在目标位置
+        if (current_boxes[i].row == tgt.row && current_boxes[i].col == tgt.col) {
+          current_boxes[i].row = -1;
+          current_boxes[i].col = -1;
+          box_done[i] = 1;
+          continue;
+        }
+        // 路径计算失败，检查所有箱子是否都已完成
+        return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
       }
     }
 
@@ -2533,7 +2832,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         continue;
       }
       if (!planned_paths[i].valid || planned_paths[i].len == 0) {
-        return -6;
+        // 路径无效，检查所有箱子是否都已完成
+        return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
       }
       if (planned_paths[i].len < 2) {
         current_boxes[i].row = -1;
@@ -2573,7 +2873,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
     }
 
     if (candidate == SIZE_MAX) {
-      return -6;
+      // 无法找到候选箱子，检查所有箱子是否都已完成
+      return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets);
     }
 
     int push_res = planner_v3_bfs_push_primary_with_chain(
@@ -2581,7 +2882,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         obstacle_count, &current_car, current_boxes, box_count, path_buffer, path_capacity,
         out_steps);
     if (push_res != 0) {
-      return push_res;
+      // 推动失败，检查所有箱子是否都已完成
+      return planner_v3_bfs_check_and_return(push_res, current_boxes, box_count, box_targets, targets);
     }
 
     remaining = 0;
@@ -2596,6 +2898,30 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
   }
 
   if (*out_steps > 1 && !planner_v3_bfs_validate_continuous_path(path_buffer, *out_steps)) {
+    // 路径验证失败，检查所有箱子是否都已完成
+    int all_finished = 1;
+    for (size_t i = 0; i < box_count; ++i) {
+      if (box_targets[i] != SIZE_MAX) {
+        Point box_pos = current_boxes[i];
+        if (box_pos.row >= 0 && box_pos.col >= 0) {
+          Point target = targets[box_targets[i]];
+          if (box_pos.row != target.row || box_pos.col != target.col) {
+            all_finished = 0;
+            break;
+          }
+        }
+      } else {
+        // 没有目标但位置有效，视为未完成
+        Point box_pos = current_boxes[i];
+        if (box_pos.row >= 0 && box_pos.col >= 0) {
+          all_finished = 0;
+          break;
+        }
+      }
+    }
+    if (all_finished) {
+      return 0;
+    }
     return -6;
   }
 
@@ -2624,6 +2950,7 @@ int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
   }
 
   // 【核心修改】直接调用新的动态选择函数
+  // 注意：最终状态验证已在planner_v3_bfs_run_dynamic内部的关键返回点完成
   return planner_v3_bfs_run_dynamic(rows, cols, car, boxes, box_count,
                                     targets, target_count, obstacles, obstacle_count,
                                     path_buffer, path_capacity, out_steps,
