@@ -2274,7 +2274,6 @@ static int planner_v3_bfs_push_primary_with_chain(
       return 0;
     }
 
-    int need_replan = 0;
     for (size_t step = 1; step < path_local.len; ++step) {
       Point curr = current_boxes[primary_idx];
       Point next = path_local.path[step];
@@ -2457,8 +2456,8 @@ static int planner_v3_bfs_push_primary_with_chain(
           return chain_res;
         }
 
-        need_replan = 1;
-        break;
+        // 链式推箱成功，直接返回外层，由外层下一轮重新分配/重新选 candidate
+        return 0;
       }
 
       if (!planner_v3_bfs_in_bounds(rows, cols, next.row, next.col) ||
@@ -2497,10 +2496,6 @@ static int planner_v3_bfs_push_primary_with_chain(
       current_boxes[primary_idx] = next;
       *current_car = old_pos;
       path_buffer[(*out_steps)++] = *current_car;
-    }
-
-    if (need_replan) {
-      continue;
     }
 
     current_boxes[primary_idx].row = -1;
