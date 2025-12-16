@@ -1287,12 +1287,16 @@ static int planner_v3_bfs_chain_push_turn(
 
     if (*out_steps >= path_capacity) return -7;
 
-    int bend_idx = box_at_bend_chain_idx;
-    if (bend_idx >= (int)chain->count) {
-      bend_idx = (int)chain->count - 1;
-    }
-    if (bend_idx < 0) {
-      bend_idx = 0;
+    // 基于 box_id 重新定位拐弯点箱子（消除对易失效索引的依赖）
+    // 步骤1可能已删除 box_at_bend，需要检查它是否仍在链中
+    int box_at_bend_still_in_chain = 0;
+    int current_bend_chain_idx = -1;
+    for (size_t ci = 0; ci < chain->count; ++ci) {
+      if (chain->indices[ci] == box_at_bend) {
+        box_at_bend_still_in_chain = 1;
+        current_bend_chain_idx = (int)ci;
+        break;
+      }
     }
 
     uint8_t chain_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
@@ -1305,16 +1309,56 @@ static int planner_v3_bfs_chain_push_turn(
       planned[bi] = current_boxes[bi];
     }
 
-    for (int i = (int)chain->count - 1; i > bend_idx; --i) {
-      size_t idx = chain->indices[i];
-      planned[idx].row += new_dir.row;
-      planned[idx].col += new_dir.col;
-    }
-
-    for (int i = bend_idx - 1; i >= 0; --i) {
-      size_t idx = chain->indices[i];
-      planned[idx].row += old_dir.row;
-      planned[idx].col += old_dir.col;
+    // 步骤2的位移逻辑：
+    // - 如果 box_at_bend 在步骤1中被删除，则所有箱子都移动（无跳过元素）
+    // - 如果 box_at_bend 仍在链中，则跳过它（通过 box_id 定位）
+    if (box_at_bend_still_in_chain && current_bend_chain_idx >= 0) {
+      // 拐弯点箱子仍在链中：跳过它，其他箱子按位置分段移动
+      for (size_t ci = 0; ci < chain->count; ++ci) {
+        size_t idx = chain->indices[ci];
+        if (idx == box_at_bend) {
+          // 跳过拐弯点箱子（已在步骤1移动）
+          continue;
+        }
+        // 根据在链中的位置决定移动方向
+        if ((int)ci > current_bend_chain_idx) {
+          // 拐弯点之后的箱子：朝新方向移动
+          planned[idx].row += new_dir.row;
+          planned[idx].col += new_dir.col;
+        } else {
+          // 拐弯点之前的箱子：朝原方向移动
+          planned[idx].row += old_dir.row;
+          planned[idx].col += old_dir.col;
+        }
+      }
+    } else {
+      // box_at_bend 在步骤1中被删除：所有箱子都移动，无跳过元素
+      // 需要确定分割点：删除前的 box_at_bend_chain_idx 位置
+      // 由于已删除，分割点应该是删除前位置（或删除后第一个元素的位置）
+      // 简化处理：如果删除的是链尾，则所有箱子朝 old_dir 移动
+      // 如果删除的是中间元素，则删除位置之后的朝 new_dir，之前的朝 old_dir
+      int removed_idx = box_at_bend_chain_idx;
+      if (removed_idx < 0) removed_idx = 0;
+      if (removed_idx >= (int)chain->count) {
+        // 删除的是链尾或超出范围：所有剩余箱子朝 old_dir 移动
+        for (size_t ci = 0; ci < chain->count; ++ci) {
+          size_t idx = chain->indices[ci];
+          planned[idx].row += old_dir.row;
+          planned[idx].col += old_dir.col;
+        }
+      } else {
+        // 删除的是中间元素：删除位置之后的朝 new_dir，之前的朝 old_dir
+        for (size_t ci = 0; ci < chain->count; ++ci) {
+          size_t idx = chain->indices[ci];
+          if ((int)ci >= removed_idx) {
+            planned[idx].row += new_dir.row;
+            planned[idx].col += new_dir.col;
+          } else {
+            planned[idx].row += old_dir.row;
+            planned[idx].col += old_dir.col;
+          }
+        }
+      }
     }
 
     for (size_t ci = 0; ci < chain->count; ++ci) {
@@ -1347,16 +1391,37 @@ static int planner_v3_bfs_chain_push_turn(
       }
     }
 
-    for (int i = (int)chain->count - 1; i > bend_idx; --i) {
-      size_t idx = chain->indices[i];
-      current_boxes[idx] = planned[idx];
-      chain->steps_walked[i]++;
-    }
-
-    for (int i = bend_idx - 1; i >= 0; --i) {
-      size_t idx = chain->indices[i];
-      current_boxes[idx] = planned[idx];
-      chain->steps_walked[i]++;
+    // 执行位移：基于 box_id 定位，而不是依赖易失效的索引
+    if (box_at_bend_still_in_chain && current_bend_chain_idx >= 0) {
+      // 拐弯点箱子仍在链中：跳过它，其他箱子按位置分段移动
+      for (size_t ci = 0; ci < chain->count; ++ci) {
+        size_t idx = chain->indices[ci];
+        if (idx == box_at_bend) {
+          // 跳过拐弯点箱子（已在步骤1移动）
+          continue;
+        }
+        current_boxes[idx] = planned[idx];
+        chain->steps_walked[ci]++;
+      }
+    } else {
+      // box_at_bend 在步骤1中被删除：所有箱子都移动
+      int removed_idx = box_at_bend_chain_idx;
+      if (removed_idx < 0) removed_idx = 0;
+      if (removed_idx >= (int)chain->count) {
+        // 删除的是链尾或超出范围：所有剩余箱子朝 old_dir 移动
+        for (size_t ci = 0; ci < chain->count; ++ci) {
+          size_t idx = chain->indices[ci];
+          current_boxes[idx] = planned[idx];
+          chain->steps_walked[ci]++;
+        }
+      } else {
+        // 删除的是中间元素：删除位置之后的朝 new_dir，之前的朝 old_dir
+        for (size_t ci = 0; ci < chain->count; ++ci) {
+          size_t idx = chain->indices[ci];
+          current_boxes[idx] = planned[idx];
+          chain->steps_walked[ci]++;
+        }
+      }
     }
 
     *current_car = primary_pos;
@@ -1569,7 +1634,7 @@ static int planner_v3_bfs_push_single_box_scored(
         car_to_push = planner_v3_bfs_manhattan(*current_car, push_from);
       }
 
-      int score = dist_after * 10 + adj_pen * 5 + reverse_pen + car_to_push * 2;
+      int score = dist_after * 10 + adj_pen * 5 + reverse_pen + car_to_push * 8;
 
       candidates[i].dist = dist_after;
       candidates[i].adj_pen = adj_pen;
