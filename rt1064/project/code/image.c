@@ -6,6 +6,7 @@
 #include "data_handle.h"
 #include "color_detection.h"
 #include "imu963ra_handle.h"
+#include "path_follow.h"
 
 
 uint8 image_otsuThreshold_less;
@@ -1018,80 +1019,26 @@ void huandao_clear(void)
 
 void speed_strategy(void)
 {
-	int contract_straight_speed = straight_speed;
-	int contract_translation_speed = 0;
-	if (push_box_flag == 0)
-	{
-		contract_straight_speed = straight_speed;
-		contract_translation_speed = 0;
-	}
-	else if (push_box_flag == 1)
-	{
-		if (blob_info.distance <= 100 && blob_info.area > 2700)
-		{
-			contract_straight_speed = -PID_Location_Calculate(&Camera_y_pid, blob_info.distance, TARGET_DISTANCE);
-		}
-		
-		if (blob_info.distance <= 90 && blob_info.area > 3200)
-		{
-			contract_translation_speed = PID_Location_Calculate(&Camera_x_pid, blob_info.cx, 160);
-		}
-		else
-		{
-			contract_translation_speed = 0;
-		}
-		if (blob_info.distance < 90)
-		{
-			line_error = 0;
-		}
-	}
-	else if (push_box_flag == 2)//
-	{
-		contract_straight_speed = 0;
-		contract_translation_speed = turn_speed;
-		line_error = 0;
-		speed_three_array[2] = -PID_Location_Calculate(&Gyro_rotate_pid, yaw_angle, now_rotate_angle);
-	}
-	else if (push_box_flag == 3)
-	{
-		contract_straight_speed = -PID_Location_Calculate(&Camera_y_pid, blob_info.distance, TARGET_DISTANCE);
-		contract_translation_speed = PID_Location_Calculate(&Camera_x_pid, blob_info.cx, 160);
-//		contract_straight_speed =0;
-//		contract_translation_speed =0;
-		line_error = 0;
-	}
-	else if (push_box_flag == 4)
-	{
-		contract_straight_speed = straight_speed - 20;
-		contract_translation_speed = 0;
-		line = 0;
-	}
-	else if (push_box_flag == 5)
-	{
-		contract_straight_speed = -straight_speed + 20;
-		contract_translation_speed = 0;
-		line = 0;
-	}
-	else if (push_box_flag == 6)//
-	{
-		contract_straight_speed = 0;
-		contract_translation_speed = 0;
-		speed_three_array[2] = -PID_Location_Calculate(&Gyro_rotate_pid, yaw_angle, now_rotate_angle);
-	}
+    path_follow_output_t pf = {0};
 
-	speed_three_array[0] = contract_straight_speed;
-	speed_three_array[1] = contract_translation_speed;
-	if (push_box_flag != 2 && push_box_flag != 6)
-	{
-		speed_three_array[2] = PID_Location_Calculate(&Yawpid, line_error, 0);	
-	}
-//	else if (push_box_flag == 2)
-//	{
-//		speed_three_array[2] = -PID_Location_Calculate(&Gyro_rotate_pid, yaw_angle, 95);
-//	}
-	
-	Kinematics_Inverse(speed_three_array, speed_encoder);
+    path_follow_update(yaw_angle, &pf);
+
+    if (pf.active)
+    {
+        speed_three_array[0] = pf.vx_cmd;
+        speed_three_array[1] = pf.vy_cmd;
+        speed_three_array[2] = pf.omega_cmd;
+    }
+    else
+    {
+        speed_three_array[0] = 0;
+        speed_three_array[1] = 0;
+        speed_three_array[2] = 0;
+    }
+
+    Kinematics_Inverse(speed_three_array, speed_encoder);
 }
+
 
 
 //------------------------------------------------------------------------------------------------------------------

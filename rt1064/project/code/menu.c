@@ -1,14 +1,4 @@
-﻿#include "menu.h"
-#include "motor.h"
-#include "Attitude.h"
-#include "assigned_box_planner_greedy.h"
-#include "zf_device_key.h"
-#include "zf_driver_flash.h"
-#include "data_handle.h"
-#include "config.h"
-#include "zf_common_font.h"
-#include "zf_device_ips200.h"
-#include "image.h"
+﻿#include "zf_common_headfile.h"
 #include <string.h>
 
 #define FLASH_SECTION_INDEX            127
@@ -43,10 +33,7 @@ static uint8 level_i = 2;                // 默认步进设为1，避免上电�
 static menu_runtime_t menu_rt = {0};     // 菜单运行时状态
 static uint8 display_mode = 0;           // 0:调试模式(刷新) 1:高速模式(发车后不刷新)
 static uint8 path_index_visible = 1;     // 路径序号显示开关
-extern int encoder_data_1;
-extern int encoder_data_2;
-extern int encoder_data_3;
-extern int encoder_data_4;
+
 
 extern uint8 car_go_flag;
 extern uint8 car_stop_flag;
@@ -57,6 +44,7 @@ extern size_t steps;
 extern Point path[GREEDY_AREA];
 extern int res;
 extern size_t box_target_mapping[3];
+extern PlannerChainInfo chain_info;
 
 extern float speed_k;
 extern int speed_limit;
@@ -135,9 +123,9 @@ static menu_item_t turn_speed_item;
 static menu_item_t speed_k_item;
 static menu_item_t speed_limit_item;
 static menu_item_t yuanhuan_speed_item;
-static menu_item_t gyro_kp_item;
-static menu_item_t gyro_ki_item;
-static menu_item_t gyro_kd_item;
+static menu_item_t pid_world_x_kp_item;
+static menu_item_t pid_world_x_ki_item;
+static menu_item_t pid_world_x_kd_item;
 
 static menu_item_t up_left_speed_item;
 static menu_item_t up_right_speed_item;
@@ -148,15 +136,15 @@ static menu_item_t end_decel_item;
 static menu_item_t slow_turn_item;
 static menu_item_t turn_num_item;
 
-static menu_item_t yaw_kp_item;
-static menu_item_t yaw_ki_item;
-static menu_item_t yaw_kd_item;
-static menu_item_t camx_kp_item;
-static menu_item_t camx_ki_item;
-static menu_item_t camx_kd_item;
-static menu_item_t camy_kp_item;
-static menu_item_t camy_ki_item;
-static menu_item_t camy_kd_item;
+static menu_item_t pid_world_y_kp_item;
+static menu_item_t pid_world_y_ki_item;
+static menu_item_t pid_world_y_kd_item;
+static menu_item_t pid_yaw_kp_item;
+static menu_item_t pid_yaw_ki_item;
+static menu_item_t pid_yaw_kd_item;
+static menu_item_t pid_accel_yaw_kp_item;
+static menu_item_t pid_accel_yaw_ki_item;
+static menu_item_t pid_accel_yaw_kd_item;
 
 static menu_item_t status_camera_view;
 static menu_item_t status_path_view;
@@ -173,9 +161,13 @@ static menu_item_t display_high_mode_item;
 static const menu_item_t *const main_children[] = {&cargo_menu, &param_menu, &status_menu, &image_menu, &display_menu};
 static const menu_item_t *const cargo_children[] = {&cargo_start_item, &cargo_stop_item};
 static const menu_item_t *const param_children[] = {&param_speed_menu, &param_servo_menu, &param_pid_menu};
-static const menu_item_t *const speed_children[] = {&base_speed_item, &turn_speed_item, &speed_k_item, &speed_limit_item, &yuanhuan_speed_item, &gyro_kp_item, &gyro_ki_item, &gyro_kd_item};
+static const menu_item_t *const speed_children[] = {&base_speed_item, &turn_speed_item, &speed_k_item, &speed_limit_item, &yuanhuan_speed_item};
 static const menu_item_t *const servo_children[] = {&up_left_speed_item, &up_right_speed_item, &down_left_speed_item, &down_right_speed_item, &start_acc_item, &end_decel_item, &slow_turn_item, &turn_num_item};
-static const menu_item_t *const pid_children[] = {&yaw_kp_item, &yaw_ki_item, &yaw_kd_item, &camx_kp_item, &camx_ki_item, &camx_kd_item, &camy_kp_item, &camy_ki_item, &camy_kd_item};
+static const menu_item_t *const pid_children[] = {
+    &pid_world_x_kp_item, &pid_world_x_ki_item, &pid_world_x_kd_item,
+    &pid_world_y_kp_item, &pid_world_y_ki_item, &pid_world_y_kd_item,
+    &pid_yaw_kp_item, &pid_yaw_ki_item, &pid_yaw_kd_item,
+    &pid_accel_yaw_kp_item, &pid_accel_yaw_ki_item, &pid_accel_yaw_kd_item};
 static const menu_item_t *const status_children[] = {&status_camera_view, &status_path_view, &status_pid_view, &status_imu_view, &status_flash_menu};
 static const menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
 static const menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
@@ -289,22 +281,22 @@ static menu_item_t yuanhuan_speed_item = {
     .param = {.value_ptr = &yuanhuan_speed, .min = -2000, .max = 2000, .width = 5},
 };
 
-static menu_item_t gyro_kp_item = {
-    .title = "Gy_kp",
+static menu_item_t pid_world_x_kp_item = {
+    .title = "wx_kp",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Gyro_rotate_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_x.fKp, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t gyro_ki_item = {
-    .title = "Gy_ki",
+static menu_item_t pid_world_x_ki_item = {
+    .title = "wx_ki",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Gyro_rotate_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_x.fKi, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t gyro_kd_item = {
-    .title = "Gy_kd",
+static menu_item_t pid_world_x_kd_item = {
+    .title = "wx_kd",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Gyro_rotate_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_x.fKd, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
 static menu_item_t up_left_speed_item = {
@@ -355,58 +347,58 @@ static menu_item_t turn_num_item = {
     .param = {.value_ptr = &turn_num, .min = 0, .max = 255, .width = 3},
 };
 
-static menu_item_t yaw_kp_item = {
-    .title = "SKp",
+static menu_item_t pid_world_y_kp_item = {
+    .title = "wy_kp",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Yawpid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_y.fKp, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t yaw_ki_item = {
-    .title = "SKi",
+static menu_item_t pid_world_y_ki_item = {
+    .title = "wy_ki",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Yawpid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_y.fKi, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t yaw_kd_item = {
-    .title = "SKd",
+static menu_item_t pid_world_y_kd_item = {
+    .title = "wy_kd",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Yawpid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_world_y.fKd, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camx_kp_item = {
-    .title = "xkp",
+static menu_item_t pid_yaw_kp_item = {
+    .title = "yaw_kp",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_x_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_yaw.fKp, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camx_ki_item = {
-    .title = "xki",
+static menu_item_t pid_yaw_ki_item = {
+    .title = "yaw_ki",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_x_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_yaw.fKi, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camx_kd_item = {
-    .title = "xkd",
+static menu_item_t pid_yaw_kd_item = {
+    .title = "yaw_kd",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_x_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_yaw.fKd, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camy_kp_item = {
-    .title = "ykp",
+static menu_item_t pid_accel_yaw_kp_item = {
+    .title = "ay_kp",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_y_pid.fKp, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_accel_yaw.fKp, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camy_ki_item = {
-    .title = "yki",
+static menu_item_t pid_accel_yaw_ki_item = {
+    .title = "ay_ki",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_y_pid.fKi, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_accel_yaw.fKi, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
-static menu_item_t camy_kd_item = {
-    .title = "ykd",
+static menu_item_t pid_accel_yaw_kd_item = {
+    .title = "ay_kd",
     .type = MENU_ITEM_PARAM_FLOAT,
-    .param = {.value_ptr = &Camera_y_pid.fKd, .min = 0, .max = 10, .precision = 2, .width = 3},
+    .param = {.value_ptr = &pid_accel_yaw.fKd, .min = 0, .max = 10, .precision = 3, .width = 4},
 };
 
 static menu_item_t status_camera_view = {
@@ -997,41 +989,50 @@ void draw_main_info(void)
     ips200_show_int(180, 32, steps, 4);
     ips200_show_string(140, 48, "b-t");
     for (int i=0;i<3;i++){
-        ips200_show_int(180, 64+i*16, box_target_mapping[i], 3);
+        ips200_show_int(180+i*8, 48, box_target_mapping[i], 3);
+    }
+    ips200_show_string(140, 64, "chain");
+    for (size_t i = 0; i < chain_info.chain_count; i++) {
+        for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
+            ips200_show_int(180+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
+        }
     }
 }
 
 void draw_cargo_info(void)
 {
     ips200_show_string(140, 16, "enc1");
-    ips200_show_int(180, 16, encoder_data_1, 4);
+    ips200_show_int(180, 16, up_L_all, 4);
     ips200_show_string(140, 32, "enc2");
-    ips200_show_int(180, 32, encoder_data_2, 4);
+    ips200_show_int(180, 32, up_R_all, 4);
     ips200_show_string(140, 48, "enc3");
-    ips200_show_int(180, 48, encoder_data_3, 4);
+    ips200_show_int(180, 48, down_L_all, 4);
     ips200_show_string(140, 64, "enc4");
-    ips200_show_int(180, 64, encoder_data_4, 4);
+    ips200_show_int(180, 64, down_R_all, 4);
 
-    ips200_show_string(0, 96, "huan");
-    ips200_show_uint(40, 96, huandao_flag, 1);
-    ips200_show_string(0, 112, "cross");
-    ips200_show_uint(40, 112, crossing_flag_help, 1);
-    ips200_show_string(0, 128, "line");
-    ips200_show_uint(40, 128, line, 3);
+    path_follow_draw_status();
 
-    ips200_show_string(0, 144, "lostL");
-    ips200_show_uint(48, 144, Left_Lost_Time, 3);
-    ips200_show_string(0, 160, "lostR");
-    ips200_show_uint(48, 160, Right_Lost_Time, 3);
+    // ips200_show_string(0, 96, "huan");
+    // ips200_show_uint(40, 96, huandao_flag, 1);
+    // ips200_show_string(0, 112, "cross");
+    // ips200_show_uint(40, 112, crossing_flag_help, 1);
+    // ips200_show_string(0, 128, "line");
+    // ips200_show_uint(40, 128, line, 3);
 
-    ips200_show_string(0, 176, "dist");
-    ips200_show_float(48, 176, blob_info.distance, 3, 1);
-    ips200_show_string(0, 192, "cx");
-    ips200_show_int(32, 192, blob_info.cx, 4);
-    ips200_show_string(100, 192, "push");
-    ips200_show_uint(140, 192, push_box_flag, 1);
-    ips200_show_string(0, 208, "yaw");
-    ips200_show_float(32, 208, now_rotate_angle, 3, 1);
+    // ips200_show_string(0, 144, "lostL");
+    // ips200_show_uint(48, 144, Left_Lost_Time, 3);
+    // ips200_show_string(0, 160, "lostR");
+    // ips200_show_uint(48, 160, Right_Lost_Time, 3);
+
+    // ips200_show_string(0, 176, "dist");
+    // ips200_show_float(48, 176, blob_info.distance, 3, 1);
+    // ips200_show_string(0, 192, "cx");
+    // ips200_show_int(32, 192, blob_info.cx, 4);
+    // ips200_show_string(100, 192, "push");
+    // ips200_show_uint(140, 192, push_box_flag, 1);
+    // ips200_show_string(0, 208, "yaw");
+    // ips200_show_float(32, 208, now_rotate_angle, 3, 1);
+
 }
 
 void draw_status_camera(void)
@@ -1194,13 +1195,15 @@ void draw_image_preview(void)
     ips200_show_string(0, 224, "line");
     ips200_show_uint(32, 224, num_line, 3);
     ips200_show_string(0, 240, "enc1");
-    ips200_show_int(40, 240, encoder_data_1, 4);
+    ips200_show_int(40, 240, up_L_all, 4);
     ips200_show_string(120, 240, "enc2");
-    ips200_show_int(160, 240, encoder_data_2, 4);
+    ips200_show_int(160, 240, up_R_all, 4);
     ips200_show_string(0, 256, "enc3");
-    ips200_show_int(40, 256, encoder_data_3, 4);
+    ips200_show_int(40, 256, down_L_all, 4);
     ips200_show_string(120, 256, "enc4");
-    ips200_show_int(160, 256, encoder_data_4, 4);
+    ips200_show_int(160, 256, down_R_all, 4);
+    ips200_show_string(0, 272, "all");
+    ips200_show_int(60, 272, all, 5);
 }
 
 void draw_display_mode(void)
@@ -1232,24 +1235,24 @@ uint8 param_save_to_flash(void)
     flash_union_buffer[2].float_type = speed_k;
     flash_union_buffer[3].int32_type = speed_limit;
     flash_union_buffer[4].int32_type = yuanhuan_speed;
-    flash_union_buffer[5].float_type = Gyro_rotate_pid.fKp;
-    flash_union_buffer[6].float_type = Gyro_rotate_pid.fKi;
-    flash_union_buffer[7].float_type = Gyro_rotate_pid.fKd;
+    flash_union_buffer[5].float_type = pid_world_x.fKp;
+    flash_union_buffer[6].float_type = pid_world_x.fKi;
+    flash_union_buffer[7].float_type = pid_world_x.fKd;
 
     flash_union_buffer[8].int32_type = start_accelerate;
     flash_union_buffer[9].int32_type = end_decelerate;
     flash_union_buffer[10].int32_type = slow_turn_speed;
     flash_union_buffer[11].int32_type = turn_num;
 
-    flash_union_buffer[12].float_type = Yawpid.fKp;
-    flash_union_buffer[13].float_type = Yawpid.fKi;
-    flash_union_buffer[14].float_type = Yawpid.fKd;
-    flash_union_buffer[15].float_type = Camera_x_pid.fKp;
-    flash_union_buffer[16].float_type = Camera_x_pid.fKi;
-    flash_union_buffer[17].float_type = Camera_x_pid.fKd;
-    flash_union_buffer[18].float_type = Camera_y_pid.fKp;
-    flash_union_buffer[19].float_type = Camera_y_pid.fKi;
-    flash_union_buffer[20].float_type = Camera_y_pid.fKd;
+    flash_union_buffer[12].float_type = pid_world_y.fKp;
+    flash_union_buffer[13].float_type = pid_world_y.fKi;
+    flash_union_buffer[14].float_type = pid_world_y.fKd;
+    flash_union_buffer[15].float_type = pid_yaw.fKp;
+    flash_union_buffer[16].float_type = pid_yaw.fKi;
+    flash_union_buffer[17].float_type = pid_yaw.fKd;
+    flash_union_buffer[18].float_type = pid_accel_yaw.fKp;
+    flash_union_buffer[19].float_type = pid_accel_yaw.fKi;
+    flash_union_buffer[20].float_type = pid_accel_yaw.fKd;
 
     if (flash_write_page_from_buffer(FLASH_SECTION_INDEX, FLASH_PAGE_INDEX) != 0)
     {
@@ -1273,24 +1276,24 @@ uint8 param_load_from_flash(void)
     speed_k = flash_union_buffer[2].float_type;
     speed_limit = flash_union_buffer[3].int32_type;
     yuanhuan_speed = flash_union_buffer[4].int32_type;
-    Gyro_rotate_pid.fKp = flash_union_buffer[5].float_type;
-    Gyro_rotate_pid.fKi = flash_union_buffer[6].float_type;
-    Gyro_rotate_pid.fKd = flash_union_buffer[7].float_type;
+    pid_world_x.fKp = flash_union_buffer[5].float_type;
+    pid_world_x.fKi = flash_union_buffer[6].float_type;
+    pid_world_x.fKd = flash_union_buffer[7].float_type;
 
     start_accelerate = flash_union_buffer[8].int32_type;
     end_decelerate = flash_union_buffer[9].int32_type;
     slow_turn_speed = flash_union_buffer[10].int32_type;
     turn_num = flash_union_buffer[11].int32_type;
 
-    Yawpid.fKp = flash_union_buffer[12].float_type;
-    Yawpid.fKi = flash_union_buffer[13].float_type;
-    Yawpid.fKd = flash_union_buffer[14].float_type;
-    Camera_x_pid.fKp = flash_union_buffer[15].float_type;
-    Camera_x_pid.fKi = flash_union_buffer[16].float_type;
-    Camera_x_pid.fKd = flash_union_buffer[17].float_type;
-    Camera_y_pid.fKp = flash_union_buffer[18].float_type;
-    Camera_y_pid.fKi = flash_union_buffer[19].float_type;
-    Camera_y_pid.fKd = flash_union_buffer[20].float_type;
+    pid_world_y.fKp = flash_union_buffer[12].float_type;
+    pid_world_y.fKi = flash_union_buffer[13].float_type;
+    pid_world_y.fKd = flash_union_buffer[14].float_type;
+    pid_yaw.fKp = flash_union_buffer[15].float_type;
+    pid_yaw.fKi = flash_union_buffer[16].float_type;
+    pid_yaw.fKd = flash_union_buffer[17].float_type;
+    pid_accel_yaw.fKp = flash_union_buffer[18].float_type;
+    pid_accel_yaw.fKi = flash_union_buffer[19].float_type;
+    pid_accel_yaw.fKd = flash_union_buffer[20].float_type;
 
     return 1;
 }

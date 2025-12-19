@@ -35,6 +35,7 @@
 
 #include "zf_common_headfile.h"
 
+
 #define IPS200_TYPE     (IPS200_TYPE_SPI)                                 // 并口两寸屏 这里宏定义填写 IPS200_TYPE_PARALLEL8
                                                                                 // SPI 两寸屏 这里宏定义填写 IPS200_TYPE_SPI
 #define PIT_PRIORITY_0    (PIT_IRQn)
@@ -49,10 +50,6 @@
 
 // 本例程是开源库移植用空工程
 
-int encoder_data_1 = 0;
-int encoder_data_2 = 0;
-int encoder_data_3 = 0;
-int encoder_data_4 = 0;
 int v1= 0;
 int v2= 0;
 int speed_base = 350;//122 245
@@ -119,6 +116,7 @@ int main(void)
 	menu_init();
 	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
     ips200_show_string(0, 0, "mt9v03x init.");
+<<<<<<< HEAD
 /*    while(1)
     {
         if(mt9v03x_init())
@@ -127,6 +125,16 @@ int main(void)
             break;
         system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
     }*/
+=======
+//    while(1)
+//    {
+//        if(mt9v03x_init())
+//            ips200_show_string(0, 16, "mt9v03x reinit.");
+//        else
+//            break;
+//        system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
+//    }
+>>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
 	key_init(20);
 	motor_init();
 	encoder_init();
@@ -141,9 +149,26 @@ int main(void)
 	PID_Init(&Camera_y_pid, &Camera_y_PidInitStruct);
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
+<<<<<<< HEAD
 
 	PlannerAllBoxPaths first_paths, final_paths;
 	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
+=======
+	path_follow_init(0.20f, (float)pulse_per_meter);
+	// res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping);
+	steps = 5;
+	path[0].col = 1;
+	path[0].row = 2;
+	path[1].col = 8;
+	path[1].row = 2;
+	path[2].col = 8;
+	path[2].row = 7;
+	path[3].col = 2;
+	path[3].row = 2;
+	path[4].col = 9;
+	path[4].row = 4;
+	path_follow_set_path(path, steps);
+>>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
@@ -195,37 +220,18 @@ int main(void)
 void pit_0_handler (void)
 {
     key_scanner();                                                              // 周期中断触发 标志位置位
-	
-	if (push_box_flag == 4)
-	{    
-		timer_box_cnt++;
-		if (timer_box_cnt >= 70)
-		{
-			push_box_flag = 5;
-			timer_box_cnt = 0;
-		}
-	}
-	else if (push_box_flag == 5)
-	{
-		timer_box_cnt++;
-		if (timer_box_cnt >= 30)
-		{
-			push_box_flag = 6;
-			now_rotate_angle = yaw_angle - 90;
-			timer_box_cnt = 0;
-		}
-	}
 }
 
 void pit_1_handler (void)
 {
 //    encoder_read_filtered(&encoder_data_1, &encoder_data_2, &encoder_data_3, &encoder_data_4);
-
-    speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
-
+	encoder_get();
+    // distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
+	speed_encoder[0]=25;
     if (car_go_flag == 1 && car_stop_flag == 0)
     {//修改位置在这里
         motor_control(speed_encoder);
+		// motor_pwm(straight_speed,0,0,0);
     }
     else if (car_go_flag == 1 && car_stop_flag == 1)
     {
@@ -256,5 +262,3 @@ void uart_rx_interrupt_handler(void) {
         fifo_write_buffer(&uart_data_fifo, &get_data, 1);
     }
 }
-
-
