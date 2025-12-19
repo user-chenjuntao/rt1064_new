@@ -1,15 +1,4 @@
-﻿#include "menu.h"
-#include "motor.h"
-#include "Attitude.h"
-#include "assigned_box_planner_greedy.h"
-#include "zf_device_key.h"
-#include "zf_driver_flash.h"
-#include "data_handle.h"
-#include "config.h"
-#include "zf_common_font.h"
-#include "zf_device_ips200.h"
-#include "image.h"
-#include "path_follow.h"
+﻿#include "zf_common_headfile.h"
 #include <string.h>
 
 #define FLASH_SECTION_INDEX            127
@@ -55,6 +44,7 @@ extern size_t steps;
 extern Point path[GREEDY_AREA];
 extern int res;
 extern size_t box_target_mapping[3];
+extern PlannerChainInfo chain_info;
 
 extern float speed_k;
 extern int speed_limit;
@@ -999,7 +989,13 @@ void draw_main_info(void)
     ips200_show_int(180, 32, steps, 4);
     ips200_show_string(140, 48, "b-t");
     for (int i=0;i<3;i++){
-        ips200_show_int(180, 64+i*16, box_target_mapping[i], 3);
+        ips200_show_int(180+i*8, 48, box_target_mapping[i], 3);
+    }
+    ips200_show_string(140, 64, "chain");
+    for (size_t i = 0; i < chain_info.chain_count; i++) {
+        for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
+            ips200_show_int(180+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
+        }
     }
 }
 
