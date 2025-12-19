@@ -11,6 +11,10 @@ extern "C" {
 typedef Point PlannerPointV3_BFS;
 
 #define PLANNER_V3_BFS_MAX_CHAIN_LEN 10
+#define PLANNER_V3_BFS_MAX_CHAIN_COUNT 10
+#define PLANNER_V3_BFS_MAX_BOXES 10
+#define PLANNER_V3_BFS_MAX_CELLS 400
+#define PLANNER_V3_BFS_MAX_PATH_LEN PLANNER_V3_BFS_MAX_CELLS
 
 /**
  * 链式箱子结构 - 存储主箱到链尾的所有箱子
@@ -23,6 +27,32 @@ typedef struct {
   size_t count;                                        // 链的长度（包含主箱）
   Point dir;                                           // 当前推动方向
 } PlannerBoxChain;
+
+/**
+ * 链式信息输出结构 - 用于输出所有检测到的链式组合
+ */
+typedef struct {
+  size_t chain_indices[PLANNER_V3_BFS_MAX_CHAIN_COUNT][PLANNER_V3_BFS_MAX_CHAIN_LEN];  // 每个链的箱子索引
+  size_t chain_lengths[PLANNER_V3_BFS_MAX_CHAIN_COUNT];  // 每个链的长度
+  size_t chain_count;                                     // 检测到的链式总数
+} PlannerChainInfo;
+
+/**
+ * 单个箱子的路径信息
+ */
+typedef struct {
+  Point path[PLANNER_V3_BFS_MAX_PATH_LEN];  // 路径点序列
+  size_t path_len;                           // 路径长度
+  int valid;                                 // 路径是否有效
+} PlannerBoxPathOutput;
+
+/**
+ * 所有箱子的路径信息输出结构
+ */
+typedef struct {
+  PlannerBoxPathOutput box_paths[PLANNER_V3_BFS_MAX_BOXES];  // 每个箱子的路径
+  size_t box_count;                                            // 箱子数量
+} PlannerAllBoxPaths;
 
 /**
  * 推箱规划算法 v3_BFS - 纯 BFS+A* 版本（动态贪心选择 + 多副箱子链式推动）
@@ -59,6 +89,9 @@ typedef struct {
  * @param path_buffer/path_capacity 输出路径缓存 / 容量
  * @param out_steps                 实际路径步数
  * @param out_box_target_indices    箱子到目标的映射（可选，传NULL则不输出），未分配为SIZE_MAX
+ * @param out_chain_info            链式信息输出（可选，传NULL则不输出）
+ * @param out_first_paths           第一次路径规划（忽略箱子阻挡）的所有箱子路径（可选，传NULL则不输出）
+ * @param out_final_paths           最终路径规划（考虑箱子阻挡）的所有箱子路径（可选，传NULL则不输出）
  *
  * @return 0  成功
  *         -1 参数为空
@@ -76,7 +109,10 @@ int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
                              const PlannerPointV3_BFS *obstacles,
                              size_t obstacle_count, PlannerPointV3_BFS *path_buffer,
                              size_t path_capacity, size_t *out_steps,
-                             size_t *out_box_target_indices);
+                             size_t *out_box_target_indices,
+                             PlannerChainInfo *out_chain_info,
+                             PlannerAllBoxPaths *out_first_paths,
+                             PlannerAllBoxPaths *out_final_paths);
 
 #ifdef __cplusplus
 }

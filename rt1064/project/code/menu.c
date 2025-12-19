@@ -54,6 +54,7 @@ extern volatile float now_rotate_angle;
 extern size_t steps;
 extern Point path[GREEDY_AREA];
 extern int res;
+extern size_t box_target_mapping[3];
 
 extern float speed_k;
 extern int speed_limit;
@@ -996,16 +997,10 @@ void draw_main_info(void)
     ips200_show_int(180, 16, res, 3);
     ips200_show_string(140, 32, "steps");
     ips200_show_int(180, 32, steps, 4);
-    // ips200_show_string(140, 48, "b-t");
-    // for (int i=0;i<3;i++){
-    //     ips200_show_int(180+i*8, 48, box_target_mapping[i], 3);
-    // }
-    // ips200_show_string(140, 64, "chain");
-    // for (size_t i = 0; i < chain_info.chain_count; i++) {
-    //     for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
-    //         ips200_show_int(180+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
-    //     }
-    // }
+    ips200_show_string(140, 48, "b-t");
+    for (int i=0;i<3;i++){
+        ips200_show_int(180, 64+i*16, box_target_mapping[i], 3);
+    }
 }
 
 void draw_cargo_info(void)
