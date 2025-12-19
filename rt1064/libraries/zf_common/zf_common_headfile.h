@@ -136,6 +136,7 @@
 #include "assigned_box_planner_greedy_2.h"
 #include "assigned_box_planner_greedy_3.h"
 #include "Attitude.h"
+#include "path_follow.h"
 //===================================================用户自定义文件===================================================
 
 #endif

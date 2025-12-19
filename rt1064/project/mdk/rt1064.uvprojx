@@ -539,6 +539,36 @@
               <FileType>5</FileType>
               <FilePath>..\code\QuaternionEKF.h</FilePath>
             </File>
+            <File>
+              <FileName>assigned_box_planner_greedy_2.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\assigned_box_planner_greedy_2.c</FilePath>
+            </File>
+            <File>
+              <FileName>assigned_box_planner_greedy_2.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\assigned_box_planner_greedy_2.h</FilePath>
+            </File>
+            <File>
+              <FileName>assigned_box_planner_greedy_3.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\assigned_box_planner_greedy_3.c</FilePath>
+            </File>
+            <File>
+              <FileName>assigned_box_planner_greedy_3.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\assigned_box_planner_greedy_3.h</FilePath>
+            </File>
+            <File>
+              <FileName>path_follow.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\code\path_follow.c</FilePath>
+            </File>
+            <File>
+              <FileName>path_follow.h</FileName>
+              <FileType>5</FileType>
+              <FilePath>..\code\path_follow.h</FilePath>
+            </File>
           </Files>
         </Group>
         <Group>
