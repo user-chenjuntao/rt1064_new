@@ -322,7 +322,7 @@ static int planner_v3_bomb_calc_plan_path(int rows, int cols, Point car,
     // 无炸弹方案，直接调用原算法
     return plan_boxes_greedy_v3_bfs(rows, cols, car, boxes, box_count,
                                     targets, target_count, obstacles, obstacle_count,
-                                    path_buffer, path_capacity, out_steps, NULL);
+                                    path_buffer, path_capacity, out_steps, NULL, NULL, NULL, NULL);
   }
   
   // 构建任务列表：箱子 + 炸弹
@@ -391,7 +391,7 @@ static int planner_v3_bomb_calc_plan_path(int rows, int cols, Point car,
                                           &single_bomb, 1,
                                           &single_target, 1,
                                           g_current_obstacles, current_obstacle_count,
-                                          g_temp_path, 512, &temp_steps, NULL);
+                                          g_temp_path, 512, &temp_steps, NULL, NULL, NULL, NULL);
       if (ret != 0) {
         return ret;
       }
@@ -436,7 +436,7 @@ static int planner_v3_bomb_calc_plan_path(int rows, int cols, Point car,
                                           &single_box, 1,
                                           &single_target, 1,
                                           temp_obstacles_with_boxes, temp_obstacle_count,
-                                          g_temp_path, 512, &temp_steps, NULL);
+                                          g_temp_path, 512, &temp_steps, NULL, NULL, NULL, NULL);
       if (ret != 0) {
         return ret;
       }
@@ -490,7 +490,7 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
   int baseline_ret = plan_boxes_greedy_v3_bfs(rows, cols, car, boxes, box_count,
                                                targets, target_count, obstacles, 
                                                obstacle_count, g_baseline_path, 2048,
-                                               &baseline_steps, out_box_target_indices);
+                                               &baseline_steps, out_box_target_indices, NULL, NULL, NULL);
   
   // 记录最优方案信息
   size_t best_steps = SIZE_MAX;
@@ -673,7 +673,7 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
                                               &test_items[ti], 1,
                                               &test_targets_list[ti], 1,
                                               obstacles_for_step, obstacle_count_for_step,
-                                              g_temp_path, 512, &temp_steps, NULL);
+                                              g_temp_path, 512, &temp_steps, NULL, NULL, NULL, NULL);
           if (ret != 0) {
             all_ok = 0;
             break;
