@@ -72,14 +72,14 @@ uint16 timer_box_cnt = 0;
 
 PlannerPointV3_BFS car = {1, 2};
 PlannerPointV3_BFS boxes[3] = {
-    {6, 2},  // ??×ó1
-    {7, 2},  // ??×ó2
-	{8, 2}
+    {5, 3},  // ??×ó1
+    {6, 3},  // ??×ó2
+	{3, 3},
 };
 PlannerPointV3_BFS targets[3] = {
-    {9, 5},  // ??±ê3???A
+    {9, 7},  // ??±ê3???A
     {9, 6},  // ??±ê3???B
-    {9, 7}  // ?¤á???ía??±ê??
+    {11, 2},  // ?¤á???ía??±ê??gei
 };  // è?òa??×ó?éè￥è?ò??′ê1ó???±ê
 
 PlannerPointV3_BFS obstacles[25] = {
@@ -104,6 +104,7 @@ int res;
 PlannerPointV3_BFS path[GREEDY_AREA];
 size_t used_bomb_count = 0;
 size_t box_target_mapping[3];
+PlannerChainInfo chain_info;
 size_t used_bombs[1];
 
 int main(void)
@@ -118,14 +119,14 @@ int main(void)
 	menu_init();
 	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
     ips200_show_string(0, 0, "mt9v03x init.");
-    while(1)
+/*    while(1)
     {
         if(mt9v03x_init())
             ips200_show_string(0, 16, "mt9v03x reinit.");
         else
             break;
         system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
-    }
+    }*/
 	key_init(20);
 	motor_init();
 	encoder_init();
@@ -141,7 +142,8 @@ int main(void)
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
 
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping);
+	PlannerAllBoxPaths first_paths, final_paths;
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
