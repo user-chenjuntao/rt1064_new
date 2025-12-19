@@ -33,6 +33,10 @@ static uint8 level_i = 2;                // 默认步进设为1，避免上电�
 static menu_runtime_t menu_rt = {0};     // 菜单运行时状态
 static uint8 display_mode = 0;           // 0:调试模式(刷新) 1:高速模式(发车后不刷新)
 static uint8 path_index_visible = 1;     // 路径序号显示开关
+static uint8 path_display_mode = 0;      // 0:文本模式(显示坐标) 1:图形模式(显示直线图)
+static const uint16 box_colors[5] = {RGB565_RED, RGB565_GREEN, RGB565_BLUE, RGB565_YELLOW, RGB565_MAGENTA};  // 最多5个箱子的颜色
+static uint16 path_text_page = 0;        // 文本模式当前页面
+static uint16 path_graph_page = 0;      // 图形模式当前页面（箱子索引）
 
 
 extern uint8 car_go_flag;
@@ -45,6 +49,8 @@ extern Point path[GREEDY_AREA];
 extern int res;
 extern size_t box_target_mapping[3];
 extern PlannerChainInfo chain_info;
+extern PlannerAllBoxPaths first_paths;
+extern PlannerAllBoxPaths final_paths;
 
 extern float speed_k;
 extern int speed_limit;
@@ -102,6 +108,10 @@ void draw_flash_status(void);
 void draw_image_preview(void);
 void draw_display_mode(void);
 
+void draw_path_first(void);
+void draw_path_final(void);
+void draw_car_path(void);
+
 // menu tree definitions
 static menu_item_t main_menu;
 static menu_item_t cargo_menu;
@@ -111,6 +121,7 @@ static menu_item_t param_servo_menu;
 static menu_item_t param_pid_menu;
 static menu_item_t status_menu;
 static menu_item_t status_flash_menu;
+static menu_item_t path_menu;
 static menu_item_t status_imu_view;
 static menu_item_t image_menu;
 static menu_item_t display_menu;
@@ -147,11 +158,14 @@ static menu_item_t pid_accel_yaw_ki_item;
 static menu_item_t pid_accel_yaw_kd_item;
 
 static menu_item_t status_camera_view;
-static menu_item_t status_path_view;
 static menu_item_t status_pid_view;
 static menu_item_t flash_save_item;
 static menu_item_t flash_load_item;
 static menu_item_t flash_clear_item;
+
+static menu_item_t path_first;
+static menu_item_t path_final;
+static menu_item_t path_car;
 
 static menu_item_t image_binary_view;
 static menu_item_t image_variable_view;
@@ -168,7 +182,8 @@ static const menu_item_t *const pid_children[] = {
     &pid_world_y_kp_item, &pid_world_y_ki_item, &pid_world_y_kd_item,
     &pid_yaw_kp_item, &pid_yaw_ki_item, &pid_yaw_kd_item,
     &pid_accel_yaw_kp_item, &pid_accel_yaw_ki_item, &pid_accel_yaw_kd_item};
-static const menu_item_t *const status_children[] = {&status_camera_view, &status_path_view, &status_pid_view, &status_imu_view, &status_flash_menu};
+static const menu_item_t *const status_children[] = {&status_camera_view, &path_menu, &status_pid_view, &status_imu_view, &status_flash_menu};
+static const menu_item_t *const path_children[] = {&path_first, &path_final, &path_car};
 static const menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
 static const menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
 static const menu_item_t *const display_children[] = {&display_debug_mode_item, &display_high_mode_item};
@@ -222,6 +237,13 @@ static menu_item_t status_menu = {
     .type = MENU_ITEM_PAGE,
     .children = (const menu_item_t *const *)status_children,
     .child_count = sizeof(status_children) / sizeof(status_children[0]),
+};
+
+static menu_item_t path_menu = {
+    .title = "Path",
+    .type = MENU_ITEM_PAGE,
+    .children = (const menu_item_t *const *)path_children,
+    .child_count = sizeof(path_children) / sizeof(path_children[0]),
 };
 
 static menu_item_t status_flash_menu = {
@@ -407,10 +429,22 @@ static menu_item_t status_camera_view = {
     .draw = draw_status_camera,
 };
 
-static menu_item_t status_path_view = {
-    .title = "Path",
+static menu_item_t path_first = {
+    .title = "Path_first",
     .type = MENU_ITEM_VIEW,
-    .draw = draw_status_path,
+    .draw = draw_path_first,
+};
+
+static menu_item_t path_final = {
+    .title = "Path_final",
+    .type = MENU_ITEM_VIEW,
+    .draw = draw_path_final,
+};
+
+static menu_item_t path_car = {
+    .title = "Path_car",
+    .type = MENU_ITEM_VIEW,
+    .draw = draw_car_path,
 };
 
 static menu_item_t status_pid_view = {
@@ -580,6 +614,12 @@ void menu_enter_selected(void)
             menu_rt.active_item = item;
             menu_rt.mode = MENU_MODE_VIEW;
             menu_rt.need_clear = 1;
+            // 进入路径视图时重置页面
+            if (item == &path_first || item == &path_final || item == &path_car)
+            {
+                path_text_page = 0;
+                path_graph_page = 0;
+            }
             break;
         default:
             break;
@@ -675,13 +715,139 @@ uint16 menu_total_path_pages(void)
     {
         return 1;
     }
-    uint16 total = (steps + PATH_ITEMS_PER_PAGE - 1) / PATH_ITEMS_PER_PAGE;
+    // 每页30个坐标（两列，每列15个）
+    uint16 total = (steps + 29) / 30;
     return (0 == total) ? 1 : total;
+}
+
+// 计算文本模式总页数（每个箱子从新页开始，两列，每列16个坐标）
+static uint16 calculate_text_total_pages(const PlannerAllBoxPaths *paths)
+{
+    uint16 total_pages = 0;
+    const uint16 items_per_page = 32;  // 每页32个坐标（两列，每列16个）
+    
+    for (size_t i = 0; i < paths->box_count && i < 5; i++)
+    {
+        if (paths->box_paths[i].valid && paths->box_paths[i].path_len > 0)
+        {
+            // 每个箱子的路径占用的页数
+            uint16 box_pages = (paths->box_paths[i].path_len + items_per_page - 1) / items_per_page;
+            total_pages += box_pages;
+        }
+    }
+    return (total_pages == 0) ? 1 : total_pages;
+}
+
+// 计算图形模式总页数（每个箱子一页）
+static uint16 calculate_graph_total_pages(const PlannerAllBoxPaths *paths)
+{
+    uint16 count = 0;
+    for (size_t i = 0; i < paths->box_count && i < 5; i++)
+    {
+        if (paths->box_paths[i].valid && paths->box_paths[i].path_len >= 2)
+        {
+            count++;
+        }
+    }
+    return (count == 0) ? 1 : count;
 }
 
 void menu_handle_view_keys(key_state_enum k1, key_state_enum k2, key_state_enum k3, key_state_enum k4)
 {
-    if (&status_path_view == menu_rt.active_item)
+    // 处理path_car视图（小车路径）
+    if (menu_rt.active_item == &path_car)
+    {
+        if (path_display_mode == 0)
+        {
+            // 文本模式：分页显示
+            uint16 total_pages = menu_total_path_pages();
+            if (k1 == KEY_SHORT_PRESS || k1 == KEY_LONG_PRESS)
+            {
+                if (path_text_page > 0)
+                {
+                    path_text_page--;
+                    menu_rt.need_clear = 1;
+                }
+            }
+            if (k2 == KEY_SHORT_PRESS || k2 == KEY_LONG_PRESS)
+            {
+                if (path_text_page + 1 < total_pages)
+                {
+                    path_text_page++;
+                    menu_rt.need_clear = 1;
+                }
+            }
+        }
+        else
+        {
+            // 图形模式：只有一页（小车路径）
+            // 不需要翻页
+        }
+        if (k3 == KEY_SHORT_PRESS || k3 == KEY_LONG_PRESS)
+        {
+            path_display_mode = !path_display_mode;
+            path_text_page = 0;
+            path_graph_page = 0;
+            menu_rt.need_clear = 1;
+        }
+    }
+    // 处理path_first和path_final视图（箱子路径）
+    else if (menu_rt.active_item == &path_first || menu_rt.active_item == &path_final)
+    {
+        const PlannerAllBoxPaths *paths = (menu_rt.active_item == &path_first) ? &first_paths : &final_paths;
+        
+        if (path_display_mode == 0)
+        {
+            // 文本模式：分页显示
+            uint16 total_pages = calculate_text_total_pages(paths);
+            if (k1 == KEY_SHORT_PRESS || k1 == KEY_LONG_PRESS)
+            {
+                if (path_text_page > 0)
+                {
+                    path_text_page--;
+                    menu_rt.need_clear = 1;
+                }
+            }
+            if (k2 == KEY_SHORT_PRESS || k2 == KEY_LONG_PRESS)
+            {
+                if (path_text_page + 1 < total_pages)
+                {
+                    path_text_page++;
+                    menu_rt.need_clear = 1;
+                }
+            }
+        }
+        else
+        {
+            // 图形模式：每个箱子一页
+            uint16 total_pages = calculate_graph_total_pages(paths);
+            if (k1 == KEY_SHORT_PRESS || k1 == KEY_LONG_PRESS)
+            {
+                if (path_graph_page > 0)
+                {
+                    path_graph_page--;
+                    menu_rt.need_clear = 1;
+                }
+            }
+            if (k2 == KEY_SHORT_PRESS || k2 == KEY_LONG_PRESS)
+            {
+                if (path_graph_page + 1 < total_pages)
+                {
+                    path_graph_page++;
+                    menu_rt.need_clear = 1;
+                }
+            }
+        }
+        if (k3 == KEY_SHORT_PRESS || k3 == KEY_LONG_PRESS)
+        {
+            path_display_mode = !path_display_mode;
+            path_text_page = 0;
+            path_graph_page = 0;
+            menu_rt.need_clear = 1;
+        }
+    }
+    // 处理path_menu视图（路径菜单）
+    else if (&path_menu == menu_rt.active_item)
     {
         uint16 total_pages = menu_total_path_pages();
         if (k1 == KEY_SHORT_PRESS || k1 == KEY_LONG_PRESS)
@@ -830,9 +996,31 @@ void menu_draw_hint(void)
     }
     else
     {
-        if (&status_path_view == menu_rt.active_item)
+        if (menu_rt.active_item == &path_car)
         {
-            ips200_show_string(0, 304, "K1:PREV K2:NEXT K3:IDX K4:BACK");
+            if (path_display_mode == 0)
+            {
+                ips200_show_string(0, 304, "K1:PRE K2:NEXT K3:GRA K4:BACK");
+            }
+            else
+            {
+                ips200_show_string(0, 304, "K1:PRE K2:NEXT K3:TEX K4:BACK");
+            }
+        }
+        else if (menu_rt.active_item == &path_first || menu_rt.active_item == &path_final)
+        {
+            if (path_display_mode == 0)
+            {
+                ips200_show_string(0, 304, "K1:UP K2:DOWN K3:GRA K4:BACK");
+            }
+            else
+            {
+                ips200_show_string(0, 304, "K1:UP K2:DOWN K3:TEX K4:BACK");
+            }
+        }
+        else if (&path_menu == menu_rt.active_item)
+        {
+            ips200_show_string(0, 304, "K1:PRE K2:NEXT K3:IDX K4:BACK");
         }
         else
         {
@@ -858,6 +1046,9 @@ void menu_init(void)
     menu_rt.flash_result = FLASH_RESULT_NONE;
     display_mode = 0;
     path_index_visible = 1;
+    path_display_mode = 0;
+    path_text_page = 0;
+    path_graph_page = 0;
 }
 
 void menu_display(void)
@@ -873,7 +1064,13 @@ void menu_display(void)
         menu_rt.need_clear = 0;
     }
 
-    if (!(MENU_MODE_VIEW == menu_rt.mode && (menu_rt.active_item == &status_path_view || menu_rt.active_item == &status_imu_view)))
+    // 路径视图（path_first, path_final, path_car）不显示菜单头部和列表
+    if (!(MENU_MODE_VIEW == menu_rt.mode && 
+          (menu_rt.active_item == &path_menu || 
+           menu_rt.active_item == &path_first || 
+           menu_rt.active_item == &path_final || 
+           menu_rt.active_item == &path_car || 
+           menu_rt.active_item == &status_imu_view)))
     {
         menu_draw_header();
         menu_draw_list();
@@ -1052,75 +1249,373 @@ void draw_status_camera(void)
     ips200_show_float(40, 224, blob_info.distance, 3, 1);
 }
 
-void draw_status_path(void)
+void draw_car_path(void)
 {
-    uint16 total_pages = menu_total_path_pages();
-    if (menu_rt.path_page >= total_pages)
+    if (path_display_mode == 0)
     {
-        menu_rt.path_page = (total_pages > 0) ? total_pages - 1 : 0;
-    }
-
-    uint16 start = menu_rt.path_page * PATH_ITEMS_PER_PAGE;
-    uint16 end = start + PATH_ITEMS_PER_PAGE;
-    if (end > steps)
-    {
-        end = steps;
-    }
-
-    const uint16 rows_per_col = PATH_ITEMS_PER_PAGE / 2; // 16
-    const uint16 col_width = 112;
-    const uint16 x_right = col_width + 8; // 120
-
-    ips200_show_string(0, 0, "Path page");
-    ips200_show_uint(72, 0, menu_rt.path_page + 1, 2);
-    ips200_show_string(88, 0, "/");
-    ips200_show_uint(96, 0, total_pages, 2);
-
-    ips200_draw_line(col_width, 16, col_width, 16 + rows_per_col * 16, RGB565_WHITE);
-
-    if (path_index_visible)
-    {
-        ips200_set_color(RGB565_CYAN, RGB565_BLACK);
-    }
-
-    for (uint16 row = 0; row < rows_per_col; row++)
-    {
-        uint16 left_idx = start + row;
-        uint16 right_idx = start + rows_per_col + row;
-        uint16 y = 16 + row * 16;
-
-        if (left_idx < end)
+        // 文本模式：分两列显示，每列15个坐标
+        const uint16 items_per_page = 30;  // 每页30个坐标（两列，每列15个）
+        const uint16 rows_per_col = 15;     // 每列15行
+        const uint16 col_width = 112;       // 列宽
+        const uint16 x_right = col_width + 8;  // 右列起始x坐标
+        
+        uint16 total_pages = menu_total_path_pages();
+        if (path_text_page >= total_pages)
         {
-            if (path_index_visible)
+            path_text_page = (total_pages > 0) ? total_pages - 1 : 0;
+        }
+
+        uint16 start = path_text_page * items_per_page;
+        uint16 end = start + items_per_page;
+        if (end > steps)
+        {
+            end = steps;
+        }
+        
+        // 如果steps为0或没有数据，只显示页码信息
+        if (steps == 0 || end <= start)
+        {
+            ips200_show_uint(72, 0, path_text_page + 1, 2);
+            ips200_show_string(88, 0, "/");
+            ips200_show_uint(96, 0, total_pages, 2);
+            return;
+        }
+
+        ips200_show_string(0, 0, "Path page");
+        ips200_show_uint(72, 0, path_text_page + 1, 2);
+        ips200_show_string(88, 0, "/");
+        ips200_show_uint(96, 0, total_pages, 2);
+
+        // 绘制分页线，确保y坐标在屏幕范围内
+        uint16 line_y_end = 16 + rows_per_col * 16;
+        if (line_y_end > 319) line_y_end = 319;  // 确保不超过屏幕高度
+        ips200_draw_line(col_width, 16, col_width, line_y_end, RGB565_WHITE);
+
+        if (path_index_visible)
+        {
+            ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+        }
+
+        for (uint16 row = 0; row < rows_per_col; row++)
+        {
+            uint16 left_idx = start + row;
+            uint16 right_idx = start + rows_per_col + row;
+            uint16 y = 16 + row * 16;
+
+            if (left_idx < end)
             {
-                ips200_show_uint(0, y, left_idx, 3);
+                if (path_index_visible)
+                {
+                    ips200_show_uint(0, y, left_idx, 3);
+                }
+                ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+                ips200_show_uint(32, y, path[left_idx].row, 3);
+                ips200_show_uint(64, y, path[left_idx].col, 3);
+                if (path_index_visible)
+                {
+                    ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+                }
             }
-            ips200_set_color(RGB565_WHITE, RGB565_BLACK);
-            ips200_show_uint(32, y, path[left_idx].row, 3);
-            ips200_show_uint(64, y, path[left_idx].col, 3);
-            if (path_index_visible)
+
+            if (right_idx < end)
             {
-                ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+                if (path_index_visible)
+                {
+                    ips200_show_uint(x_right, y, right_idx, 3);
+                }
+                ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+                ips200_show_uint(x_right + 32, y, path[right_idx].row, 3);
+                ips200_show_uint(x_right + 64, y, path[right_idx].col, 3);
+                if (path_index_visible)
+                {
+                    ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+                }
             }
         }
 
-        if (right_idx < end)
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    }
+    else
+    {
+        // 图形模式：绘制路径直线图（连接所有点）
+        const uint16 offset_y = 16;  // 向下平移
+        const uint16 scale = 15;     // 坐标扩大15倍
+        
+        if (steps < 2)
         {
-            if (path_index_visible)
+            return;
+        }
+        
+        // 绘制小车路径（连接所有点）
+        for (size_t i = 0; i < steps - 1; i++)
+        {
+            uint16 x1 = path[i].col * scale;
+            uint16 y1 = path[i].row * scale + offset_y;
+            uint16 x2 = path[i + 1].col * scale;
+            uint16 y2 = path[i + 1].row * scale + offset_y;
+            
+            // 确保坐标在屏幕范围内（ips200_draw_line会检查边界，超出会触发断言）
+            if (x1 < 240 && y1 < 320 && x2 < 240 && y2 < 320)
             {
-                ips200_show_uint(x_right, y, right_idx, 3);
-            }
-            ips200_set_color(RGB565_WHITE, RGB565_BLACK);
-            ips200_show_uint(x_right + 32, y, path[right_idx].row, 3);
-            ips200_show_uint(x_right + 64, y, path[right_idx].col, 3);
-            if (path_index_visible)
-            {
-                ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+                ips200_draw_line(x1, y1, x2, y2, RGB565_WHITE);
             }
         }
+        
+        // 在倒数第4行显示信息（320 - 4*16 = 256）
+        ips200_show_string(0, 256, "Car Path");
     }
+}
 
-    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+void draw_path_first(void)
+{
+    if (path_display_mode == 0)
+    {
+        // 文本模式：分两列显示，每列16个坐标，每个箱子从新页开始
+        const uint16 items_per_page = 32;  // 每页32个坐标（两列，每列16个）
+        const uint16 items_per_col = 16;   // 每列16个
+        const uint16 col_width = 112;      // 列宽
+        const uint16 x_right = col_width + 8;  // 右列起始x坐标
+        
+        // 找到当前页面对应的箱子
+        uint16 current_page = path_text_page;
+        size_t current_box_idx = 0;
+        uint16 box_page_offset = 0;
+        uint16 accumulated_pages = 0;
+        
+        for (size_t i = 0; i < first_paths.box_count && i < 5; i++)
+        {
+            if (first_paths.box_paths[i].valid && first_paths.box_paths[i].path_len > 0)
+            {
+                uint16 box_pages = (first_paths.box_paths[i].path_len + items_per_page - 1) / items_per_page;
+                if (current_page < accumulated_pages + box_pages)
+                {
+                    current_box_idx = i;
+                    box_page_offset = current_page - accumulated_pages;
+                    break;
+                }
+                accumulated_pages += box_pages;
+            }
+        }
+        
+        PlannerBoxPathOutput *box_path = &first_paths.box_paths[current_box_idx];
+        if (!box_path->valid || box_path->path_len == 0)
+        {
+            return;
+        }
+        
+        // 计算当前箱子在当前页的起始索引
+        uint16 start_in_box = box_page_offset * items_per_page;
+        uint16 end_in_box = start_in_box + items_per_page;
+        if (end_in_box > box_path->path_len)
+        {
+            end_in_box = box_path->path_len;
+        }
+        
+        // 绘制分页线
+        ips200_draw_line(col_width, 16, col_width, 16 + items_per_col * 16, RGB565_WHITE);
+        
+        // 显示页面信息和箱子编号
+        uint16 total_pages = calculate_text_total_pages(&first_paths);
+        ips200_show_string(0, 0, "Box");
+        ips200_show_uint(32, 0, current_box_idx, 1);
+        ips200_show_string(48, 0, "Page");
+        ips200_show_uint(88, 0, path_text_page + 1, 2);
+        ips200_show_string(104, 0, "/");
+        ips200_show_uint(112, 0, total_pages, 2);
+        
+        // 显示当前页的坐标
+        for (size_t i = start_in_box; i < end_in_box; i++)
+        {
+            uint16 local_idx = i - start_in_box;
+            uint16 row = local_idx % items_per_col;
+            uint16 col = local_idx / items_per_col;
+            uint16 y = 16 + row * 16;
+            uint16 x = (col == 0) ? 0 : x_right;
+            
+            ips200_show_uint(x, y, i, 3);
+            ips200_show_uint(x + 32, y, box_path->path[i].row, 3);
+            ips200_show_uint(x + 64, y, box_path->path[i].col, 3);
+        }
+    }
+    else
+    {
+        // 图形模式：每个箱子一页
+        const uint16 offset_y = 16;  // 向下平移
+        const uint16 scale = 15;     // 坐标扩大15倍
+        
+        // 找到当前页面对应的箱子索引
+        size_t current_box_idx = 0;
+        size_t valid_box_count = 0;
+        
+        for (size_t i = 0; i < first_paths.box_count && i < 5; i++)
+        {
+            if (first_paths.box_paths[i].valid && first_paths.box_paths[i].path_len >= 2)
+            {
+                if (valid_box_count == path_graph_page)
+                {
+                    current_box_idx = i;
+                    break;
+                }
+                valid_box_count++;
+            }
+        }
+        
+        PlannerBoxPathOutput *box_path = &first_paths.box_paths[current_box_idx];
+        if (box_path->valid && box_path->path_len >= 2)
+        {
+            uint16 color = box_colors[current_box_idx % 5];
+            
+            // 绘制该箱子的路径（连接所有点）
+            for (size_t i = 0; i < box_path->path_len - 1; i++)
+            {
+                uint16 x1 = box_path->path[i].col * scale;
+                uint16 y1 = box_path->path[i].row * scale + offset_y;
+                uint16 x2 = box_path->path[i + 1].col * scale;
+                uint16 y2 = box_path->path[i + 1].row * scale + offset_y;
+                
+                // 确保坐标在屏幕范围内
+                if (x1 < 240 && y1 < 320 && x2 < 240 && y2 < 320)
+                {
+                    ips200_draw_line(x1, y1, x2, y2, color);
+                }
+            }
+            
+            // 在倒数第4行显示箱子编号（320 - 4*16 = 256）
+            ips200_show_string(0, 256, "Box");
+            ips200_show_uint(32, 256, current_box_idx, 1);
+            uint16 total_pages = calculate_graph_total_pages(&first_paths);
+            ips200_show_string(64, 256, "Page");
+            ips200_show_uint(104, 256, path_graph_page + 1, 1);
+            ips200_show_string(112, 256, "/");
+            ips200_show_uint(120, 256, total_pages, 1);
+        }
+    }
+}
+
+void draw_path_final(void)
+{
+    if (path_display_mode == 0)
+    {
+        // 文本模式：分两列显示，每列16个坐标，每个箱子从新页开始
+        const uint16 items_per_page = 32;  // 每页32个坐标（两列，每列16个）
+        const uint16 items_per_col = 16;   // 每列16个
+        const uint16 col_width = 112;      // 列宽
+        const uint16 x_right = col_width + 8;  // 右列起始x坐标
+        
+        // 找到当前页面对应的箱子
+        uint16 current_page = path_text_page;
+        size_t current_box_idx = 0;
+        uint16 box_page_offset = 0;
+        uint16 accumulated_pages = 0;
+        
+        for (size_t i = 0; i < final_paths.box_count && i < 5; i++)
+        {
+            if (final_paths.box_paths[i].valid && final_paths.box_paths[i].path_len > 0)
+            {
+                uint16 box_pages = (final_paths.box_paths[i].path_len + items_per_page - 1) / items_per_page;
+                if (current_page < accumulated_pages + box_pages)
+                {
+                    current_box_idx = i;
+                    box_page_offset = current_page - accumulated_pages;
+                    break;
+                }
+                accumulated_pages += box_pages;
+            }
+        }
+        
+        PlannerBoxPathOutput *box_path = &final_paths.box_paths[current_box_idx];
+        if (!box_path->valid || box_path->path_len == 0)
+        {
+            return;
+        }
+        
+        // 计算当前箱子在当前页的起始索引
+        uint16 start_in_box = box_page_offset * items_per_page;
+        uint16 end_in_box = start_in_box + items_per_page;
+        if (end_in_box > box_path->path_len)
+        {
+            end_in_box = box_path->path_len;
+        }
+        
+        // 绘制分页线
+        ips200_draw_line(col_width, 16, col_width, 16 + items_per_col * 16, RGB565_WHITE);
+        
+        // 显示页面信息和箱子编号
+        uint16 total_pages = calculate_text_total_pages(&final_paths);
+        ips200_show_string(0, 0, "Box");
+        ips200_show_uint(32, 0, current_box_idx, 1);
+        ips200_show_string(48, 0, "Page");
+        ips200_show_uint(88, 0, path_text_page + 1, 2);
+        ips200_show_string(104, 0, "/");
+        ips200_show_uint(112, 0, total_pages, 2);
+        
+        // 显示当前页的坐标
+        for (size_t i = start_in_box; i < end_in_box; i++)
+        {
+            uint16 local_idx = i - start_in_box;
+            uint16 row = local_idx % items_per_col;
+            uint16 col = local_idx / items_per_col;
+            uint16 y = 16 + row * 16;
+            uint16 x = (col == 0) ? 0 : x_right;
+            
+            ips200_show_uint(x, y, i, 3);
+            ips200_show_uint(x + 32, y, box_path->path[i].row, 3);
+            ips200_show_uint(x + 64, y, box_path->path[i].col, 3);
+        }
+    }
+    else
+    {
+        // 图形模式：每个箱子一页
+        const uint16 offset_y = 16;  // 向下平移
+        const uint16 scale = 15;     // 坐标扩大15倍
+        
+        // 找到当前页面对应的箱子索引
+        size_t current_box_idx = 0;
+        size_t valid_box_count = 0;
+        
+        for (size_t i = 0; i < final_paths.box_count && i < 5; i++)
+        {
+            if (final_paths.box_paths[i].valid && final_paths.box_paths[i].path_len >= 2)
+            {
+                if (valid_box_count == path_graph_page)
+                {
+                    current_box_idx = i;
+                    break;
+                }
+                valid_box_count++;
+            }
+        }
+        
+        PlannerBoxPathOutput *box_path = &final_paths.box_paths[current_box_idx];
+        if (box_path->valid && box_path->path_len >= 2)
+        {
+            uint16 color = box_colors[current_box_idx % 5];
+            
+            // 绘制该箱子的路径（连接所有点）
+            for (size_t i = 0; i < box_path->path_len - 1; i++)
+            {
+                uint16 x1 = box_path->path[i].col * scale;
+                uint16 y1 = box_path->path[i].row * scale + offset_y;
+                uint16 x2 = box_path->path[i + 1].col * scale;
+                uint16 y2 = box_path->path[i + 1].row * scale + offset_y;
+                
+                // 确保坐标在屏幕范围内
+                if (x1 < 240 && y1 < 320 && x2 < 240 && y2 < 320)
+                {
+                    ips200_draw_line(x1, y1, x2, y2, color);
+                }
+            }
+            
+            // 在倒数第4行显示箱子编号（320 - 4*16 = 256）
+            ips200_show_string(0, 256, "Box");
+            ips200_show_uint(32, 256, current_box_idx, 1);
+            uint16 total_pages = calculate_graph_total_pages(&final_paths);
+            ips200_show_string(64, 256, "Page");
+            ips200_show_uint(104, 256, path_graph_page + 1, 1);
+            ips200_show_string(112, 256, "/");
+            ips200_show_uint(120, 256, total_pages, 1);
+        }
+    }
 }
 
 void draw_status_pid(void)
@@ -1307,3 +1802,4 @@ uint8 param_clear_flash(void)
     }
     return 1;
 }
+
