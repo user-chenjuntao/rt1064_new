@@ -1,5 +1,6 @@
 ﻿#include "zf_common_headfile.h"
 #include <string.h>
+#include "path_follow.h"
 
 #define FLASH_SECTION_INDEX            127
 #define FLASH_PAGE_INDEX               FLASH_PAGE_3
@@ -70,6 +71,9 @@ extern uint8 Left_Lost_Time;
 extern uint8 Right_Lost_Time;
 extern uint8 num_line;
 
+extern Point corner_path[50];  // 拐点路径缓冲区
+extern size_t corner_steps;         // 拐点数量
+
 // menu helpers
 void menu_bind_parents(menu_item_t *parent);
 menu_item_t *menu_get_selected_item(void);
@@ -111,6 +115,7 @@ void draw_display_mode(void);
 void draw_path_first(void);
 void draw_path_final(void);
 void draw_car_path(void);
+void draw_path_easy(void);
 
 // menu tree definitions
 static menu_item_t main_menu;
@@ -166,6 +171,7 @@ static menu_item_t flash_clear_item;
 static menu_item_t path_first;
 static menu_item_t path_final;
 static menu_item_t path_car;
+static menu_item_t path_easy;
 
 static menu_item_t image_binary_view;
 static menu_item_t image_variable_view;
@@ -183,7 +189,7 @@ static const menu_item_t *const pid_children[] = {
     &pid_yaw_kp_item, &pid_yaw_ki_item, &pid_yaw_kd_item,
     &pid_accel_yaw_kp_item, &pid_accel_yaw_ki_item, &pid_accel_yaw_kd_item};
 static const menu_item_t *const status_children[] = {&status_camera_view, &path_menu, &status_pid_view, &status_imu_view, &status_flash_menu};
-static const menu_item_t *const path_children[] = {&path_first, &path_final, &path_car};
+static const menu_item_t *const path_children[] = {&path_first, &path_final, &path_car, &path_easy};
 static const menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
 static const menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
 static const menu_item_t *const display_children[] = {&display_debug_mode_item, &display_high_mode_item};
@@ -447,6 +453,12 @@ static menu_item_t path_car = {
     .draw = draw_car_path,
 };
 
+static menu_item_t path_easy = {
+    .title = "Path_easy",
+    .type = MENU_ITEM_VIEW,
+    .draw = draw_path_easy,
+};
+
 static menu_item_t status_pid_view = {
     .title = "PID",
     .type = MENU_ITEM_VIEW,
@@ -619,6 +631,12 @@ void menu_enter_selected(void)
             {
                 path_text_page = 0;
                 path_graph_page = 0;
+            }
+            // 进入path_easy时提取拐点
+            if (item == &path_easy)
+            {
+                path_text_page = 0;
+                corner_steps = path_follow_extract_corners(path, steps, corner_path, GREEDY_AREA);
             }
             break;
         default:
@@ -846,6 +864,33 @@ void menu_handle_view_keys(key_state_enum k1, key_state_enum k2, key_state_enum 
             menu_rt.need_clear = 1;
         }
     }
+    // 处理path_easy视图（拐点路径）
+    else if (menu_rt.active_item == &path_easy)
+    {
+        // 计算拐点路径的总页数
+        uint16 total_pages = (corner_steps == 0) ? 1 : ((corner_steps + 29) / 30);
+        if (k1 == KEY_SHORT_PRESS || k1 == KEY_LONG_PRESS)
+        {
+            if (path_text_page > 0)
+            {
+                path_text_page--;
+                menu_rt.need_clear = 1;
+            }
+        }
+        if (k2 == KEY_SHORT_PRESS || k2 == KEY_LONG_PRESS)
+        {
+            if (path_text_page + 1 < total_pages)
+            {
+                path_text_page++;
+                menu_rt.need_clear = 1;
+            }
+        }
+        if (k3 == KEY_SHORT_PRESS || k3 == KEY_LONG_PRESS)
+        {
+            path_index_visible = !path_index_visible;
+            menu_rt.need_clear = 1;
+        }
+    }
     // 处理path_menu视图（路径菜单）
     else if (&path_menu == menu_rt.active_item)
     {
@@ -1018,6 +1063,10 @@ void menu_draw_hint(void)
                 ips200_show_string(0, 304, "K1:UP K2:DOWN K3:TEX K4:BACK");
             }
         }
+        else if (menu_rt.active_item == &path_easy)
+        {
+            ips200_show_string(0, 304, "K1:PRE K2:NEXT K3:IDX K4:BACK");
+        }
         else if (&path_menu == menu_rt.active_item)
         {
             ips200_show_string(0, 304, "K1:PRE K2:NEXT K3:IDX K4:BACK");
@@ -1064,12 +1113,13 @@ void menu_display(void)
         menu_rt.need_clear = 0;
     }
 
-    // 路径视图（path_first, path_final, path_car）不显示菜单头部和列表
+    // 路径视图（path_first, path_final, path_car, path_easy）不显示菜单头部和列表
     if (!(MENU_MODE_VIEW == menu_rt.mode && 
           (menu_rt.active_item == &path_menu || 
            menu_rt.active_item == &path_first || 
            menu_rt.active_item == &path_final || 
            menu_rt.active_item == &path_car || 
+           menu_rt.active_item == &path_easy || 
            menu_rt.active_item == &status_imu_view)))
     {
         menu_draw_header();
@@ -1247,6 +1297,92 @@ void draw_status_camera(void)
 
     ips200_show_string(0, 224, "dist");
     ips200_show_float(40, 224, blob_info.distance, 3, 1);
+}
+
+void draw_path_easy(void)
+{
+    // 文本模式：分两列显示，每列15个坐标
+    const uint16 items_per_page = 30;  // 每页30个坐标（两列，每列15个）
+    const uint16 rows_per_col = 15;     // 每列15行
+    const uint16 col_width = 112;       // 列宽
+    const uint16 x_right = col_width + 8;  // 右列起始x坐标
+    
+    uint16 total_pages = (corner_steps == 0) ? 1 : ((corner_steps + 29) / 30);
+    if (path_text_page >= total_pages)
+    {
+        path_text_page = (total_pages > 0) ? total_pages - 1 : 0;
+    }
+
+    uint16 start = path_text_page * items_per_page;
+    uint16 end = start + items_per_page;
+    if (end > corner_steps)
+    {
+        end = corner_steps;
+    }
+    
+    // 如果corner_steps为0或没有数据，只显示页码信息
+    if (corner_steps == 0 || end <= start)
+    {
+        ips200_show_string(0, 0, "Corner page");
+        ips200_show_uint(88, 0, path_text_page + 1, 2);
+        ips200_show_string(96, 0, "/");
+        ips200_show_uint(104, 0, total_pages, 2);
+        return;
+    }
+
+    ips200_show_string(0, 0, "Corner page");
+    ips200_show_uint(88, 0, path_text_page + 1, 2);
+    ips200_show_string(96, 0, "/");
+    ips200_show_uint(104, 0, total_pages, 2);
+
+    // 绘制分页线，确保y坐标在屏幕范围内
+    uint16 line_y_end = 16 + rows_per_col * 16;
+    if (line_y_end > 319) line_y_end = 319;  // 确保不超过屏幕高度
+    ips200_draw_line(col_width, 16, col_width, line_y_end, RGB565_WHITE);
+
+    if (path_index_visible)
+    {
+        ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+    }
+
+    for (uint16 row = 0; row < rows_per_col; row++)
+    {
+        uint16 left_idx = start + row;
+        uint16 right_idx = start + rows_per_col + row;
+        uint16 y = 16 + row * 16;
+
+        if (left_idx < end)
+        {
+            if (path_index_visible)
+            {
+                ips200_show_uint(0, y, left_idx, 3);
+            }
+            ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+            ips200_show_uint(32, y, corner_path[left_idx].row, 3);
+            ips200_show_uint(64, y, corner_path[left_idx].col, 3);
+            if (path_index_visible)
+            {
+                ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+            }
+        }
+
+        if (right_idx < end)
+        {
+            if (path_index_visible)
+            {
+                ips200_show_uint(x_right, y, right_idx, 3);
+            }
+            ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+            ips200_show_uint(x_right + 32, y, corner_path[right_idx].row, 3);
+            ips200_show_uint(x_right + 64, y, corner_path[right_idx].col, 3);
+            if (path_index_visible)
+            {
+                ips200_set_color(RGB565_CYAN, RGB565_BLACK);
+            }
+        }
+    }
+
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
 }
 
 void draw_car_path(void)

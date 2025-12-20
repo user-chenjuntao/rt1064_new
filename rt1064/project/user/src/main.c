@@ -69,15 +69,15 @@ uint16 timer_box_cnt = 0;
 
 PlannerPointV3_BFS car = {1, 2};
 PlannerPointV3_BFS boxes[3] = {
-    {5, 3},  // ??×ó1
-    {6, 3},  // ??×ó2
-	{3, 3},
+    {6, 2},  // ??×?1
+    {7, 2},  // ??×?2
+	{8, 2}
 };
 PlannerPointV3_BFS targets[3] = {
-    {9, 7},  // ??±ê3???A
-    {9, 6},  // ??±ê3???B
-    {11, 2},  // ?¤á???ía??±ê??gei
-};  // è?òa??×ó?éè￥è?ò??′ê1ó???±ê
+    {9, 5},  // ??±ê????A
+    {9, 6},  // ??±ê????B
+    {9, 7}  // ?¤????????±ê??
+};  // ??????×?????????????????±ê
 
 PlannerPointV3_BFS obstacles[25] = {
 
@@ -103,6 +103,11 @@ size_t used_bomb_count = 0;
 size_t box_target_mapping[3];
 PlannerChainInfo chain_info;
 size_t used_bombs[1];
+PlannerAllBoxPaths first_paths, final_paths;
+
+Point corner_path[50];   // 拐点缓冲区
+size_t corner_steps = 0;   // 拐点数量
+
 
 int main(void)
 {
@@ -116,16 +121,6 @@ int main(void)
 	menu_init();
 	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
     ips200_show_string(0, 0, "mt9v03x init.");
-<<<<<<< HEAD
-/*    while(1)
-    {
-        if(mt9v03x_init())
-            ips200_show_string(0, 16, "mt9v03x reinit.");
-        else
-            break;
-        system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
-    }*/
-=======
 //    while(1)
 //    {
 //        if(mt9v03x_init())
@@ -134,7 +129,6 @@ int main(void)
 //            break;
 //        system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
 //    }
->>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
 	key_init(20);
 	motor_init();
 	encoder_init();
@@ -149,26 +143,11 @@ int main(void)
 	PID_Init(&Camera_y_pid, &Camera_y_PidInitStruct);
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
-<<<<<<< HEAD
 
-	PlannerAllBoxPaths first_paths, final_paths;
+	
+	path_follow_init(0.40f, (float)pulse_per_meter);
+	
 	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
-=======
-	path_follow_init(0.20f, (float)pulse_per_meter);
-	// res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping);
-	steps = 5;
-	path[0].col = 1;
-	path[0].row = 2;
-	path[1].col = 8;
-	path[1].row = 2;
-	path[2].col = 8;
-	path[2].row = 7;
-	path[3].col = 2;
-	path[3].row = 2;
-	path[4].col = 9;
-	path[4].row = 4;
-	path_follow_set_path(path, steps);
->>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
@@ -177,7 +156,14 @@ int main(void)
 	{
 		ips200_show_string(0, 16, "path reinit.");
 	}
-//	system_delay_ms(1000);
+	corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
+
+	if (corner_steps > 0)
+	{
+		// 使用提取的拐点设置路径
+		path_follow_set_path(corner_path, corner_steps);
+	}
+
 	imu963ra_init();
 	Attitude_Init();
 	pit_ms_init(PIT_CH0, 20);                                                  // 初始化 PIT_CH0 为周期中断 20ms 周期
@@ -226,8 +212,8 @@ void pit_1_handler (void)
 {
 //    encoder_read_filtered(&encoder_data_1, &encoder_data_2, &encoder_data_3, &encoder_data_4);
 	encoder_get();
-    // distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
-	speed_encoder[0]=25;
+    distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
+	// speed_encoder[0]=25;
     if (car_go_flag == 1 && car_stop_flag == 0)
     {//修改位置在这里
         motor_control(speed_encoder);
