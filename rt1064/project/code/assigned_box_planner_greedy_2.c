@@ -1308,10 +1308,43 @@ static int planner_v3_bfs_get_car_to_push_path(int rows, int cols, Point car, Po
   return 0;
 }
 
+// 前向声明
+static void planner_v3_bfs_collect_all_secondaries_recursive(
+    size_t primary_idx, const PlannerBoxOverlap *overlaps, size_t box_count,
+    uint8_t *ignore_mask);
+
+// 辅助函数：向上追溯主箱链，找到链头（没有主箱的根主箱）
+// 返回链头的索引，如果当前箱子就是链头则返回自身
+static size_t planner_v3_bfs_find_root_primary(size_t box_idx, const PlannerBoxOverlap *overlaps, size_t box_count) {
+  if (!overlaps) return box_idx;
+  
+  size_t current = box_idx;
+  uint8_t visited[PLANNER_V3_BFS_MAX_BOXES] = {0};
+  
+  // 向上追溯主箱链，防止循环
+  while (current < box_count && !visited[current]) {
+    visited[current] = 1;
+    if (overlaps[current].valid && overlaps[current].primary != SIZE_MAX && overlaps[current].primary < box_count) {
+      size_t next = overlaps[current].primary;
+      if (visited[next]) {
+        // 检测到循环，返回当前
+        break;
+      }
+      current = next;
+    } else {
+      // 当前箱子没有主箱，就是链头
+      break;
+    }
+  }
+  
+  return current;
+}
+
 static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
                                        const PlannerBoxPathInfo *free_paths,
                                        const Point *current_boxes, size_t box_count,
                                        const Point *obstacles, size_t obstacle_count,
+                                       const size_t *box_targets, const Point *targets,
                                        PlannerBoxOverlap *overlaps) {
   for (size_t i = 0; i < box_count; ++i) {
     overlaps[i].valid = 0;
@@ -1324,22 +1357,68 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
     overlaps[i].dir.col = 0;
   }
   
-  // 计算所有箱子的车辆到推箱位路径（第二次路径规划）
-  PlannerBoxPathInfo car_paths[PLANNER_V3_BFS_MAX_BOXES];
+  // 计算所有箱子的第二次路径规划路径（考虑箱子阻挡的箱子路径）
+  PlannerBoxPathInfo planned_box_paths[PLANNER_V3_BFS_MAX_BOXES];
   for (size_t i = 0; i < box_count; ++i) {
-    car_paths[i].valid = 0;
-    car_paths[i].len = 0;
+    planned_box_paths[i].valid = 0;
+    planned_box_paths[i].len = 0;
     
     Point box = current_boxes[i];
     if (box.row < 0 || box.col < 0) {
       continue;
     }
+    if (box_targets[i] == SIZE_MAX) {
+      continue;
+    }
     
-    // 计算车辆到该箱子推箱位的路径（第二次路径规划）
-    planner_v3_bfs_get_car_to_push_path(rows, cols, car, box, obstacles, obstacle_count,
-                                       current_boxes, box_count, &car_paths[i]);
+    // 计算箱子的第二次路径规划路径（考虑箱子阻挡）
+    // 作为主箱，递归忽略自己对应的所有层级的副箱（包括副箱的副箱...）
+    // 作为副箱，忽略自己的主箱，避免互相占位导致死角误判
+    uint8_t ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
+    ignore_mask[i] = 1;
+    // 忽略已完成的箱子（负坐标）
+    for (size_t j = 0; j < box_count; ++j) {
+      if (current_boxes[j].row < 0 || current_boxes[j].col < 0) {
+        ignore_mask[j] = 1;
+      }
+    }
+    // 先构建基础的主箱-副箱关系（用于递归忽略副箱）
+    // 这里使用临时overlaps，只用于确定忽略关系
+    PlannerBoxOverlap temp_overlaps[PLANNER_V3_BFS_MAX_BOXES];
+    for (size_t k = 0; k < box_count; ++k) {
+      temp_overlaps[k].valid = 0;
+      temp_overlaps[k].primary = SIZE_MAX;
+    }
+    // 快速构建直接的主箱-副箱关系（仅用于忽略判断）
+    for (size_t primary = 0; primary < box_count; ++primary) {
+      if (!free_paths[primary].valid) continue;
+      for (size_t secondary = 0; secondary < box_count; ++secondary) {
+        if (primary == secondary || !free_paths[secondary].valid) continue;
+        Point sec_start = current_boxes[secondary];
+        if (sec_start.row < 0 || sec_start.col < 0) continue;
+        for (size_t pi = 0; pi < free_paths[primary].len; ++pi) {
+          if (free_paths[primary].path[pi].row == sec_start.row &&
+              free_paths[primary].path[pi].col == sec_start.col) {
+            temp_overlaps[secondary].valid = 1;
+            temp_overlaps[secondary].primary = primary;
+            break;
+          }
+        }
+      }
+    }
+    planner_v3_bfs_collect_all_secondaries_recursive(i, temp_overlaps, box_count, ignore_mask);
+    if (temp_overlaps[i].valid && temp_overlaps[i].primary != SIZE_MAX) {
+      ignore_mask[temp_overlaps[i].primary] = 1;
+    }
+    
+    if (!planner_v3_bfs_compute_box_path_with_mask(
+            rows, cols, current_boxes[i], targets[box_targets[i]], obstacles, obstacle_count,
+            current_boxes, box_count, ignore_mask, i, &planned_box_paths[i])) {
+      continue;  // 路径计算失败，跳过
+    }
   }
 
+  // 第一遍遍历：构建基础的主箱-副箱关系（直接关系，第一次路径规划只保留最基础的overlap）
   for (size_t primary = 0; primary < box_count; ++primary) {
     if (!free_paths[primary].valid) {
       continue;
@@ -1380,68 +1459,97 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
 
         if (overlap_len > 0) {
           PlannerBoxOverlap *ov = &overlaps[secondary];
-          if (!ov->valid || overlap_len > ov->overlap_len ||
-              (overlap_len == ov->overlap_len && pi < ov->primary_start)) {
+          // 计算当前主箱到副箱的距离
+          Point primary_pos = current_boxes[primary];
+          Point secondary_pos = current_boxes[secondary];
+          int current_dist = planner_v3_bfs_manhattan(primary_pos, secondary_pos);
+          
+          // 优先选择距离副箱更近的主箱（而不是重叠长度更长的）
+          if (!ov->valid) {
+            // 还没有主箱关系，直接设置
             ov->valid = 1;
             ov->primary = primary;
             ov->primary_start = pi;
             ov->secondary_start = 0;
-            ov->overlap_len = overlap_len;  // 第一次路径规划的重叠长度（用于判断是否构成链式）
+            ov->overlap_len = overlap_len;
             ov->dir = free_paths[primary].dir[pi];
+          } else {
+            // 已有主箱关系，计算之前主箱到副箱的距离
+            Point old_primary_pos = current_boxes[ov->primary];
+            int old_dist = planner_v3_bfs_manhattan(old_primary_pos, secondary_pos);
             
-            // 计算第二次路径规划的重叠长度（用于检测何时路径不再重叠）
-            size_t overlap_len_second = 0;
-            if (car_paths[primary].valid && car_paths[secondary].valid) {
-              // 找到两个车辆路径的起点（车辆位置）
-              Point car_pos = car;
-              size_t car_path_primary_start = SIZE_MAX;
-              size_t car_path_secondary_start = SIZE_MAX;
-              
-              for (size_t i = 0; i < car_paths[primary].len; ++i) {
-                if (car_paths[primary].path[i].row == car_pos.row &&
-                    car_paths[primary].path[i].col == car_pos.col) {
-                  car_path_primary_start = i;
-                  break;
-                }
-              }
-              for (size_t i = 0; i < car_paths[secondary].len; ++i) {
-                if (car_paths[secondary].path[i].row == car_pos.row &&
-                    car_paths[secondary].path[i].col == car_pos.col) {
-                  car_path_secondary_start = i;
-                  break;
-                }
-              }
-              
-              // 如果两个路径都从车辆位置开始，计算重叠长度
-              if (car_path_primary_start != SIZE_MAX && car_path_secondary_start != SIZE_MAX) {
-                size_t cp_idx = car_path_primary_start;
-                size_t cs_idx = car_path_secondary_start;
-                
-                while (cp_idx + 1 < car_paths[primary].len &&
-                       cs_idx + 1 < car_paths[secondary].len) {
-                  Point dir_cp = car_paths[primary].dir[cp_idx];
-                  Point dir_cs = car_paths[secondary].dir[cs_idx];
-                  Point next_cp = car_paths[primary].path[cp_idx + 1];
-                  Point next_cs = car_paths[secondary].path[cs_idx + 1];
-                  
-                  if (dir_cp.row != dir_cs.row || dir_cp.col != dir_cs.col) {
-                    break;
-                  }
-                  if (next_cp.row != next_cs.row || next_cp.col != next_cs.col) {
-                    break;
-                  }
-                  overlap_len_second++;
-                  cp_idx++;
-                  cs_idx++;
-                }
-              }
+            // 如果当前主箱距离更近，则更新；如果距离相同，则保持原有逻辑（重叠长度优先，重叠长度相同则路径起始位置更早的优先）
+            if (current_dist < old_dist ||
+                (current_dist == old_dist && overlap_len > ov->overlap_len) ||
+                (current_dist == old_dist && overlap_len == ov->overlap_len && pi < ov->primary_start)) {
+              ov->valid = 1;
+              ov->primary = primary;
+              ov->primary_start = pi;
+              ov->secondary_start = 0;
+              ov->overlap_len = overlap_len;
+              ov->dir = free_paths[primary].dir[pi];
             }
-            ov->overlap_len_second = overlap_len_second;
           }
         }
         break;  // 只考虑首次经过secondary起点的重叠
       }
     }
+  }
+  
+  // 第二遍：计算第二次路径规划的重叠长度（使用箱子的路径，而不是车辆的路径）
+  for (size_t secondary = 0; secondary < box_count; ++secondary) {
+    PlannerBoxOverlap *ov = &overlaps[secondary];
+    if (!ov->valid || ov->primary == SIZE_MAX) {
+      continue;
+    }
+    
+    // 向上追溯主箱链，找到链头
+    size_t root_primary = planner_v3_bfs_find_root_primary(ov->primary, overlaps, box_count);
+    
+    // 计算第二次路径规划的重叠长度（使用链头和副箱的箱子路径）
+    size_t overlap_len_second = 0;
+    if (planned_box_paths[root_primary].valid && planned_box_paths[secondary].valid) {
+      // 找到两个箱子路径的起点（箱子当前位置）
+      Point sec_start = current_boxes[secondary];
+      size_t box_path_primary_start = SIZE_MAX;
+      size_t box_path_secondary_start = 0;  // secondary路径从0开始就是箱子当前位置
+      
+      const PlannerBoxPathInfo *primary_box_path = &planned_box_paths[root_primary];
+      
+      // 在primary路径中查找secondary的起始位置
+      for (size_t i = 0; i < primary_box_path->len; ++i) {
+        if (primary_box_path->path[i].row == sec_start.row &&
+            primary_box_path->path[i].col == sec_start.col) {
+          box_path_primary_start = i;
+          break;
+        }
+      }
+      
+      // 如果找到了起点，计算重叠长度
+      if (box_path_primary_start != SIZE_MAX) {
+        size_t bp_idx = box_path_primary_start;
+        size_t bs_idx = box_path_secondary_start;
+        
+        while (bp_idx + 1 < primary_box_path->len &&
+               bs_idx + 1 < planned_box_paths[secondary].len) {
+          Point dir_bp = primary_box_path->dir[bp_idx];
+          Point dir_bs = planned_box_paths[secondary].dir[bs_idx];
+          Point next_bp = primary_box_path->path[bp_idx + 1];
+          Point next_bs = planned_box_paths[secondary].path[bs_idx + 1];
+          
+          if (dir_bp.row != dir_bs.row || dir_bp.col != dir_bs.col) {
+            break;
+          }
+          if (next_bp.row != next_bs.row || next_bp.col != next_bs.col) {
+            break;
+          }
+          overlap_len_second++;
+          bp_idx++;
+          bs_idx++;
+        }
+      }
+    }
+    ov->overlap_len_second = overlap_len_second;
   }
 }
 
@@ -2271,7 +2379,8 @@ static int planner_v3_bfs_chain_sync_tail_path_state(
 }
 
 // 【改进版】检测链中任意箱子是否需要脱链（不只是链尾）
-// - 当某箱子 steps_walked >= overlap_len-1 时，检测下一步是否会分叉
+// - 使用每个箱子实际走的步数（steps_walked）与第二次路径规划的重叠长度（overlap_len_second）比较
+// - 当某箱子 steps_walked >= overlap_len_second-1 时，检测下一步是否会分叉
 // - 如果分叉后车辆无法到达推位，则在分叉前（当前步）脱链
 // - 从链尾开始向前检测，确保按顺序脱链
 static int planner_v3_bfs_chain_try_detach_any_box_by_overlap(
@@ -2287,12 +2396,14 @@ static int planner_v3_bfs_chain_try_detach_any_box_by_overlap(
   // 从链尾向前遍历（跳过主箱，主箱索引0）
   for (int chain_idx = (int)chain->count - 1; chain_idx >= 1; chain_idx--) {
     size_t box_idx = chain->indices[chain_idx];
-    size_t overlap_len = chain->overlap_lens[chain_idx];
+    // overlap_lens存储的是第二次路径规划的重叠长度（overlap_len_second）
+    size_t overlap_len_second = chain->overlap_lens[chain_idx];
+    // 使用每个箱子实际走的步数（steps_walked）来比较
     size_t steps_walked = chain->steps_walked[chain_idx];
     
-    // 检查是否到达或即将超过重叠长度
-    if (overlap_len == 0) continue;
-    if (steps_walked < overlap_len - 1) continue;  // 还在重叠区域内，不需要检测
+    // 检查是否到达或即将超过重叠长度（使用实际步数比较）
+    if (overlap_len_second == 0) continue;
+    if (steps_walked < overlap_len_second - 1) continue;  // 还在重叠区域内，不需要检测
     
     // 此箱子即将分叉或已分叉，获取其路径信息
     if (box_targets[box_idx] == SIZE_MAX) continue;
@@ -2407,8 +2518,9 @@ static int planner_v3_bfs_chain_try_detach_any_box_by_overlap(
   return 0;
 }
 
-// 按 overlap_len 精确释放链尾副箱（保留原有逻辑作为兼容）
-// - 当链尾 steps_walked >= overlap_len 时，把链尾从 chain 中移除
+// 按 overlap_len_second 精确释放链尾副箱（保留原有逻辑作为兼容）
+// - 使用链尾箱子实际走的步数（steps_walked）与第二次路径规划的重叠长度（overlap_len_second）比较
+// - 当链尾 steps_walked >= overlap_len_second 时，把链尾从 chain 中移除
 // - 先推该副箱：沿它自己的 planned path（从当前 path_idx 起的剩余段）独立推到目标
 // - 推成功则返回 out_detached=1；推失败则回滚并 out_detached=0（保持旧行为）
 static int planner_v3_bfs_chain_try_detach_tail_by_overlap_len(
@@ -2425,9 +2537,11 @@ static int planner_v3_bfs_chain_try_detach_tail_by_overlap_len(
   size_t tail_chain_idx = chain->count - 1;
   if (chain->indices[tail_chain_idx] != tail_idx) return 0;
 
-  size_t overlap_len = chain->overlap_lens[tail_chain_idx];
-  if (overlap_len == 0) return 0;
-  if (chain->steps_walked[tail_chain_idx] < overlap_len) return 0;
+  // overlap_lens存储的是第二次路径规划的重叠长度（overlap_len_second）
+  size_t overlap_len_second = chain->overlap_lens[tail_chain_idx];
+  if (overlap_len_second == 0) return 0;
+  // 使用链尾箱子实际走的步数（steps_walked）来比较
+  if (chain->steps_walked[tail_chain_idx] < overlap_len_second) return 0;
 
   if (!tail_path || !tail_path->valid || tail_path->len == 0) return 0;
   if (path_idx >= tail_path->len) return 0;
@@ -3766,6 +3880,24 @@ static void planner_v3_bfs_accumulate_chain_info(const PlannerBoxOverlap *overla
   }
 }
 
+// 辅助函数：递归收集所有层级的副箱（包括副箱的副箱...）
+static void planner_v3_bfs_collect_all_secondaries_recursive(
+    size_t primary_idx, const PlannerBoxOverlap *overlaps, size_t box_count,
+    uint8_t *ignore_mask) {
+  if (!overlaps || !ignore_mask) return;
+  
+  // 遍历所有箱子，找出当前主箱的所有直接副箱
+  for (size_t s = 0; s < box_count; ++s) {
+    if (overlaps[s].valid && overlaps[s].primary == primary_idx) {
+      // 标记这个副箱为忽略
+      ignore_mask[s] = 1;
+      // 递归处理这个副箱的所有副箱
+      planner_v3_bfs_collect_all_secondaries_recursive(
+          s, overlaps, box_count, ignore_mask);
+    }
+  }
+}
+
 // 辅助函数：将 PlannerBoxPathInfo 转换为 PlannerBoxPathOutput
 static void planner_v3_bfs_copy_path_info_to_output(const PlannerBoxPathInfo *src,
                                                      PlannerBoxPathOutput *dst) {
@@ -3992,7 +4124,7 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
       }
     }
 
-    planner_v3_bfs_detect_overlaps(rows, cols, current_car, free_paths, current_boxes, box_count, obstacles, obstacle_count, overlaps);
+    planner_v3_bfs_detect_overlaps(rows, cols, current_car, free_paths, current_boxes, box_count, obstacles, obstacle_count, box_targets, targets, overlaps);
     
     // 累积收集链式信息（记录所有出现过的链）
     if (out_chain_info) {
@@ -4025,12 +4157,9 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
           ignore_mask[j] = 1;
         }
       }
-      // 作为主箱，忽略自己对应的副箱；作为副箱，忽略自己的主箱，避免互相占位导致死角误判
-      for (size_t s = 0; s < box_count; ++s) {
-        if (overlaps[s].valid && overlaps[s].primary == i) {
-          ignore_mask[s] = 1;
-        }
-      }
+      // 作为主箱，递归忽略自己对应的所有层级的副箱（包括副箱的副箱...）
+      // 作为副箱，忽略自己的主箱，避免互相占位导致死角误判
+      planner_v3_bfs_collect_all_secondaries_recursive(i, overlaps, box_count, ignore_mask);
       if (overlaps[i].valid && overlaps[i].primary != SIZE_MAX) {
         ignore_mask[overlaps[i].primary] = 1;
       }

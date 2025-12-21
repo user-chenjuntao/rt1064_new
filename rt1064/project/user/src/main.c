@@ -68,18 +68,18 @@ uint16 timer_box_cnt = 0;
 //};
 
 PlannerPointV3_BFS car = {1, 2};
-PlannerPointV3_BFS boxes[3] = {
-    {5, 3},  // ??×ó1
-    {6, 3},  // ??×ó2
+PlannerPointV3_BFS boxes[] = {
+    {6, 3},  
+    {7, 3},  
 	{3, 3},
 };
-PlannerPointV3_BFS targets[3] = {
-    {9, 7},  // ??±ê3???A
-    {9, 6},  // ??±ê3???B
-    {11, 2},  // ?¤á???ía??±ê??gei
-};  // è?òa??×ó?éè￥è?ò??′ê1ó???±ê
+PlannerPointV3_BFS targets[] = {
+    {9, 7},  
+    {9, 6},  
+    {11, 2},  
+};  
 
-PlannerPointV3_BFS obstacles[25] = {
+PlannerPointV3_BFS obstacles[] = {
 
 	{0, 7}, {2, 7},
 	{3, 7}, {4, 7}, {4, 6}, 
@@ -93,22 +93,41 @@ PlannerPointV3_BFS obstacles[25] = {
 
 };//
 
-PlannerPointV3_Bomb bombs[1] = {{3, 3}};
+PlannerPointV3_Bomb bombs[] = {{3, 3}};
 	//
 //Point car = {5,1};
 size_t steps;
 int res;
 PlannerPointV3_BFS path[GREEDY_AREA];
 size_t used_bomb_count = 0;
-size_t box_target_mapping[3];
+size_t box_target_mapping[100];
 PlannerChainInfo chain_info;
+PlannerAllBoxPaths first_paths, final_paths;
 size_t used_bombs[1];
+
+// 数组数量变量
+size_t boxes_count = 0;
+size_t targets_count = 0;
+size_t obstacles_count = 0;
+size_t bombs_count = 0;
+
+// 读取数组数量的函数
+void read_array_counts(void)
+{
+    boxes_count = sizeof(boxes) / sizeof(boxes[0]);
+    targets_count = sizeof(targets) / sizeof(targets[0]);
+    obstacles_count = sizeof(obstacles) / sizeof(obstacles[0]);
+    bombs_count = sizeof(bombs) / sizeof(bombs[0]);
+}
 
 int main(void)
 {
     clock_init(SYSTEM_CLOCK_600M);  // 不可删除
     debug_init();                   // 调试端口初始化
 
+    // 读取数组数量
+    read_array_counts();
+    
     // 此处编写用户代码 例如外设初始化代码等
     system_delay_ms(300);           //等待主板其他外设上电完成
     uart_blob_init();
@@ -116,7 +135,6 @@ int main(void)
 	menu_init();
 	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
     ips200_show_string(0, 0, "mt9v03x init.");
-<<<<<<< HEAD
 /*    while(1)
     {
         if(mt9v03x_init())
@@ -125,16 +143,6 @@ int main(void)
             break;
         system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
     }*/
-=======
-//    while(1)
-//    {
-//        if(mt9v03x_init())
-//            ips200_show_string(0, 16, "mt9v03x reinit.");
-//        else
-//            break;
-//        system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
-//    }
->>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
 	key_init(20);
 	motor_init();
 	encoder_init();
@@ -149,26 +157,9 @@ int main(void)
 	PID_Init(&Camera_y_pid, &Camera_y_PidInitStruct);
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
-<<<<<<< HEAD
 
-	PlannerAllBoxPaths first_paths, final_paths;
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
-=======
-	path_follow_init(0.20f, (float)pulse_per_meter);
-	// res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping);
-	steps = 5;
-	path[0].col = 1;
-	path[0].row = 2;
-	path[1].col = 8;
-	path[1].row = 2;
-	path[2].col = 8;
-	path[2].row = 7;
-	path[3].col = 2;
-	path[3].row = 2;
-	path[4].col = 9;
-	path[4].row = 4;
-	path_follow_set_path(path, steps);
->>>>>>> 082436c4667294212872071adbff9b6fd0753fb8
+	
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
