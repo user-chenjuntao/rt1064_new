@@ -104,6 +104,11 @@ size_t box_target_mapping[100];
 PlannerChainInfo chain_info;
 PlannerAllBoxPaths first_paths, final_paths;
 size_t used_bombs[1];
+PlannerAllBoxPaths first_paths, final_paths;
+
+Point corner_path[50];   // 拐点缓冲区
+size_t corner_steps = 0;   // 拐点数量
+
 
 // 数组数量变量
 size_t boxes_count = 0;
@@ -160,6 +165,9 @@ int main(void)
 
 	
 	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
+	path_follow_init(0.40f, (float)pulse_per_meter);
+	
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
@@ -168,7 +176,14 @@ int main(void)
 	{
 		ips200_show_string(0, 16, "path reinit.");
 	}
-//	system_delay_ms(1000);
+	corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
+
+	if (corner_steps > 0)
+	{
+		// 使用提取的拐点设置路径
+		path_follow_set_path(corner_path, corner_steps);
+	}
+
 	imu963ra_init();
 	Attitude_Init();
 	pit_ms_init(PIT_CH0, 20);                                                  // 初始化 PIT_CH0 为周期中断 20ms 周期
@@ -217,8 +232,8 @@ void pit_1_handler (void)
 {
 //    encoder_read_filtered(&encoder_data_1, &encoder_data_2, &encoder_data_3, &encoder_data_4);
 	encoder_get();
-    // distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
-	speed_encoder[0]=25;
+    distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
+	// speed_encoder[0]=25;
     if (car_go_flag == 1 && car_stop_flag == 0)
     {//修改位置在这里
         motor_control(speed_encoder);

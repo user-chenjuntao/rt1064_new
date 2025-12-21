@@ -37,6 +37,17 @@ void path_follow_draw_status(void);
 float path_follow_heading_deg(Point from, Point to);
 void distance_speed_strategy(void);
 
+/**
+ * 提取路径中的拐点（方向发生变化的点）
+ * @param path 原始路径数组
+ * @param path_steps 原始路径长度
+ * @param corner_buffer 输出拐点数组缓冲区
+ * @param corner_capacity 拐点缓冲区容量
+ * @return 实际提取的拐点数量，如果缓冲区不足则返回0
+ */
+size_t path_follow_extract_corners(const Point *path, size_t path_steps, 
+                                   Point *corner_buffer, size_t corner_capacity);
+
 extern tagPID_T pid_world_x;
 extern tagPID_T pid_world_y;
 extern tagPID_T pid_yaw;

@@ -11,6 +11,8 @@
 #define M_PI 3.1415926
 #endif
 
+#define CAR_DRIVER_MIN_SPEED 20.0f  // 最小驱动速度 cm/s
+
 typedef struct
 {
     float x_m;      // 世界坐标系 X，单位 m
@@ -143,8 +145,8 @@ void path_follow_set_path(const Point *path, size_t steps)
     g_ctx.idx = 0;
     if (path && steps > 0)
     {
-        g_ctx.pose.x_m = path[0].col * g_ctx.grid_m;
-        g_ctx.pose.y_m = path[0].row * g_ctx.grid_m;
+        g_ctx.pose.x_m = path[0].row * g_ctx.grid_m;
+        g_ctx.pose.y_m = path[0].col * g_ctx.grid_m;
         g_ctx.active = 1;
     }
     else
@@ -211,8 +213,8 @@ void path_follow_update(float yaw_deg, path_follow_output_t *out)
     // path_follow_update_pid_limits();
 
     Point target = g_ctx.path[g_ctx.idx];
-    float target_x = target.col * g_ctx.grid_m;
-    float target_y = target.row * g_ctx.grid_m;
+    float target_x = target.row * g_ctx.grid_m;
+    float target_y = target.col * g_ctx.grid_m;
 
     float dx = target_x - g_ctx.pose.x_m;
     float dy = target_y - g_ctx.pose.y_m;
@@ -224,8 +226,8 @@ void path_follow_update(float yaw_deg, path_follow_output_t *out)
         {
             g_ctx.idx++;
             target = g_ctx.path[g_ctx.idx];
-            target_x = target.col * g_ctx.grid_m;
-            target_y = target.row * g_ctx.grid_m;
+            target_x = target.row * g_ctx.grid_m;
+            target_y = target.col * g_ctx.grid_m;
             dx = target_x - g_ctx.pose.x_m;
             dy = target_y - g_ctx.pose.y_m;
             dist = sqrtf(dx * dx + dy * dy);
@@ -250,6 +252,24 @@ void path_follow_update(float yaw_deg, path_follow_output_t *out)
 
     float v_world_x = (float)v_world_x_cmd;
     float v_world_y = (float)v_world_y_cmd;
+
+    // if (v_world_x > 0.0f && v_world_x < CAR_DRIVER_MIN_SPEED)
+    // {
+    //     v_world_x = CAR_DRIVER_MIN_SPEED;
+    // }
+    // else if (v_world_x < 0.0f && v_world_x > -CAR_DRIVER_MIN_SPEED)
+    // {
+    //     v_world_x = -CAR_DRIVER_MIN_SPEED;
+    // }
+    
+    // if (v_world_y > 0.0f && v_world_y < CAR_DRIVER_MIN_SPEED)
+    // {
+    //     v_world_y = CAR_DRIVER_MIN_SPEED;
+    // }
+    // else if (v_world_y < 0.0f && v_world_y > -CAR_DRIVER_MIN_SPEED)
+    // {
+    //     v_world_y = -CAR_DRIVER_MIN_SPEED;
+    // }
 
     float cos_yaw = cosf(yaw_rad);
     float sin_yaw = sinf(yaw_rad);
@@ -308,8 +328,8 @@ void path_follow_get_status(path_follow_status_t *status)
 
     if (g_ctx.path && g_ctx.idx < g_ctx.steps)
     {
-        status->target_x_m = g_ctx.path[g_ctx.idx].col * g_ctx.grid_m;
-        status->target_y_m = g_ctx.path[g_ctx.idx].row * g_ctx.grid_m;
+        status->target_x_m = g_ctx.path[g_ctx.idx].row * g_ctx.grid_m;
+        status->target_y_m = g_ctx.path[g_ctx.idx].col * g_ctx.grid_m;
     }
     else
     {
@@ -344,12 +364,73 @@ void path_follow_draw_status(void)
 // 前向为0度（+X 方向），左侧为0~180，右侧为0~-180
 float path_follow_heading_deg(Point from, Point to)
 {
-    float dx = (float)(to.col - from.col);
-    float dy = (float)(to.row - from.row);
+    float dx = (float)(to.row - from.row);
+    float dy = (float)(to.col - from.col);
     if (dx == 0.0f && dy == 0.0f)
     {
         return 0.0f;
     }
     float angle_rad = atan2f(dy, dx);
     return angle_rad * (180.0f / (float)M_PI);
+}
+
+// 提取路径中的拐点（方向发生变化的点）
+size_t path_follow_extract_corners(const Point *path, size_t path_steps, 
+                                   Point *corner_buffer, size_t corner_capacity)
+{
+    if (NULL == path || 0 == path_steps || NULL == corner_buffer || 0 == corner_capacity)
+    {
+        return 0;
+    }
+
+    // 如果路径只有一个点，直接返回
+    if (path_steps == 1)
+    {
+        if (corner_capacity >= 1)
+        {
+            corner_buffer[0] = path[0];
+            return 1;
+        }
+        return 0;
+    }
+
+    size_t corner_count = 0;
+
+    // 第一个点总是拐点（起点）
+    if (corner_count >= corner_capacity)
+    {
+        return 0;  // 缓冲区不足
+    }
+    corner_buffer[corner_count++] = path[0];
+
+    // 检查中间点是否为拐点
+    for (size_t i = 1; i < path_steps - 1; i++)
+    {
+        // 计算从上一个点到当前点的方向向量
+        int dx1 = path[i].col - path[i - 1].col;
+        int dy1 = path[i].row - path[i - 1].row;
+
+        // 计算从当前点到下一个点的方向向量
+        int dx2 = path[i + 1].col - path[i].col;
+        int dy2 = path[i + 1].row - path[i].row;
+
+        // 如果方向向量不同，则当前点是拐点
+        if (dx1 != dx2 || dy1 != dy2)
+        {
+            if (corner_count >= corner_capacity)
+            {
+                return 0;  // 缓冲区不足
+            }
+            corner_buffer[corner_count++] = path[i];
+        }
+    }
+
+    // 最后一个点总是拐点（终点）
+    if (corner_count >= corner_capacity)
+    {
+        return 0;  // 缓冲区不足
+    }
+    corner_buffer[corner_count++] = path[path_steps - 1];
+
+    return corner_count;
 }
