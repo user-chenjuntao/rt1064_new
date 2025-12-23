@@ -29,11 +29,26 @@ typedef struct {
 } PlannerBoxChain;
 
 /**
+ * 箱子重叠信息结构 - 用于存储主箱-副箱的重叠关系
+ */
+typedef struct {
+  size_t primary;                    // 主箱索引
+  size_t primary_start;             // 主箱路径中重叠起始位置
+  size_t secondary_start;           // 副箱路径中重叠起始位置
+  size_t overlap_len;               // 第一次路径规划的重叠长度（用于判断是否构成链式）
+  size_t overlap_len_second;       // 第二次路径规划的重叠长度（用于检测何时路径不再重叠）
+  Point overlap_end_pos;            // 第二次路径规划的重叠路径末端坐标（用于脱离检测）
+  Point dir;                        // 推动方向
+  int valid;                        // 是否有效
+} PlannerBoxOverlap;
+
+/**
  * 链式信息输出结构 - 用于输出所有检测到的链式组合
  */
 typedef struct {
   size_t chain_indices[PLANNER_V3_BFS_MAX_CHAIN_COUNT][PLANNER_V3_BFS_MAX_CHAIN_LEN];  // 每个链的箱子索引
   size_t chain_lengths[PLANNER_V3_BFS_MAX_CHAIN_COUNT];  // 每个链的长度
+  Point chain_overlap_end_pos[PLANNER_V3_BFS_MAX_CHAIN_COUNT][PLANNER_V3_BFS_MAX_CHAIN_LEN];  // 每个链中每个箱子的重叠末端坐标
   size_t chain_count;                                     // 检测到的链式总数
 } PlannerChainInfo;
 
@@ -92,6 +107,7 @@ typedef struct {
  * @param out_chain_info            链式信息输出（可选，传NULL则不输出）
  * @param out_first_paths           第一次路径规划（忽略箱子阻挡）的所有箱子路径（可选，传NULL则不输出）
  * @param out_final_paths           最终路径规划（考虑箱子阻挡）的所有箱子路径（可选，传NULL则不输出）
+ * @param out_overlaps               重叠信息输出（可选，传NULL则不输出），数组大小应为 box_count
  *
  * @return 0  成功
  *         -1 参数为空
@@ -112,7 +128,8 @@ int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
                              size_t *out_box_target_indices,
                              PlannerChainInfo *out_chain_info,
                              PlannerAllBoxPaths *out_first_paths,
-                             PlannerAllBoxPaths *out_final_paths);
+                             PlannerAllBoxPaths *out_final_paths,
+                             PlannerBoxOverlap *out_overlaps);
 
 #ifdef __cplusplus
 }

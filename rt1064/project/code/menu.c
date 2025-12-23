@@ -53,6 +53,7 @@ extern size_t boxes_count;
 extern PlannerChainInfo chain_info;
 extern PlannerAllBoxPaths first_paths;
 extern PlannerAllBoxPaths final_paths;
+extern PlannerBoxOverlap overlaps[];
 
 extern float speed_k;
 extern int speed_limit;
@@ -1243,6 +1244,28 @@ void draw_main_info(void)
     for (size_t i = 0; i < chain_info.chain_count; i++) {
         for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
             ips200_show_int(180+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
+        }
+    }
+    // 显示链式箱子的重叠末端坐标（从最近一次planner_v3_bfs_detect_overlaps的overlaps数组读取）
+    ips200_show_string(140, 80, "overlap");
+    uint16 y_offset = 100;
+    for (size_t i = 0; i < chain_info.chain_count && y_offset < 240; i++) {
+        for (size_t j = 0; j < chain_info.chain_lengths[i] && y_offset < 240; j++) {
+            size_t box_idx = chain_info.chain_indices[i][j];
+            // 从overlaps数组读取重叠末端坐标（与脱离检测时使用的值一致）
+
+            Point overlap_end = {-1, -1};
+            overlap_end = overlaps[box_idx].overlap_end_pos;
+            
+            // 显示箱子索引和重叠末端坐标
+            
+            ips200_show_string(140, y_offset, "b");
+            ips200_show_int(160, y_offset, box_idx, 2);
+
+            ips200_show_int(180, y_offset, overlap_end.row, 2);
+            ips200_show_int(200, y_offset, overlap_end.col, 2);
+
+            y_offset += 16;
         }
     }
 }

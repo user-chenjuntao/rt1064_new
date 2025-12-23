@@ -69,14 +69,14 @@ uint16 timer_box_cnt = 0;
 
 PlannerPointV3_BFS car = {1, 2};
 PlannerPointV3_BFS boxes[] = {
-    {6, 3},  
-    {7, 3},  
+    {4, 3},  
+    {5, 3},  
 	{3, 3},
 };
 PlannerPointV3_BFS targets[] = {
     {9, 7},  
-    {9, 6},  
-    {11, 2},  
+    {8, 0}, 
+    {9, 0},  
 };  
 
 PlannerPointV3_BFS obstacles[] = {
@@ -104,7 +104,7 @@ size_t box_target_mapping[100];
 PlannerChainInfo chain_info;
 PlannerAllBoxPaths first_paths, final_paths;
 size_t used_bombs[1];
-PlannerAllBoxPaths first_paths, final_paths;
+PlannerBoxOverlap overlaps[PLANNER_V3_BFS_MAX_BOXES];
 
 Point corner_path[50];   // 拐点缓冲区
 size_t corner_steps = 0;   // 拐点数量
@@ -164,10 +164,10 @@ int main(void)
 	Kinematics_Init();
 
 	
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
 	path_follow_init(0.40f, (float)pulse_per_meter);
 	
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths);
+	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
