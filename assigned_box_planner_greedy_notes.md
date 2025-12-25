@@ -46,6 +46,7 @@
 2. **推箱位优化**：计算车到推箱位的真实距离，而非车到箱子中心的距离
 3. **纯BFS+A***：所有路径规划统一使用全局BFS+A*，无区域限制
 4. **链式推动**：检测并执行多箱子链式推动，一次推动多个箱子，大幅提高效率
+5. **错误信息记录**：所有 `-6` 错误都会记录详细的错误阶段和错误详情到全局变量，便于调试和问题定位
 
 ### 详细流程
 
@@ -107,6 +108,7 @@ for 每个未完成的箱子 bi:
 - **全局最优**：使用BFS+A*保证每步路径最优
 - **可靠性高**：死点检测+真实距离计算，减少失败概率
 - **高效推动**：链式推动机制大幅减少总步数
+- **错误诊断**：详细的错误信息记录，便于快速定位失败原因
 
 ## 函数接口
 
@@ -153,6 +155,39 @@ int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
 - `out_final_paths`：可选，输出最终路径规划（考虑箱子阻挡）的所有箱子路径
   - 格式与 `out_first_paths` 相同
 
+**错误信息全局变量**（v3_BFS版本）：
+当函数返回 `-6` 时，可通过以下全局变量获取详细的错误信息：
+- `last_err_stage`：错误阶段（整数）
+  - `1`：初始分配失败
+  - `2`：动态选目标失败
+  - `3`：第二次规划失败
+  - `4`：车辆路径连续性失败
+  - `5`：链式推动内部失败
+- `last_err_detail`：错误详情（整数），对应阶段的子错误码
+  - 具体含义取决于 `last_err_stage` 的值
+  - 例如：`last_err_stage=1` 时，`last_err_detail=1` 表示"找不到可行目标"
+  - 例如：`last_err_stage=5` 时，`last_err_detail=6` 表示"车到不了推位"
+
+**使用示例**：
+```c
+#include "assigned_box_planner_greedy_2.h"
+
+extern int last_err_stage;   // 错误阶段
+extern int last_err_detail;  // 错误详情
+
+int ret = plan_boxes_greedy_v3_bfs(...);
+if (ret == -6) {
+    printf("规划失败，错误阶段：%d，错误详情：%d\n", last_err_stage, last_err_detail);
+    switch (last_err_stage) {
+        case 1: printf("初始分配失败\n"); break;
+        case 2: printf("动态选目标失败\n"); break;
+        case 3: printf("第二次规划失败\n"); break;
+        case 4: printf("车辆路径连续性失败\n"); break;
+        case 5: printf("链式推动内部失败\n"); break;
+    }
+}
+```
+
 ### 参数说明
 - `rows/cols`：网格行数/列数，总单元格数需 ≤400
 - `car`：小车初始坐标
@@ -173,7 +208,15 @@ int plan_boxes_greedy_v3_bfs(int rows, int cols, PlannerPointV3_BFS car,
 - `-3`：箱子数超限（>10）
 - `-4`：路径缓存容量为0
 - `-5`：单箱迭代超步数（5000步）
-- `-6`：无可行推动方向或车无法到达推箱位
+- `-6`：无可行推动方向或车无法到达推箱位（**详细错误信息见全局变量 `last_err_stage` 和 `last_err_detail`**）
+  - **错误阶段分类**（`last_err_stage`）：
+    - `1`：初始分配失败 - 无法为箱子分配目标
+    - `2`：动态选目标失败 - 动态选择箱子-目标组合时失败
+    - `3`：第二次规划失败 - 考虑箱子阻挡的路径规划失败
+    - `4`：车辆路径连续性失败 - 生成的车辆路径不连续（跳跃或对角线移动）
+    - `5`：链式推动内部失败 - 链式推动执行过程中的各种失败（推位非法、被占、车到不了推位等）
+  - **错误详情**（`last_err_detail`）：对应阶段的子错误码，用于精确定位失败原因
+  - **注意**：仅 v3_BFS 版本（`assigned_box_planner_greedy_2`）支持错误信息记录
 - `-7`：路径缓存容量不足
 - `-8`：目标数少于箱子数
 
@@ -383,6 +426,20 @@ if (ret == 0) {
     }
 } else {
     printf("规划失败，错误码: %d\n", ret);
+    
+    // v3_BFS版本：获取详细错误信息
+    if (ret == -6) {
+        extern int last_err_stage;
+        extern int last_err_detail;
+        printf("错误阶段：%d，错误详情：%d\n", last_err_stage, last_err_detail);
+        switch (last_err_stage) {
+            case 1: printf("初始分配失败\n"); break;
+            case 2: printf("动态选目标失败\n"); break;
+            case 3: printf("第二次规划失败\n"); break;
+            case 4: printf("车辆路径连续性失败\n"); break;
+            case 5: printf("链式推动内部失败\n"); break;
+        }
+    }
 }
 ```
 
@@ -466,6 +523,18 @@ if (ret == 0) {
    - ✅ 多推箱位尝试
    - ✅ 路径连续性验证
    - ✅ 链式推动（多箱子同时推动）
+
+7. **错误信息记录机制**：
+   - **全局变量**：`last_err_stage`（错误阶段）和 `last_err_detail`（错误详情）
+   - **自动记录**：所有 `return -6` 前都会自动设置错误信息
+   - **错误分类**：
+     * 阶段1：初始分配失败（无法为箱子分配目标）
+     * 阶段2：动态选目标失败（动态选择箱子-目标组合时失败）
+     * 阶段3：第二次规划失败（考虑箱子阻挡的路径规划失败）
+     * 阶段4：车辆路径连续性失败（路径不连续、跳跃或对角线移动）
+     * 阶段5：链式推动内部失败（推位非法、被占、车到不了推位等）
+   - **使用方式**：函数返回 `-6` 后，通过 `extern int last_err_stage;` 和 `extern int last_err_detail;` 访问
+   - **优势**：快速定位失败原因，便于调试和问题修复
 
 6. **性能特征**：
    - **时间复杂度**：每个箱子 O(rows×cols) BFS + O(rows×cols×log(rows×cols)) A*
@@ -930,6 +999,7 @@ threshold = 14 / 2 = 7
 - 路径缓存不足会返回 -7，建议适当增大 `path_capacity`
 - 单个箱子推行超过 5000 步视为无解，返回 -5
 - **路径连续性保证**：生成的路径每一步只改变行或列之一，曼哈顿距离为1，无跳跃或对角线移动
+- **错误信息记录**（仅v3_BFS版本）：当返回 `-6` 时，可通过全局变量 `last_err_stage` 和 `last_err_detail` 获取详细的错误阶段和错误详情，便于快速定位失败原因
 - **箱子与目标关系**：
   - 每个箱子可以推向任意目标点（初始时自动贪心分配）
   - 箱子到达目标后消失（内部标记为-1,-1坐标）

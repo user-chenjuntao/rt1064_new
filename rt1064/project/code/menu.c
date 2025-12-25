@@ -1,6 +1,7 @@
 ﻿#include "zf_common_headfile.h"
 #include <string.h>
 #include "path_follow.h"
+#include "assigned_box_planner_greedy_2.h"
 
 #define FLASH_SECTION_INDEX            127
 #define FLASH_PAGE_INDEX               FLASH_PAGE_3
@@ -76,6 +77,8 @@ extern uint8 num_line;
 extern Point corner_path[50];  // 拐点路径缓冲区
 extern size_t corner_steps;         // 拐点数量
 
+extern PlannerRebuildChainStatus g_rebuild_chain_status;  // 重构链状态信息
+
 // menu helpers
 void menu_bind_parents(menu_item_t *parent);
 menu_item_t *menu_get_selected_item(void);
@@ -130,6 +133,7 @@ static menu_item_t status_menu;
 static menu_item_t status_flash_menu;
 static menu_item_t path_menu;
 static menu_item_t status_imu_view;
+static menu_item_t status_rebuild_chain_view;
 static menu_item_t image_menu;
 static menu_item_t display_menu;
 
@@ -1232,22 +1236,24 @@ void action_set_high_mode(void)
 
 void draw_main_info(void)
 {
-    ips200_show_string(140, 16, "plan");
-    ips200_show_int(180, 16, res, 3);
-    ips200_show_string(140, 32, "steps");
-    ips200_show_int(180, 32, steps, 4);
-    ips200_show_string(140, 48, "b-t");
+    ips200_show_string(120, 16, "plan");
+    ips200_show_int(160, 16, res, 3);
+    ips200_show_int(180, 16, last_err_stage, 3);
+    ips200_show_int(200, 16, last_err_detail, 3);
+    ips200_show_string(120, 32, "steps");
+    ips200_show_int(160, 32, steps, 4);
+    ips200_show_string(120, 48, "b-t");
     for (int i=0;i<boxes_count;i++){
-        ips200_show_int(180+i*8, 48, box_target_mapping[i], 3);
+        ips200_show_int(160+i*8, 48, box_target_mapping[i], 3);
     }
-    ips200_show_string(140, 64, "chain");
+    ips200_show_string(120, 64, "chain");
     for (size_t i = 0; i < chain_info.chain_count; i++) {
         for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
-            ips200_show_int(180+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
+            ips200_show_int(160+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
         }
     }
     // 显示链式箱子的重叠末端坐标（从最近一次planner_v3_bfs_detect_overlaps的overlaps数组读取）
-    ips200_show_string(140, 80, "overlap");
+    ips200_show_string(120, 80, "overlap");
     uint16 y_offset = 100;
     for (size_t i = 0; i < chain_info.chain_count && y_offset < 240; i++) {
         for (size_t j = 0; j < chain_info.chain_lengths[i] && y_offset < 240; j++) {
@@ -1259,14 +1265,134 @@ void draw_main_info(void)
             
             // 显示箱子索引和重叠末端坐标
             
-            ips200_show_string(140, y_offset, "b");
-            ips200_show_int(160, y_offset, box_idx, 2);
+            ips200_show_string(120, y_offset, "b");
+            ips200_show_int(140, y_offset, box_idx, 2);
 
-            ips200_show_int(180, y_offset, overlap_end.row, 2);
-            ips200_show_int(200, y_offset, overlap_end.col, 2);
+            ips200_show_int(160, y_offset, overlap_end.row, 2);
+            ips200_show_int(180, y_offset, overlap_end.col, 2);
 
             y_offset += 16;
         }
+    }
+    
+    // 显示重构链状态信息
+    ips200_show_string(120, 150, "Rebuild:");
+    if (g_rebuild_chain_status.success)
+    {
+        ips200_set_color(RGB565_GREEN, RGB565_BLACK);
+        ips200_show_string(160, 166, "OK");
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+        // 显示脱离箱子数量（在B下方）
+        if (g_rebuild_chain_status.detached_count > 0)
+        {
+            ips200_show_string(120, 246, "Det:");
+            ips200_show_uint(160, 246, g_rebuild_chain_status.detached_count, 2);
+        }
+    }
+    else
+    {
+        ips200_set_color(RGB565_RED, RGB565_BLACK);
+        ips200_show_string(160, 166, "FAIL");
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+        
+        // 显示失败步骤或脱离/重构状态
+        ips200_show_string(120, 182, "Step:");
+        if (g_rebuild_chain_status.fail_step == 1)
+        {
+            ips200_show_string(160, 198, "Path1");
+        }
+        else if (g_rebuild_chain_status.fail_step == 2)
+        {
+            ips200_show_string(160, 198, "Path2");
+        }
+        else if (g_rebuild_chain_status.fail_step == 3)
+        {
+            ips200_show_string(160, 198, "Chain");
+        }
+        else
+        {
+            // fail_step为0或未知，显示是否有脱离和是否尝试重构
+            if (g_rebuild_chain_status.detached_count > 0)
+            {
+                // 有脱离，显示脱离数量，表示尝试了重构但状态未正确记录
+                ips200_show_string(160, 198, "Det:");
+                ips200_show_uint(200, 248, g_rebuild_chain_status.detached_count, 2);
+            }
+            else
+            {
+                // 没有脱离，也没有尝试重构
+                ips200_show_string(160, 198, "NoDet");
+            }
+        }
+        
+        // 显示是否尝试重构链（在Step下方显示）
+        if (g_rebuild_chain_status.detached_count > 0)
+        {
+            // 有脱离
+            ips200_show_string(120, 214, "Rebuild:");
+            if (g_rebuild_chain_status.fail_step > 0)
+            {
+                // 尝试了重构但失败（fail_step已显示具体步骤）
+                ips200_show_string(180, 214, "Tried");
+            }
+            else
+            {
+                // 有脱离但可能未尝试重构或状态未记录
+                ips200_show_string(180, 214, "?Try");
+            }
+        }
+        
+        // 显示失败箱子索引和位置（在Rebuild下方）
+        if (g_rebuild_chain_status.fail_box_idx != SIZE_MAX)
+        {
+            ips200_show_string(120, 230, "B");
+            ips200_show_uint(136, 230, g_rebuild_chain_status.fail_box_idx, 2);
+            if (g_rebuild_chain_status.fail_box_pos.row >= 0 && g_rebuild_chain_status.fail_box_pos.col >= 0)
+            {
+                ips200_show_int(136+8, 230, g_rebuild_chain_status.fail_box_pos.row, 2);
+                ips200_show_int(136+8+8, 230, g_rebuild_chain_status.fail_box_pos.col, 2);
+            }
+        }
+        
+        // 显示脱离箱子数量（在B下方）
+        if (g_rebuild_chain_status.detached_count > 0)
+        {
+            ips200_show_string(120, 246, "Det:");
+            ips200_show_uint(152, 246, g_rebuild_chain_status.detached_count, 2);
+        }
+    }
+    
+    // 显示执行状态（无论重构成功还是失败都显示）
+    if (g_rebuild_chain_status.exec_success == 1)
+    {
+        // 执行成功
+        ips200_set_color(RGB565_GREEN, RGB565_BLACK);
+        ips200_show_string(0, 150, "Exec:OK");
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    }
+    else if (g_rebuild_chain_status.exec_success == 0)
+    {
+        // 执行失败
+        ips200_set_color(RGB565_RED, RGB565_BLACK);
+        ips200_show_string(0, 150, "Exec:FAIL");
+        ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+        
+        // 显示执行失败位置
+        if (g_rebuild_chain_status.exec_fail_box_idx != SIZE_MAX)
+        {
+            ips200_show_string(0, 166, "EFB:");
+            ips200_show_uint(20, 166, g_rebuild_chain_status.exec_fail_box_idx, 2);
+            if (g_rebuild_chain_status.exec_fail_pos.row >= 0 && g_rebuild_chain_status.exec_fail_pos.col >= 0)
+            {
+                ips200_show_int(20+16, 166, g_rebuild_chain_status.exec_fail_pos.row, 2);
+                ips200_show_int(20+16+8, 166, g_rebuild_chain_status.exec_fail_pos.col, 2);
+            }
+        }
+    }
+    else if (g_rebuild_chain_status.exec_success == -1)
+    {
+        // 未尝试执行（无法构建链式）
+        ips200_show_string(0, 150, "Exec:NoTry");
     }
 }
 

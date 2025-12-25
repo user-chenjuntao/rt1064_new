@@ -16,6 +16,9 @@ typedef Point PlannerPointV3_BFS;
 #define PLANNER_V3_BFS_MAX_CELLS 400
 #define PLANNER_V3_BFS_MAX_PATH_LEN PLANNER_V3_BFS_MAX_CELLS
 
+extern int last_err_stage;   // 错误阶段：1=初始分配失败, 2=动态选目标失败, 3=第二次规划失败, 4=车辆路径连续性失败, 5=链式推动内部失败
+extern int last_err_detail;  // 错误详情：对应阶段的子错误码
+
 /**
  * 链式箱子结构 - 存储主箱到链尾的所有箱子
  * 链的顺序: indices[0]=主箱, indices[1]=第一个副箱, ..., indices[count-1]=链尾副箱
@@ -68,6 +71,22 @@ typedef struct {
   PlannerBoxPathOutput box_paths[PLANNER_V3_BFS_MAX_BOXES];  // 每个箱子的路径
   size_t box_count;                                            // 箱子数量
 } PlannerAllBoxPaths;
+
+/**
+ * 重构链状态信息结构 - 用于记录重构链的构建结果和执行结果
+ */
+typedef struct {
+  int success;                    // 是否成功：1=成功, 0=失败
+  int fail_step;                  // 失败步骤：1=第一次路径规划失败, 2=第二次路径规划失败, 3=无法构建链式, 0=成功
+  size_t fail_box_idx;            // 失败的箱子索引（如果失败）
+  Point fail_box_pos;             // 失败箱子的位置
+  size_t detached_count;          // 脱离箱子数量
+  size_t detached_indices[PLANNER_V3_BFS_MAX_BOXES];  // 脱离箱子索引列表
+  int exec_success;               // 执行是否成功：1=链式推动执行成功, 0=执行失败或未执行, -1=未尝试执行
+  int exec_res;                   // 执行结果：0=成功, 负数=失败错误码
+  Point exec_fail_pos;            // 执行失败的位置（如果执行失败）
+  size_t exec_fail_box_idx;       // 执行失败的箱子索引（如果执行失败）
+} PlannerRebuildChainStatus;
 
 /**
  * 推箱规划算法 v3_BFS - 纯 BFS+A* 版本（动态贪心选择 + 多副箱子链式推动）

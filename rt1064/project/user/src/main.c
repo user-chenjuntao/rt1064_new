@@ -69,14 +69,14 @@ uint16 timer_box_cnt = 0;
 
 PlannerPointV3_BFS car = {1, 2};
 PlannerPointV3_BFS boxes[] = {
-    {4, 3},  
-    {5, 3},  
+	{5, 3},
+    {6, 3},    
 	{3, 3},
 };
 PlannerPointV3_BFS targets[] = {
     {9, 7},  
-    {8, 0}, 
-    {9, 0},  
+	{9, 6},
+    {14, 2},  
 };  
 
 PlannerPointV3_BFS obstacles[] = {
@@ -109,6 +109,8 @@ PlannerBoxOverlap overlaps[PLANNER_V3_BFS_MAX_BOXES];
 Point corner_path[50];   // 拐点缓冲区
 size_t corner_steps = 0;   // 拐点数量
 
+// 重构链状态信息（在assigned_box_planner_greedy_2.c中定义）
+extern PlannerRebuildChainStatus g_rebuild_chain_status;
 
 // 数组数量变量
 size_t boxes_count = 0;
@@ -167,7 +169,7 @@ int main(void)
 	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
 	path_follow_init(0.40f, (float)pulse_per_meter);
 	
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
+	//res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
 	if (res == 0)
 	{
 		ips200_show_string(0, 16, "path init.");
