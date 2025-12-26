@@ -70,13 +70,13 @@ uint16 timer_box_cnt = 0;
 PlannerPointV3_BFS car = {1, 2};
 PlannerPointV3_BFS boxes[] = {
 	{5, 3},
-    {6, 3},    
+    {7, 3},    
 	{3, 3},
 };
 PlannerPointV3_BFS targets[] = {
     {9, 7},  
 	{9, 6},
-    {14, 2},  
+    {9, 5},  
 };  
 
 PlannerPointV3_BFS obstacles[] = {

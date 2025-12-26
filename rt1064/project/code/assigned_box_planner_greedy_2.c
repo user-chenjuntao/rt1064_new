@@ -3972,10 +3972,13 @@ static int planner_v3_bfs_split_then_finish(int rows, int cols, size_t primary_i
 static int planner_v3_bfs_execute_multi_chain(
     int rows, int cols, PlannerChainLocal *chain,
     const PlannerBoxPathInfo *planned_paths, const PlannerBoxOverlap *overlaps,
-    const size_t *box_targets, const Point *targets, const Point *obstacles,
+    size_t *box_targets, const Point *targets, const Point *obstacles,
     size_t obstacle_count, Point *current_car, Point *current_boxes,
     size_t box_count, Point *path_buffer, size_t path_capacity,
     size_t *out_steps) {
+  // 静态变量：保存每个主箱上一次链式箱子的索引集合（与planner_v3_bfs_push_primary_with_chain共享）
+  static size_t exec_last_chain_indices[PLANNER_V3_BFS_MAX_BOXES][PLANNER_V3_BFS_MAX_BOXES];
+  static size_t exec_last_chain_counts[PLANNER_V3_BFS_MAX_BOXES] = {0};
   if (!chain) {
     last_err_stage = 5;  // 链式推动内部失败
     last_err_detail = 1; // 链指针为空
@@ -4066,6 +4069,72 @@ static int planner_v3_bfs_execute_multi_chain(
       chain->steps_walked[chain->count] = 0;
       chain->count++;
       tail_idx = new_tail;
+      
+      // 【新增】检测到新箱子动态加入，触发目标重分配
+      if (chain->count > 1) {
+        size_t primary_idx = chain->indices[0];
+        // 检测是否有新箱子加入链式
+        int has_new_box = 0;
+        if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+          // 如果上一次链式为空（第一次构建链），视为有新箱子加入
+          if (exec_last_chain_counts[primary_idx] == 0) {
+            has_new_box = 1;
+          } else {
+            // 检查当前链中的每个箱子是否在上一次的链中
+            for (size_t c = 0; c < chain->count; ++c) {
+              size_t box_idx = chain->indices[c];
+              int found_in_last = 0;
+              for (size_t l = 0; l < exec_last_chain_counts[primary_idx]; ++l) {
+                if (exec_last_chain_indices[primary_idx][l] == box_idx) {
+                  found_in_last = 1;
+                  break;
+                }
+              }
+              if (!found_in_last) {
+                // 发现新箱子加入
+                has_new_box = 1;
+                break;
+              }
+            }
+          }
+        } else {
+          // 如果主箱索引超出范围，第一次构建链时也视为有新箱子（链式首次形成）
+          has_new_box = 1;
+        }
+        
+        // 如果有新箱子加入，进行目标重分配
+        if (has_new_box) {
+          int changed = planner_v3_bfs_chain_reassign_targets_tail_to_head(
+              rows, cols, chain, current_boxes, box_count, box_targets, targets,
+              obstacles, obstacle_count);
+          if (changed) {
+            // 目标发生变化：返回重规划信号，回到第一次路径规划阶段重算
+            // 更新上一次链式状态
+            if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+              exec_last_chain_counts[primary_idx] = chain->count;
+              for (size_t c = 0; c < chain->count; ++c) {
+                exec_last_chain_indices[primary_idx][c] = chain->indices[c];
+              }
+            }
+            return PLANNER_V3_BFS_REPLAN;
+          }
+          // 即使目标没有变化，也更新上一次链式状态（因为链式已经变化）
+          if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+            exec_last_chain_counts[primary_idx] = chain->count;
+            for (size_t c = 0; c < chain->count; ++c) {
+              exec_last_chain_indices[primary_idx][c] = chain->indices[c];
+            }
+          }
+        } else {
+          // 没有新箱子加入（可能有箱子脱离），更新链式状态但不进行重分配
+          if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+            exec_last_chain_counts[primary_idx] = chain->count;
+            for (size_t c = 0; c < chain->count; ++c) {
+              exec_last_chain_indices[primary_idx][c] = chain->indices[c];
+            }
+          }
+        }
+      }
       
       // 获取新链尾的路径
       if (box_targets[tail_idx] == SIZE_MAX) {
@@ -4358,7 +4427,7 @@ static int planner_v3_bfs_execute_multi_chain(
 static int planner_v3_bfs_execute_chain_then_targets(
     int rows, int cols, size_t primary_idx, size_t secondary_idx,
     const PlannerBoxPathInfo *planned_paths, const PlannerBoxOverlap *overlaps,
-    const size_t *box_targets, const Point *targets, const Point *obstacles,
+    size_t *box_targets, const Point *targets, const Point *obstacles,
     size_t obstacle_count, Point *current_car, Point *current_boxes,
     size_t box_count, Point *path_buffer, size_t path_capacity,
     size_t *out_steps) {
@@ -4410,6 +4479,10 @@ static int planner_v3_bfs_push_primary_with_chain(
     const Point *obstacles, size_t obstacle_count, Point *current_car, Point *current_boxes,
     size_t box_count, Point *path_buffer, size_t path_capacity, size_t *out_steps,
     uint8_t *primary_chain_reassigned_once) {
+  // 静态变量：保存每个主箱上一次链式箱子的索引集合
+  static size_t last_chain_indices[PLANNER_V3_BFS_MAX_BOXES][PLANNER_V3_BFS_MAX_BOXES];
+  static size_t last_chain_counts[PLANNER_V3_BFS_MAX_BOXES] = {0};
+  
   while (1) {
     // 每轮动态确认是否仍有存活的副箱子；链条结束后自动退化为单箱推送
     int has_secondary = 0;
@@ -4679,16 +4752,75 @@ static int planner_v3_bfs_push_primary_with_chain(
           expected_pos.col += dir.col;
         }
 
-        // 【规则更新】每个不同的链式箱子群（主箱不一样）都必须经历一次链内目标重分配流程
-        // 同一个主箱只执行一次：不论是否改变分配结果，都视为“已经历过”
-        if (primary_chain_reassigned_once && !(*primary_chain_reassigned_once) && chain.count > 1) {
-          *primary_chain_reassigned_once = 1;
-          int changed = planner_v3_bfs_chain_reassign_targets_tail_to_head(
-              rows, cols, &chain, current_boxes, box_count, box_targets, targets,
-              obstacles, obstacle_count);
-          if (changed) {
-            // 目标发生变化：按原需求回到第一次路径规划（忽略箱子阻挡）阶段重算
-            return PLANNER_V3_BFS_REPLAN;
+        // 【规则更新】链式内目标重分配规则：
+        // 1. 如果链式内有新箱子加入，则需要进行一次目标重分配，重新规划路径等后续过程
+        // 2. 如果有箱子脱离链式，则不需要进行目标重分配
+        if (chain.count > 1) {
+          // 检测是否有新箱子加入链式
+          int has_new_box = 0;
+          if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+            // 如果上一次链式为空（第一次构建链），视为有新箱子加入
+            if (last_chain_counts[primary_idx] == 0) {
+              has_new_box = 1;
+            } else {
+              // 检查当前链中的每个箱子是否在上一次的链中
+              for (size_t c = 0; c < chain.count; ++c) {
+                size_t box_idx = chain.indices[c];
+                int found_in_last = 0;
+                for (size_t l = 0; l < last_chain_counts[primary_idx]; ++l) {
+                  if (last_chain_indices[primary_idx][l] == box_idx) {
+                    found_in_last = 1;
+                    break;
+                  }
+                }
+                if (!found_in_last) {
+                  // 发现新箱子加入
+                  has_new_box = 1;
+                  break;
+                }
+              }
+            }
+          } else {
+            // 如果主箱索引超出范围，第一次构建链时也视为有新箱子（链式首次形成）
+            has_new_box = 1;
+          }
+          
+          // 如果有新箱子加入，进行目标重分配
+          if (has_new_box) {
+            int changed = planner_v3_bfs_chain_reassign_targets_tail_to_head(
+                rows, cols, &chain, current_boxes, box_count, box_targets, targets,
+                obstacles, obstacle_count);
+            if (changed) {
+              // 目标发生变化：按原需求回到第一次路径规划（忽略箱子阻挡）阶段重算
+              // 更新上一次链式状态
+              if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+                last_chain_counts[primary_idx] = chain.count;
+                for (size_t c = 0; c < chain.count; ++c) {
+                  last_chain_indices[primary_idx][c] = chain.indices[c];
+                }
+              }
+              return PLANNER_V3_BFS_REPLAN;
+            }
+            // 即使目标没有变化，也更新上一次链式状态（因为链式已经变化）
+            if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+              last_chain_counts[primary_idx] = chain.count;
+              for (size_t c = 0; c < chain.count; ++c) {
+                last_chain_indices[primary_idx][c] = chain.indices[c];
+              }
+            }
+          } else {
+            // 没有新箱子加入（可能有箱子脱离），更新链式状态但不进行重分配
+            if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+              last_chain_counts[primary_idx] = chain.count;
+              for (size_t c = 0; c < chain.count; ++c) {
+                last_chain_indices[primary_idx][c] = chain.indices[c];
+              }
+            }
+          }
+        } else {
+          // 链式只有1个箱子（只有主箱），清空上一次链式状态
+          if (primary_idx < PLANNER_V3_BFS_MAX_BOXES) {
+            last_chain_counts[primary_idx] = 0;
           }
         }
         
@@ -5227,9 +5359,16 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
     }
 
     // 输出第一次路径规划（忽略箱子阻挡）的所有箱子路径
+    // 保留已完成的箱子的路径信息，只更新未完成的箱子
     if (out_first_paths) {
       out_first_paths->box_count = box_count;
       for (size_t i = 0; i < box_count; ++i) {
+        // 如果箱子已完成且之前已经有有效的路径信息，则保留它
+        if (box_done[i] && out_first_paths->box_paths[i].valid && out_first_paths->box_paths[i].path_len > 0) {
+          // 保留已完成的箱子的路径信息
+          continue;
+        }
+        // 否则更新路径信息（包括未完成的箱子和之前没有路径信息的已完成箱子）
         planner_v3_bfs_copy_path_info_to_output(&free_paths[i], &out_first_paths->box_paths[i]);
       }
     }
@@ -5305,9 +5444,16 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
     // planned_paths已经在检测重叠之前计算好了，这里不需要重新计算
 
     // 输出最终路径规划（考虑箱子阻挡）的所有箱子路径
+    // 保留已完成的箱子的路径信息，只更新未完成的箱子
     if (out_final_paths) {
       out_final_paths->box_count = box_count;
       for (size_t i = 0; i < box_count; ++i) {
+        // 如果箱子已完成且之前已经有有效的路径信息，则保留它
+        if (box_done[i] && out_final_paths->box_paths[i].valid && out_final_paths->box_paths[i].path_len > 0) {
+          // 保留已完成的箱子的路径信息
+          continue;
+        }
+        // 否则更新路径信息（包括未完成的箱子和之前没有路径信息的已完成箱子）
         planner_v3_bfs_copy_path_info_to_output(&planned_paths[i], &out_final_paths->box_paths[i]);
       }
     }
