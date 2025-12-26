@@ -1373,6 +1373,24 @@ static size_t planner_v3_bfs_find_root_primary(size_t box_idx, const PlannerBoxO
   return current;
 }
 
+// 检查箱子是否已完成
+static int planner_v3_bfs_is_box_done(size_t box_idx, const Point *current_boxes, 
+                                      const size_t *box_targets, const Point *targets) {
+  // 已完成的箱子通常被标记为负坐标
+  if (current_boxes[box_idx].row < 0 || current_boxes[box_idx].col < 0) {
+    return 1;
+  }
+  // 检查箱子是否已到达目标位置
+  if (box_targets && targets && box_targets[box_idx] != SIZE_MAX) {
+    Point box = current_boxes[box_idx];
+    Point tgt = targets[box_targets[box_idx]];
+    if (box.row == tgt.row && box.col == tgt.col) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
 static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
                                        const PlannerBoxPathInfo *free_paths,
                                        const PlannerBoxPathInfo *planned_paths,
@@ -1380,6 +1398,18 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
                                        const Point *obstacles, size_t obstacle_count,
                                        const size_t *box_targets, const Point *targets,
                                        PlannerBoxOverlap *overlaps) {
+  // 保存已完成箱子的 overlap_end_pos
+  Point saved_overlap_end_pos[PLANNER_V3_BFS_MAX_BOXES];
+  for (size_t i = 0; i < box_count && i < PLANNER_V3_BFS_MAX_BOXES; ++i) {
+    if (planner_v3_bfs_is_box_done(i, current_boxes, box_targets, targets) && 
+        overlaps[i].overlap_end_pos.row >= 0 && overlaps[i].overlap_end_pos.col >= 0) {
+      saved_overlap_end_pos[i] = overlaps[i].overlap_end_pos;
+    } else {
+      saved_overlap_end_pos[i].row = -1;
+      saved_overlap_end_pos[i].col = -1;
+    }
+  }
+  
   for (size_t i = 0; i < box_count; ++i) {
     overlaps[i].valid = 0;
     overlaps[i].primary = SIZE_MAX;
@@ -1391,6 +1421,13 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
     overlaps[i].overlap_end_pos.col = -1;
     overlaps[i].dir.row = 0;
     overlaps[i].dir.col = 0;
+  }
+  
+  // 恢复已完成箱子的 overlap_end_pos
+  for (size_t i = 0; i < box_count && i < PLANNER_V3_BFS_MAX_BOXES; ++i) {
+    if (saved_overlap_end_pos[i].row >= 0 && saved_overlap_end_pos[i].col >= 0) {
+      overlaps[i].overlap_end_pos = saved_overlap_end_pos[i];
+    }
   }
   
   // 如果传入了planned_paths（第二次路径规划，与final_paths相同），则使用它来计算重叠路径末端坐标
@@ -1480,6 +1517,11 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
     for (size_t secondary = 0; secondary < box_count; ++secondary) {
       PlannerBoxOverlap *ov = &overlaps[secondary];
       if (!ov->valid || ov->primary == SIZE_MAX) {
+        continue;
+      }
+      
+      // 对于已完成的箱子，跳过更新 overlap_end_pos，保留之前的值
+      if (planner_v3_bfs_is_box_done(secondary, current_boxes, box_targets, targets)) {
         continue;
       }
       
