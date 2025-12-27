@@ -1245,133 +1245,10 @@ static int planner_v3_bfs_chain_reassign_targets_tail_to_head(int rows, int cols
   return changed ? 1 : 0;
 }
 
-// 计算车辆到推箱位的路径（第二次路径规划）
-// 返回：1=成功找到路径，0=失败
-static int planner_v3_bfs_get_car_to_push_path(int rows, int cols, Point car, Point box,
-                                              const Point *obstacles, size_t obstacle_count,
-                                              const Point *boxes, size_t box_count,
-                                              PlannerBoxPathInfo *out_path) {
-  if (!out_path) return 0;
-  out_path->valid = 0;
-  out_path->len = 0;
-  
-  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-  
-  // 找到所有有效的推箱位
-  Point valid_push_positions[4];
-  int valid_count = 0;
-  
-  for (int d = 0; d < 4; ++d) {
-    int push_r = box.row - dirs[d][0];
-    int push_c = box.col - dirs[d][1];
-    int new_box_r = box.row + dirs[d][0];
-    int new_box_c = box.col + dirs[d][1];
-    
-    if (!planner_v3_bfs_in_bounds(rows, cols, push_r, push_c)) continue;
-    if (!planner_v3_bfs_in_bounds(rows, cols, new_box_r, new_box_c)) continue;
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_r, push_c)) continue;
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_box_r, new_box_c)) continue;
-    if (planner_v3_bfs_is_box_at(boxes, box_count, new_box_r, new_box_c, SIZE_MAX)) continue;
-    
-    valid_push_positions[valid_count].row = push_r;
-    valid_push_positions[valid_count].col = push_c;
-    valid_count++;
-  }
-  
-  if (valid_count == 0) {
-    return 0;  // 没有有效的推箱位
-  }
-  
-  // 按距离排序推箱位
-  typedef struct {
-    Point pos;
-    int dist;
-  } PushPosWithDist;
-  
-  PushPosWithDist sorted_positions[4];
-  for (int i = 0; i < valid_count; ++i) {
-    sorted_positions[i].pos = valid_push_positions[i];
-    sorted_positions[i].dist = planner_v3_bfs_manhattan(car, valid_push_positions[i]);
-  }
-  
-  for (int i = 0; i < valid_count - 1; ++i) {
-    for (int j = 0; j < valid_count - 1 - i; ++j) {
-      if (sorted_positions[j].dist > sorted_positions[j + 1].dist) {
-        PushPosWithDist tmp = sorted_positions[j];
-        sorted_positions[j] = sorted_positions[j + 1];
-        sorted_positions[j + 1] = tmp;
-      }
-    }
-  }
-  
-  // 尝试所有有效推箱位，使用全局BFS+A*（第二次路径规划）
-  for (int try_idx = 0; try_idx < valid_count; ++try_idx) {
-    Point target_push_pos = sorted_positions[try_idx].pos;
-    
-    // 第1步：从目标推箱位做全局BFS
-    int dist[PLANNER_V3_BFS_MAX_CELLS];
-    if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target_push_pos, obstacles, 
-                                           obstacle_count, boxes, box_count, SIZE_MAX, dist)) {
-      continue;  // BFS失败，尝试下一个推箱位
-    }
-    
-    // 第2步：使用A*搜索路径（第二次路径规划：绕箱子）
-    size_t temp_path_len = 0;
-    if (!planner_v3_bfs_astar_with_dist(rows, cols, car, target_push_pos,
-                                    obstacles, obstacle_count,
-                                    boxes, box_count, dist,
-                                    out_path->path, PLANNER_V3_BFS_MAX_PATH_LEN, 
-                                    &temp_path_len, 0)) {
-      continue;  // A*失败，尝试下一个推箱位
-    }
-    
-    if (temp_path_len > 0) {
-      Point last = out_path->path[temp_path_len - 1];
-      if (last.row == target_push_pos.row && last.col == target_push_pos.col) {
-        // 成功到达推箱位
-        out_path->len = temp_path_len;
-        planner_v3_bfs_fill_dirs(out_path);
-        out_path->valid = 1;
-        return 1;
-      }
-    }
-  }
-  
-  // 所有推箱位都无法到达
-  return 0;
-}
-
 // 前向声明
 static void planner_v3_bfs_collect_all_secondaries_recursive(
     size_t primary_idx, const PlannerBoxOverlap *overlaps, size_t box_count,
     uint8_t *ignore_mask);
-
-// 辅助函数：向上追溯主箱链，找到链头（没有主箱的根主箱）
-// 返回链头的索引，如果当前箱子就是链头则返回自身
-static size_t planner_v3_bfs_find_root_primary(size_t box_idx, const PlannerBoxOverlap *overlaps, size_t box_count) {
-  if (!overlaps) return box_idx;
-  
-  size_t current = box_idx;
-  uint8_t visited[PLANNER_V3_BFS_MAX_BOXES] = {0};
-  
-  // 向上追溯主箱链，防止循环
-  while (current < box_count && !visited[current]) {
-    visited[current] = 1;
-    if (overlaps[current].valid && overlaps[current].primary != SIZE_MAX && overlaps[current].primary < box_count) {
-      size_t next = overlaps[current].primary;
-      if (visited[next]) {
-        // 检测到循环，返回当前
-        break;
-      }
-      current = next;
-    } else {
-      // 当前箱子没有主箱，就是链头
-      break;
-    }
-  }
-  
-  return current;
-}
 
 // 检查箱子是否已完成
 static int planner_v3_bfs_is_box_done(size_t box_idx, const Point *current_boxes, 
@@ -1753,14 +1630,6 @@ static size_t planner_v3_bfs_chain_remove_finished(
     const Point *targets, size_t box_count) {
   return planner_v3_bfs_chain_remove_finished_ex(chain, current_boxes, box_targets, 
                                                   targets, box_count, 1);
-}
-
-// 只检查到达目标（拐弯时使用）
-static size_t planner_v3_bfs_chain_remove_arrived_only(
-    PlannerChainLocal *chain, Point *current_boxes, const size_t *box_targets,
-    const Point *targets, size_t box_count) {
-  return planner_v3_bfs_chain_remove_finished_ex(chain, current_boxes, box_targets,
-                                                  targets, box_count, 0);
 }
 
 // forward declarations: 供直行和拐弯推进函数提前调用（避免 C99 隐式声明）
@@ -2604,40 +2473,6 @@ static int planner_v3_bfs_chain_sync_tail_path_state(
 
 // 辅助函数：回溯链的状态到上一步（直行推动的情况）
 // 将所有链内箱子向push_dir的反方向移动一格，车位置也相应回溯
-static void planner_v3_bfs_chain_rollback_straight(
-    PlannerChainLocal *chain, Point push_dir,
-    Point *current_car, Point *current_boxes, size_t box_count,
-    Point *path_buffer, size_t *out_steps) {
-  if (!chain || chain->count == 0) return;
-  
-  // 回溯箱子位置：从主箱到链尾，依次向push_dir的反方向移动
-  Point reverse_dir = {-push_dir.row, -push_dir.col};
-  for (size_t i = 0; i < chain->count; ++i) {
-    size_t idx = chain->indices[i];
-    if (idx < box_count) {
-      current_boxes[idx].row += reverse_dir.row;
-      current_boxes[idx].col += reverse_dir.col;
-      // 回溯已走步数
-      if (chain->steps_walked[i] > 0) {
-        chain->steps_walked[i]--;
-      }
-    }
-  }
-  
-  // 回溯车位置：车应该回到推动前的位置（原主箱位置的反方向）
-  size_t primary_idx = chain->indices[0];
-  if (primary_idx < box_count) {
-    Point primary_pos = current_boxes[primary_idx];
-    Point car_pos = {primary_pos.row - push_dir.row, primary_pos.col - push_dir.col};
-    *current_car = car_pos;
-  }
-  
-  // 移除路径缓冲区中最后一步（如果有）
-  if (*out_steps > 0) {
-    (*out_steps)--;
-  }
-}
-
 // 【改进版】检测链中任意箱子是否需要脱链（不只是链尾）
 // - 检测当前坐标和重叠路径的末端坐标是否相同
 // 尝试将脱离的箱子重新构成链式并检查是否可以推动
@@ -3980,34 +3815,6 @@ static int planner_v3_bfs_split_chain_and_finish(
   return 0;
 }
 
-// 旧版兼容函数
-static int planner_v3_bfs_split_then_finish(int rows, int cols, size_t primary_idx,
-                                        size_t secondary_idx, const size_t *box_targets,
-                                        const Point *targets, const Point *obstacles,
-                                        size_t obstacle_count, Point *current_car,
-                                        Point *current_boxes, size_t box_count,
-                                        Point *path_buffer, size_t path_capacity,
-                                        size_t *out_steps) {
-  PlannerChainLocal chain;
-  chain.count = 2;
-  chain.indices[0] = primary_idx;
-  chain.indices[1] = secondary_idx;
-  chain.overlap_lens[0] = 0;
-  chain.overlap_lens[1] = 0;  // 解散链时不需要检查重叠
-  chain.overlap_end_positions[0].row = -1;
-  chain.overlap_end_positions[0].col = -1;
-  chain.overlap_end_positions[1].row = -1;
-  chain.overlap_end_positions[1].col = -1;
-  chain.steps_walked[0] = 0;
-  chain.steps_walked[1] = 0;
-  chain.dir.row = 0;
-  chain.dir.col = 0;
-  
-  return planner_v3_bfs_split_chain_and_finish(
-      rows, cols, &chain, box_targets, targets, obstacles, obstacle_count,
-      current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
-}
-
 // 新版多副箱子链式推动函数
 // 支持主箱推副箱1，副箱1推副箱2...的链式推动
 // 直行时：所有链中箱子同时移动一格
@@ -4464,56 +4271,6 @@ static int planner_v3_bfs_execute_multi_chain(
   }
   
   return 0;
-}
-
-// 旧版兼容函数（保持接口兼容）
-static int planner_v3_bfs_execute_chain_then_targets(
-    int rows, int cols, size_t primary_idx, size_t secondary_idx,
-    const PlannerBoxPathInfo *planned_paths, const PlannerBoxOverlap *overlaps,
-    size_t *box_targets, const Point *targets, const Point *obstacles,
-    size_t obstacle_count, Point *current_car, Point *current_boxes,
-    size_t box_count, Point *path_buffer, size_t path_capacity,
-    size_t *out_steps) {
-  // 构建初始链：主箱 + 副箱
-  PlannerChainLocal chain;
-  chain.count = 2;
-  chain.indices[0] = primary_idx;
-  chain.indices[1] = secondary_idx;
-  
-  // 初始化重叠长度和已走步数
-  chain.overlap_lens[0] = 0;  // 主箱
-  chain.overlap_end_positions[0].row = -1;
-  chain.overlap_end_positions[0].col = -1;
-  chain.steps_walked[0] = 0;
-  
-  // 获取副箱的重叠长度（使用第二次路径规划的overlap_len_second）
-  if (overlaps && overlaps[secondary_idx].valid && overlaps[secondary_idx].primary == primary_idx) {
-    chain.overlap_lens[1] = overlaps[secondary_idx].overlap_len_second;
-    // 保存重叠路径的末端坐标
-    if (overlaps[secondary_idx].overlap_end_pos.row >= 0 && overlaps[secondary_idx].overlap_end_pos.col >= 0) {
-      chain.overlap_end_positions[1] = overlaps[secondary_idx].overlap_end_pos;
-    } else {
-      chain.overlap_end_positions[1].row = -1;
-      chain.overlap_end_positions[1].col = -1;
-    }
-  } else {
-    chain.overlap_lens[1] = 1;  // 默认重叠长度为1
-    chain.overlap_end_positions[1].row = -1;
-    chain.overlap_end_positions[1].col = -1;
-  }
-  chain.steps_walked[1] = 0;
-  
-  // 计算初始方向
-  Point primary_pos = current_boxes[primary_idx];
-  Point secondary_pos = current_boxes[secondary_idx];
-  chain.dir.row = secondary_pos.row - primary_pos.row;
-  chain.dir.col = secondary_pos.col - primary_pos.col;
-  
-  // 调用新的多副箱子链式推动函数
-  return planner_v3_bfs_execute_multi_chain(
-      rows, cols, &chain, planned_paths, overlaps, box_targets, targets,
-      obstacles, obstacle_count, current_car, current_boxes, box_count,
-      path_buffer, path_capacity, out_steps);
 }
 
 static int planner_v3_bfs_push_primary_with_chain(
