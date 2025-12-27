@@ -1493,9 +1493,9 @@ static void planner_v3_bfs_detect_overlaps(int rows, int cols, Point car,
             Point old_primary_pos = current_boxes[ov->primary];
             int old_dist = planner_v3_bfs_manhattan(old_primary_pos, secondary_pos);
             
-            // 如果当前主箱距离更近，则更新；如果距离相同，则保持原有逻辑（重叠长度优先，重叠长度相同则路径起始位置更早的优先）
+            // 如果当前主箱距离更近，则更新；如果距离相同，则选择重叠更短的（重叠更短优先），重叠长度相同则路径起始位置更早的优先
             if (current_dist < old_dist ||
-                (current_dist == old_dist && overlap_len > ov->overlap_len) ||
+                (current_dist == old_dist && overlap_len < ov->overlap_len) ||
                 (current_dist == old_dist && overlap_len == ov->overlap_len && pi < ov->primary_start)) {
               ov->valid = 1;
               ov->primary = primary;
@@ -2777,8 +2777,9 @@ static int planner_v3_bfs_try_rebuild_chain_for_detached(
             Point old_primary_pos = current_boxes[old_primary_orig];
             int old_dist = planner_v3_bfs_manhattan(old_primary_pos, secondary_pos);
             
+            // 如果当前主箱距离更近，则更新；如果距离相同，则选择重叠更短的（重叠更短优先），重叠长度相同则路径起始位置更早的优先
             if (current_dist < old_dist ||
-                (current_dist == old_dist && overlap_len > ov->overlap_len) ||
+                (current_dist == old_dist && overlap_len < ov->overlap_len) ||
                 (current_dist == old_dist && overlap_len == ov->overlap_len && pi < ov->primary_start)) {
               ov->valid = 1;
               ov->primary = primary_i;
@@ -4877,6 +4878,9 @@ static int planner_v3_bfs_push_primary_with_chain(
           for (size_t p = 0; p < c; ++p) {
             box_ignore[chain.indices[p]] = 1;
           }
+          // 忽略当前副箱作为主箱时的所有层级副箱
+          planner_v3_bfs_collect_all_secondaries_recursive(
+              box_idx, overlaps, box_count, box_ignore);
           if (!planner_v3_bfs_compute_box_path_with_mask(
                   rows, cols, current_boxes[box_idx], targets[box_targets[box_idx]], obstacles,
                   obstacle_count, current_boxes, box_count, box_ignore, box_idx, &box_path)) {
