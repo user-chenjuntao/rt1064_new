@@ -5541,6 +5541,47 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
           if (out_box_target_indices) {
             out_box_target_indices[candidate] = SIZE_MAX;
           }
+        } else {
+          // 如果箱子已完成，遍历所有未完成箱子，识别"单箱"并清除其目标分配
+          for (size_t i = 0; i < box_count; ++i) {
+            // 跳过已完成的箱子
+            if (box_done[i]) {
+              continue;
+            }
+            if (current_boxes[i].row < 0 || current_boxes[i].col < 0) {
+              continue;
+            }
+            // 检查是否是"单箱"（无主箱、也无副箱）
+            // 1. 不是副箱：overlaps[i].valid == 0 或 overlaps[i].primary == SIZE_MAX
+            int is_secondary = 0;
+            if (overlaps[i].valid && overlaps[i].primary != SIZE_MAX) {
+              is_secondary = 1;
+            }
+            // 2. 没有副箱：没有其他箱子的 overlaps[j].primary == i 且 overlaps[j].valid == 1
+            int has_secondary = 0;
+            if (!is_secondary) {
+              for (size_t j = 0; j < box_count; ++j) {
+                if (j == i) {
+                  continue;
+                }
+                if (overlaps[j].valid && overlaps[j].primary == i) {
+                  // 检查副箱是否还存在
+                  Point sec_pos = current_boxes[j];
+                  if (sec_pos.row >= 0 && sec_pos.col >= 0) {
+                    has_secondary = 1;
+                    break;
+                  }
+                }
+              }
+            }
+            // 如果是"单箱"（不是副箱且没有副箱），清除其目标分配
+            if (!is_secondary && !has_secondary) {
+              box_targets[i] = SIZE_MAX;
+              if (out_box_target_indices) {
+                out_box_target_indices[i] = SIZE_MAX;
+              }
+            }
+          }
         }
       }
       
