@@ -5225,6 +5225,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
           continue;
         }
         // 路径计算失败，检查所有箱子是否都已完成
+        last_err_stage = 3;  // 第二次规划失败
+        last_err_detail = 11; // 第二次路径规划计算失败
         return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets,
                                                out_box_target_indices);
       }
@@ -5283,6 +5285,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         }
         if (!planned_paths[i].valid || planned_paths[i].len == 0) {
           // 路径无效，检查所有箱子是否都已完成
+          last_err_stage = 3;  // 第二次规划失败
+          last_err_detail = 12; // 第二次路径规划结果无效
           return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets,
                                                  out_box_target_indices);
         }
@@ -5437,6 +5441,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
 
       if (candidate == SIZE_MAX) {
         // 无法找到候选箱子，检查所有箱子是否都已完成
+        last_err_stage = 2;  // 动态选目标失败
+        last_err_detail = 3; // 无法找到候选箱子
         return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets,
                                                out_box_target_indices);
       }
@@ -5481,6 +5487,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         // 链式推箱触发"整链目标重分配"，需要回到第一次路径规划阶段重算
         replan_guard++;
         if (replan_guard > 20) {
+          last_err_stage = 2;  // 动态选目标失败
+          last_err_detail = 4; // 重规划次数过多
           return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets,
                                                  out_box_target_indices);
         }
@@ -5505,6 +5513,8 @@ static int planner_v3_bfs_run_dynamic(int rows, int cols, Point car,
         }
         if (all_boxes_tried) {
           // 所有箱子都尝试过了且都返回-6，检查所有箱子是否都已完成
+          last_err_stage = 2;  // 动态选目标失败
+          last_err_detail = 5; // 所有箱子都尝试失败
           return planner_v3_bfs_check_and_return(-6, current_boxes, box_count, box_targets, targets,
                                                  out_box_target_indices);
         }
