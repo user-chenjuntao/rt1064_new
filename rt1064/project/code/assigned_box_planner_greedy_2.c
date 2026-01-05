@@ -58,6 +58,7 @@ static int planner_v3_bfs_execute_single_box_path(int rows, int cols, size_t box
 
 static int planner_v3_bfs_push_single_box_scored(int rows, int cols, size_t box_idx,
                                                   size_t target_idx, const Point *targets,
+                                                  const size_t *box_targets,
                                                   const Point *obstacles, size_t obstacle_count,
                                                   Point *current_car, Point *current_boxes,
                                                   size_t box_count, Point *path_buffer,
@@ -3514,7 +3515,7 @@ static int planner_v3_bfs_chain_try_detach_any_box_by_overlap(
             }
             
             int single_res = planner_v3_bfs_push_single_box_scored(
-                rows, cols, detached_box_idx, box_targets[detached_box_idx], targets,
+                rows, cols, detached_box_idx, box_targets[detached_box_idx], targets, box_targets,
                 obstacles, obstacle_count, current_car, current_boxes, box_count,
                 path_buffer, path_capacity, out_steps);
             if (single_res != 0) {
@@ -3720,7 +3721,7 @@ static int planner_v3_bfs_chain_try_detach_any_box_by_overlap(
             }
             
             int single_res = planner_v3_bfs_push_single_box_scored(
-                rows, cols, detached_box_idx, box_targets[detached_box_idx], targets,
+                rows, cols, detached_box_idx, box_targets[detached_box_idx], targets, box_targets,
                 obstacles, obstacle_count, current_car, current_boxes, box_count,
                 path_buffer, path_capacity, out_steps);
             if (single_res != 0) {
@@ -3816,8 +3817,9 @@ static int planner_v3_bfs_chain_detach_tail_if_overlap_done(
 
 static int planner_v3_bfs_push_single_box_scored(
     int rows, int cols, size_t box_idx, size_t target_idx, const Point *targets,
-    const Point *obstacles, size_t obstacle_count, Point *current_car, Point *current_boxes,
-    size_t box_count, Point *path_buffer, size_t path_capacity, size_t *out_steps) {
+    const size_t *box_targets, const Point *obstacles, size_t obstacle_count, 
+    Point *current_car, Point *current_boxes, size_t box_count, 
+    Point *path_buffer, size_t path_capacity, size_t *out_steps) {
   if (target_idx == SIZE_MAX) {
     last_err_stage = 3;  // 第二次规划失败
     last_err_detail = 5; // 单箱推送目标未分配
@@ -4006,6 +4008,44 @@ static int planner_v3_bfs_push_single_box_scored(
         break;
       }
 
+      // 在移动车到推位之前，先检查推位是否被其他箱子占据
+      // 如果被占，按照规则处理占位箱子
+      int blocking_res = planner_v3_bfs_handle_blocking_box(
+          rows, cols, candidate.push_from, NULL,  // 单箱推行，chain为NULL
+          box_targets, targets,  // 使用传入的box_targets
+          obstacles, obstacle_count,
+          current_car, current_boxes, box_count,
+          NULL,  // 单箱推行没有blocked_box_paths
+          path_buffer, path_capacity, out_steps);
+      if (blocking_res == -7) {
+        return -7;
+      }
+      if (blocking_res == 0) {
+        // 无法处理占位箱子，尝试下一个方向
+        *current_car = car_before;
+        *out_steps = steps_before;
+        continue;
+      }
+      
+      // 处理占位箱子后，再次检查推位（可能已经被移开或已完成）
+      int push_pos_blocked = 0;
+      for (size_t bi = 0; bi < box_count; ++bi) {
+        if (bi == box_idx) continue;  // 跳过自己
+        Point b = current_boxes[bi];
+        if (b.row >= 0 && b.col >= 0 && 
+            b.row == candidate.push_from.row && 
+            b.col == candidate.push_from.col) {
+          push_pos_blocked = 1;
+          break;
+        }
+      }
+      if (push_pos_blocked) {
+        // 推位仍然被占，尝试下一个方向
+        *current_car = car_before;
+        *out_steps = steps_before;
+        continue;
+      }
+      
       int car_result = planner_v3_bfs_car_move_with_global_astar(
           rows, cols, current_car, candidate.push_from, obstacles, obstacle_count, current_boxes,
           box_count, path_buffer, path_capacity, out_steps);
@@ -4626,8 +4666,9 @@ static int planner_v3_bfs_push_primary_with_chain(
     }
     if (!has_secondary) {
       return planner_v3_bfs_push_single_box_scored(
-          rows, cols, primary_idx, box_targets[primary_idx], targets, obstacles, obstacle_count,
-          current_car, current_boxes, box_count, path_buffer, path_capacity, out_steps);
+          rows, cols, primary_idx, box_targets[primary_idx], targets, box_targets,
+          obstacles, obstacle_count, current_car, current_boxes, box_count, 
+          path_buffer, path_capacity, out_steps);
     }
 
     uint8_t deadlock_ignore_mask[PLANNER_V3_BFS_MAX_BOXES] = {0};
