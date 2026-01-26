@@ -567,6 +567,7 @@ void path_follow_draw_status(void)
     ips200_show_float(100, 144, st.target_x_m, 2, 4);
     ips200_show_string(0,160,"target_y_m");
     ips200_show_float(100, 160, st.target_y_m, 2, 4);
+
 }
 
 // 前向为0度（+X 方向），左侧为0~180，右侧为0~-180

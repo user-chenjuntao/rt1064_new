@@ -67,31 +67,6 @@ uint16 timer_box_cnt = 0;
 //	{3,7},{6,2},{6,6}
 //};
 
-PlannerPointV3_BFS car = {1, 2};
-PlannerPointV3_BFS boxes[] = {
-	{5, 3},
-    {7, 3},    
-	{3, 3},
-};
-PlannerPointV3_BFS targets[] = {
-    {9, 7},  
-	{9, 6},
-    {9, 5},  
-};  
-
-PlannerPointV3_BFS obstacles[] = {
-
-	{0, 7}, {2, 7},
-	{3, 7}, {4, 7}, {4, 6}, 
-	{7, 5}, {8, 5}, {8, 6},
-	{8, 7}, {8, 8}, {9, 8},
-	{10, 8},{11, 8},{12, 8},
-	{12, 7},{12, 6},{12, 5},
-	{12, 4},{12, 3},{11, 3},
-	{10, 3},{10, 6},{10, 5},
-	{1, 9},{1,7}
-
-};//
 
 PlannerPointV3_Bomb bombs[] = {{3, 3}};
 	//
@@ -117,6 +92,8 @@ size_t boxes_count = 0;
 size_t targets_count = 0;
 size_t obstacles_count = 0;
 size_t bombs_count = 0;
+
+uint8 data_control_flag = 0;
 
 // 读取数组数量的函数
 void read_array_counts(void)
@@ -166,25 +143,7 @@ int main(void)
 	Kinematics_Init();
 
 	
-	res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes,boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
-	path_follow_init(0.40f, (float)pulse_per_meter);
 	
-	//res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
-	if (res == 0)
-	{
-		ips200_show_string(0, 16, "path init.");
-	}
-	else
-	{
-		ips200_show_string(0, 16, "path reinit.");
-	}
-	corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
-
-	if (corner_steps > 0)
-	{
-		// 使用提取的拐点设置路径
-		path_follow_set_path(corner_path, corner_steps);
-	}
 
 	imu963ra_init();
 	Attitude_Init();
@@ -202,8 +161,7 @@ int main(void)
     while(1)
     {
 		process_blob_data();
-		color_distance_handle();
-        // 此处编写需要循环执行的代码
+       // 此处编写需要循环执行的代码
 		/*
 		if(mt9v03x_finish_flag)
 		{
@@ -212,6 +170,40 @@ int main(void)
 		}
 		*/
 		
+		// 使用实际接收到的数据计数，并检查数据接收是否完成
+		extern size_t actual_obstacles_count;
+		extern size_t actual_boxes_count;
+		extern size_t actual_targets_count;
+		extern bool data_reception_complete;
+		
+		if (data_reception_complete && data_control_flag == 0)
+		{
+			// 使用实际接收到的数据数量，而不是数组大小
+			res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, actual_boxes_count, 
+			                              targets, actual_targets_count, 
+			                              obstacles, actual_obstacles_count, 
+			                              path, GREEDY_AREA, &steps, box_target_mapping, 
+			                              &chain_info, &first_paths, &final_paths, overlaps);
+			path_follow_init(0.40f, (float)pulse_per_meter);
+			
+			// res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
+			if (res == 0)
+			{
+				ips200_show_string(0, 250, "path init.");
+			}
+			else
+			{
+				ips200_show_string(0, 250, "path reinit.");
+			}
+			corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
+
+			if (corner_steps > 0)
+			{
+				// 使用提取的拐点设置路径
+				path_follow_set_path(corner_path, corner_steps);
+			}
+			data_control_flag = 1;
+		}
 		
 		
         menu_switch();
