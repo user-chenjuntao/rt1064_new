@@ -65,6 +65,108 @@ static int planner_v3_bomb_is_obstacle(const Point *obstacles, size_t count, int
   return 0;
 }
 
+// 简单的BFS路径规划，用于从当前位置返回到起点（所有箱子已完成）
+static int planner_v3_bomb_find_return_path(int rows, int cols, Point start, Point target,
+                                             const Point *obstacles, size_t obstacle_count,
+                                             Point *path, size_t path_capacity, size_t *path_len) {
+  *path_len = 0;
+  if (start.row == target.row && start.col == target.col) {
+    return 1;  // 已经在起点
+  }
+  
+  if (!planner_v3_bomb_in_bounds(rows, cols, start.row, start.col) ||
+      !planner_v3_bomb_in_bounds(rows, cols, target.row, target.col)) {
+    return 0;
+  }
+  
+  int total_cells = rows * cols;
+  if (total_cells > 400 || total_cells <= 0) {
+    return 0;
+  }
+  
+  uint8_t visited[400];
+  int parent[400];
+  int queue[400];
+  int head = 0;
+  int tail = 0;
+  
+  for (int i = 0; i < total_cells; ++i) {
+    visited[i] = 0;
+    parent[i] = -1;
+  }
+  
+  int start_idx = start.row * cols + start.col;
+  int target_idx = target.row * cols + target.col;
+  
+  queue[tail++] = start_idx;
+  visited[start_idx] = 1;
+  
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  int found = 0;
+  
+  while (head < tail && head < 400) {
+    int curr_idx = queue[head++];
+    if (curr_idx == target_idx) {
+      found = 1;
+      break;
+    }
+    
+    int r = curr_idx / cols;
+    int c = curr_idx % cols;
+    
+    for (int d = 0; d < 4; ++d) {
+      int nr = r + dirs[d][0];
+      int nc = c + dirs[d][1];
+      
+      if (!planner_v3_bomb_in_bounds(rows, cols, nr, nc)) {
+        continue;
+      }
+      
+      if (planner_v3_bomb_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+        continue;
+      }
+      
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) {
+        continue;
+      }
+      
+      if (!visited[next_idx]) {
+        visited[next_idx] = 1;
+        parent[next_idx] = curr_idx;
+        if (tail < 400) {
+          queue[tail++] = next_idx;
+        }
+      }
+    }
+  }
+  
+  if (!found) {
+    return 0;
+  }
+  
+  // 回溯路径
+  int path_indices[400];
+  int path_count = 0;
+  int idx = target_idx;
+  
+  while (idx != -1 && path_count < 400) {
+    path_indices[path_count++] = idx;
+    idx = parent[idx];
+  }
+  
+  // 反转路径（从起点到终点，跳过起点本身）
+  *path_len = 0;
+  for (int i = path_count - 2; i >= 0 && *path_len < path_capacity; --i) {
+    int pidx = path_indices[i];
+    path[*path_len].row = pidx / cols;
+    path[*path_len].col = pidx % cols;
+    (*path_len)++;
+  }
+  
+  return (*path_len > 0) ? 1 : 0;
+}
+
 // 识别所有关键炸段（优化版：最多重叠1个障碍）
 // 核心思想：
 // 1. 识别连续障碍序列（水平和垂直）
@@ -511,6 +613,22 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
       size_t copy_len = baseline_steps < path_capacity ? baseline_steps : path_capacity;
       memcpy(path_buffer, g_baseline_path, copy_len * sizeof(Point));
       *out_steps = copy_len;
+      // 所有箱子已完成，让车子返回到起点
+      if (*out_steps > 0 && *out_steps < path_capacity) {
+        Point final_car_pos = path_buffer[*out_steps - 1];
+        // 如果车子已经在起点，不需要返回
+        if (final_car_pos.row != car.row || final_car_pos.col != car.col) {
+          // 使用简单的BFS规划从当前位置到起点的路径
+          size_t return_steps = 0;
+          int return_result = planner_v3_bomb_find_return_path(
+              rows, cols, final_car_pos, car, obstacles, obstacle_count,
+              path_buffer + *out_steps, path_capacity - *out_steps, &return_steps);
+          if (return_result && return_steps > 0) {
+            *out_steps += return_steps;
+          }
+          // 如果返回起点失败，也返回0（因为所有箱子已完成）
+        }
+      }
       return 0;
     }
     return baseline_ret;
@@ -528,6 +646,22 @@ int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
       size_t copy_len = baseline_steps < path_capacity ? baseline_steps : path_capacity;
       memcpy(path_buffer, g_baseline_path, copy_len * sizeof(Point));
       *out_steps = copy_len;
+      // 所有箱子已完成，让车子返回到起点
+      if (*out_steps > 0 && *out_steps < path_capacity) {
+        Point final_car_pos = path_buffer[*out_steps - 1];
+        // 如果车子已经在起点，不需要返回
+        if (final_car_pos.row != car.row || final_car_pos.col != car.col) {
+          // 使用简单的BFS规划从当前位置到起点的路径
+          size_t return_steps = 0;
+          int return_result = planner_v3_bomb_find_return_path(
+              rows, cols, final_car_pos, car, obstacles, obstacle_count,
+              path_buffer + *out_steps, path_capacity - *out_steps, &return_steps);
+          if (return_result && return_steps > 0) {
+            *out_steps += return_steps;
+          }
+          // 如果返回起点失败，也返回0（因为所有箱子已完成）
+        }
+      }
       return 0;
     }
     return baseline_ret;
@@ -747,6 +881,23 @@ finish_enumeration:
       }
     }
     // 如果使用炸弹，路径已经在枚举时保存到path_buffer了（700-703行）
+    
+    // 所有箱子已完成，让车子返回到起点
+    if (*out_steps > 0 && *out_steps < path_capacity) {
+      Point final_car_pos = path_buffer[*out_steps - 1];
+      // 如果车子已经在起点，不需要返回
+      if (final_car_pos.row != car.row || final_car_pos.col != car.col) {
+        // 使用简单的BFS规划从当前位置到起点的路径
+        size_t return_steps = 0;
+        int return_result = planner_v3_bomb_find_return_path(
+            rows, cols, final_car_pos, car, obstacles, obstacle_count,
+            path_buffer + *out_steps, path_capacity - *out_steps, &return_steps);
+        if (return_result && return_steps > 0) {
+          *out_steps += return_steps;
+        }
+        // 如果返回起点失败，也返回0（因为所有箱子已完成）
+      }
+    }
     
     return 0;
   }
