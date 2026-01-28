@@ -6,6 +6,11 @@
 #define FLASH_SECTION_INDEX            127
 #define FLASH_PAGE_INDEX               FLASH_PAGE_3
 #define PATH_ITEMS_PER_PAGE            32
+#define MAP_GRID_SIZE                  14
+#define MAP_CELL_W                     8
+#define MAP_CELL_H                     16
+#define IPS200_SCREEN_W                240
+#define IPS200_SCREEN_H                320
 
 #define FLASH_RESULT_NONE    0
 #define FLASH_RESULT_SUCCESS 1
@@ -40,7 +45,7 @@ static const uint16 box_colors[5] = {RGB565_RED, RGB565_GREEN, RGB565_BLUE, RGB5
 static uint16 path_text_page = 0;        // 文本模式当前页面
 static uint16 path_graph_page = 0;      // 图形模式当前页面（箱子索引）
 
-
+extern uint8 data_control_flag;
 extern uint8 car_go_flag;
 extern uint8 car_stop_flag;
 extern volatile uint8 push_box_flag;
@@ -99,6 +104,7 @@ uint8 param_clear_flash(void);
 
 // actions
 void action_start_car(void);
+void action_start_dr(void);
 void action_stop_car(void);
 void action_save_flash(void);
 void action_load_flash(void);
@@ -113,6 +119,7 @@ void draw_status_camera(void);
 void draw_status_path(void);
 void draw_status_pid(void);
 void draw_status_imu(void);
+void draw_status_map(void);
 void draw_flash_status(void);
 void draw_image_preview(void);
 void draw_display_mode(void);
@@ -133,11 +140,13 @@ static menu_item_t status_menu;
 static menu_item_t status_flash_menu;
 static menu_item_t path_menu;
 static menu_item_t status_imu_view;
+static menu_item_t status_print_map_view;
 static menu_item_t status_rebuild_chain_view;
 static menu_item_t image_menu;
 static menu_item_t display_menu;
 
 static menu_item_t cargo_start_item;
+static menu_item_t cargo_start_dr_item;
 static menu_item_t cargo_stop_item;
 
 static menu_item_t base_speed_item;
@@ -185,7 +194,7 @@ static menu_item_t display_debug_mode_item;
 static menu_item_t display_high_mode_item;
 
 static const menu_item_t *const main_children[] = {&cargo_menu, &param_menu, &status_menu, &image_menu, &display_menu};
-static const menu_item_t *const cargo_children[] = {&cargo_start_item, &cargo_stop_item};
+static const menu_item_t *const cargo_children[] = {&cargo_start_item, &cargo_start_dr_item, &cargo_stop_item};
 static const menu_item_t *const param_children[] = {&param_speed_menu, &param_servo_menu, &param_pid_menu};
 static const menu_item_t *const speed_children[] = {&base_speed_item, &turn_speed_item, &speed_k_item, &speed_limit_item, &yuanhuan_speed_item};
 static const menu_item_t *const servo_children[] = {&up_left_speed_item, &up_right_speed_item, &down_left_speed_item, &down_right_speed_item, &start_acc_item, &end_decel_item, &slow_turn_item, &turn_num_item};
@@ -194,7 +203,7 @@ static const menu_item_t *const pid_children[] = {
     &pid_world_y_kp_item, &pid_world_y_ki_item, &pid_world_y_kd_item,
     &pid_yaw_kp_item, &pid_yaw_ki_item, &pid_yaw_kd_item,
     &pid_accel_yaw_kp_item, &pid_accel_yaw_ki_item, &pid_accel_yaw_kd_item};
-static const menu_item_t *const status_children[] = {&status_camera_view, &path_menu, &status_pid_view, &status_imu_view, &status_flash_menu};
+static const menu_item_t *const status_children[] = {&status_camera_view, &path_menu, &status_pid_view, &status_imu_view, &status_print_map_view, &status_flash_menu};
 static const menu_item_t *const path_children[] = {&path_first, &path_final, &path_car, &path_easy};
 static const menu_item_t *const flash_children[] = {&flash_save_item, &flash_load_item, &flash_clear_item};
 static const menu_item_t *const image_children[] = {&image_binary_view, &image_variable_view};
@@ -277,6 +286,12 @@ static menu_item_t cargo_start_item = {
     .title = "Start",
     .type = MENU_ITEM_ACTION,
     .action = action_start_car,
+};
+
+static menu_item_t cargo_start_dr_item = {
+    .title = "Start_DR",
+    .type = MENU_ITEM_ACTION,
+    .action = action_start_dr,
 };
 
 static menu_item_t cargo_stop_item = {
@@ -475,6 +490,12 @@ static menu_item_t status_imu_view = {
     .title = "IMU",
     .type = MENU_ITEM_VIEW,
     .draw = draw_status_imu,
+};
+
+static menu_item_t status_print_map_view = {
+    .title = "Print_Map",
+    .type = MENU_ITEM_VIEW,
+    .draw = draw_status_map,
 };
 
 static menu_item_t flash_save_item = {
@@ -1126,7 +1147,8 @@ void menu_display(void)
            menu_rt.active_item == &path_final || 
            menu_rt.active_item == &path_car || 
            menu_rt.active_item == &path_easy || 
-           menu_rt.active_item == &status_imu_view)))
+           menu_rt.active_item == &status_imu_view ||
+           menu_rt.active_item == &status_print_map_view)))
     {
         menu_draw_header();
         menu_draw_list();
@@ -1195,14 +1217,42 @@ void menu_switch(void)
 }
 void action_start_car(void)
 {
+    uart_data_processing_enabled = true;  // 启用串口数据处理
     car_go_flag = 1;
     car_stop_flag = 0;
+}
+
+
+// uint8 iii = 0;
+
+void action_start_dr(void)
+{
+    uart_data_processing_enabled = true;  // 启用串口数据处理（但不启动电机）
+    memset(obstacles, 0, sizeof(obstacles));
+    memset(boxes, 0, sizeof(boxes));
+    memset(targets, 0, sizeof(targets));
+    actual_obstacles_count = 0;
+    actual_boxes_count = 0;
+    actual_targets_count = 0;
+    actual_car_path_count = 0;
+    get_data_1 = 0;
+    get_data_2 = 0;
+    get_data_3 = 0;
+    get_data_4 = 0;
+    printf("START\n");
 }
 
 void action_stop_car(void)
 {
     car_go_flag = 0;
     car_stop_flag = 1;
+    data_reception_complete = false;  // 重置数据接收完成标志
+    uart_data_processing_enabled = false; // 停止串口数据处理
+    get_data_1 = 0;
+    get_data_2 = 0;
+    get_data_3 = 0;
+    get_data_4 = 0;
+    data_control_flag = 0;
     memset(speed_encoder, 0, sizeof(speed_encoder));
     motor_control(speed_encoder);
 }
@@ -1243,15 +1293,18 @@ void draw_main_info(void)
     ips200_show_string(120, 32, "steps");
     ips200_show_int(160, 32, steps, 4);
     ips200_show_string(120, 48, "b-t");
-    for (int i=0;i<boxes_count;i++){
-        ips200_show_int(160+i*8, 48, box_target_mapping[i], 3);
-    }
-    ips200_show_string(120, 64, "chain");
-    for (size_t i = 0; i < chain_info.chain_count; i++) {
-        for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
-            ips200_show_int(160+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
-        }
-    }
+
+    ips200_show_uint(0,250,format_count,4);
+    // ips200_show_int(80,250,blob_info.cy,4);
+    // for (int i=0;i<boxes_count;i++){
+    //     ips200_show_int(160+i*8, 48, box_target_mapping[i], 3);
+    // }
+    // ips200_show_string(120, 64, "chain");
+    // for (size_t i = 0; i < chain_info.chain_count; i++) {
+    //     for (size_t j = 0; j < chain_info.chain_lengths[i]; j++) {
+    //         ips200_show_int(160+j*8, 64+i*16, chain_info.chain_indices[i][j], 3);
+    //     }
+    // }
     // 显示链式箱子的重叠末端坐标（从最近一次planner_v3_bfs_detect_overlaps的overlaps数组读取）
     ips200_show_string(120, 80+(chain_info.chain_count-1)*16, "overlap");
     uint16 y_offset = 100+(chain_info.chain_count-1)*16;
@@ -1388,6 +1441,19 @@ void draw_cargo_info(void)
 
     path_follow_draw_status();
 
+    ips200_show_int(0, 192, get_data_1, 3);
+    ips200_show_int(30, 192, get_data_2, 3);
+    ips200_show_int(60, 192, get_data_3, 3);
+    ips200_show_int(90, 192, get_data_4, 3);
+
+    ips200_show_string(0, 224, "obs:");
+    ips200_show_int(35, 224, actual_obstacles_count, 3);
+    ips200_show_string(60, 224, "box:");
+    ips200_show_int(95, 224, actual_boxes_count, 3);
+    ips200_show_string(120, 224, "tar:");
+    ips200_show_int(155, 224, actual_targets_count, 3);
+
+
     // ips200_show_string(0, 96, "huan");
     // ips200_show_uint(40, 96, huandao_flag, 1);
     // ips200_show_string(0, 112, "cross");
@@ -1426,6 +1492,69 @@ void draw_status_camera(void)
 
     ips200_show_string(0, 224, "dist");
     ips200_show_float(40, 224, blob_info.distance, 3, 1);
+}
+
+static void map_grid_set_char(char grid[MAP_GRID_SIZE][MAP_GRID_SIZE], int row, int col, char symbol)
+{
+    if (row < 0 || row >= MAP_GRID_SIZE || col < 0 || col >= MAP_GRID_SIZE)
+    {
+        return;
+    }
+    grid[row][col] = symbol;
+}
+
+void draw_status_map(void)
+{
+    char grid[MAP_GRID_SIZE][MAP_GRID_SIZE];
+    char line[MAP_GRID_SIZE + 1];
+    const uint16 map_origin_x = (IPS200_SCREEN_W - MAP_GRID_SIZE * MAP_CELL_W) / 2;
+    const uint16 map_origin_y = (IPS200_SCREEN_H - MAP_GRID_SIZE * MAP_CELL_H) / 2;
+    const uint16 title_y = (map_origin_y >= MAP_CELL_H) ? (map_origin_y - MAP_CELL_H) : 0;
+    size_t count = 0;
+
+    memset(grid, '.', sizeof(grid));
+
+    count = actual_obstacles_count;
+    if (count > MAX_OBSTACLES)
+    {
+        count = MAX_OBSTACLES;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        map_grid_set_char(grid, obstacles[i].row, obstacles[i].col, '#');
+    }
+
+    count = actual_targets_count;
+    if (count > MAX_TARGETS)
+    {
+        count = MAX_TARGETS;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        map_grid_set_char(grid, targets[i].row, targets[i].col, 'T');
+    }
+
+    count = actual_boxes_count;
+    if (count > MAX_BOXES)
+    {
+        count = MAX_BOXES;
+    }
+    for (size_t i = 0; i < count; i++)
+    {
+        map_grid_set_char(grid, boxes[i].row, boxes[i].col, 'B');
+    }
+
+    map_grid_set_char(grid, car.row, car.col, 'C');
+
+    ips200_set_color(RGB565_WHITE, RGB565_BLACK);
+    ips200_show_string(map_origin_x, title_y, "Map");
+
+    for (uint8 row = 0; row < MAP_GRID_SIZE; row++)
+    {
+        memcpy(line, grid[row], MAP_GRID_SIZE);
+        line[MAP_GRID_SIZE] = '\0';
+        ips200_show_string(map_origin_x, map_origin_y + row * MAP_CELL_H, line);
+    }
 }
 
 void draw_path_easy(void)
@@ -2067,4 +2196,3 @@ uint8 param_clear_flash(void)
     }
     return 1;
 }
-

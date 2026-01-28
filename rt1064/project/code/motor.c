@@ -190,47 +190,69 @@ int16 Lowpass(int16 X_last,int16 X_new)
 
 void motor_pwm(int up_left_speed,int up_right_speed,int down_left_speed,int down_right_speed)
 {
-	if(up_left_speed >= 0)                                                           // 正转
+	if(up_left_speed > 0)                                                           // 正转
     {
 		gpio_set_level(MOTOR1_DIR, GPIO_LOW);                     // DIR输出高电平
-        pwm_set_duty(MOTOR1_PWM, up_left_speed);                   // 计算占空比
+        pwm_set_duty(MOTOR1_PWM, up_left_speed+440);                   // 计算占空比
      }
      else if (up_left_speed < 0)                                                                  // 反转
      {
 		gpio_set_level(MOTOR1_DIR, GPIO_HIGH);                    // DIR输出低电平
-        pwm_set_duty(MOTOR1_PWM, -up_left_speed);                // 计算占空比
+        pwm_set_duty(MOTOR1_PWM, -up_left_speed+440);                // 计算占空比
 
      }
+	 else if (up_left_speed == 0)
+	 {
+		gpio_set_level(MOTOR1_DIR, GPIO_LOW);                     // DIR输出高电平
+		 pwm_set_duty(MOTOR1_PWM, 0);                                 // 停止
+	 }
 
-	 if (up_right_speed >= 0)
+	 if (up_right_speed > 0)
 	 {
 		 gpio_set_level(MOTOR2_DIR, GPIO_LOW);                       // DIR输出高电平
-         pwm_set_duty(MOTOR2_PWM, up_right_speed);                   // 计算占空比
+         pwm_set_duty(MOTOR2_PWM, up_right_speed+340);                   // 计算占空比
 	 }
-	 else
+	 else if (up_right_speed < 0)
 	 {
 		 gpio_set_level(MOTOR2_DIR, GPIO_HIGH);                     // DIR输出低电平
-         pwm_set_duty(MOTOR2_PWM, -up_right_speed);                // 计算占空比
+         pwm_set_duty(MOTOR2_PWM, -up_right_speed+380);                // 计算占空比
 	 }
-	 if (down_left_speed >= 0)
+	 else if (up_right_speed == 0)
+	 {
+		 gpio_set_level(MOTOR2_DIR, GPIO_LOW);                       // DIR输出高电平
+		 pwm_set_duty(MOTOR2_PWM, 0);                                 // 停止
+	 }
+
+	 if (down_left_speed > 0)
 	 {
 		 gpio_set_level(MOTOR3_DIR, GPIO_LOW);                       // DIR输出高电平
-         pwm_set_duty(MOTOR3_PWM, down_left_speed);                   // 计算占空比
+         pwm_set_duty(MOTOR3_PWM, down_left_speed+360);                   // 计算占空比
 	 }
-	 else
+	 else if (down_left_speed < 0)
 	 {
 		 gpio_set_level(MOTOR3_DIR, GPIO_HIGH);                      // DIR输出低电平
-         pwm_set_duty(MOTOR3_PWM, -down_left_speed);                // 计算占空比
+         pwm_set_duty(MOTOR3_PWM, -down_left_speed+330);                // 计算占空比
 	 }
-	 if (down_right_speed >= 0)
+	 else if (down_left_speed == 0)
+	 {
+		 gpio_set_level(MOTOR3_DIR, GPIO_LOW);                       // DIR输出高电平
+		 pwm_set_duty(MOTOR3_PWM, 0);                                 // 停止
+	 }
+
+	 if (down_right_speed > 0)
 	 {
 		 gpio_set_level(MOTOR4_DIR, GPIO_HIGH);                       // DIR输出高电平
-         pwm_set_duty(MOTOR4_PWM, down_right_speed);                  // 计算占空比
+         pwm_set_duty(MOTOR4_PWM, down_right_speed+480);                  // 计算占空比
 	 }
-	 else
+	 else if (down_right_speed < 0)
 	 {
 		 gpio_set_level(MOTOR4_DIR, GPIO_LOW);                       // DIR输出低电平
-         pwm_set_duty(MOTOR4_PWM, -down_right_speed);                // 计算占空比
+         pwm_set_duty(MOTOR4_PWM, -down_right_speed+470);                // 计算占空比
+	 }
+	 else if (down_right_speed == 0)
+	 {
+		 gpio_set_level(MOTOR4_DIR, GPIO_HIGH);                       // DIR输出高电平
+		 pwm_set_duty(MOTOR4_PWM, 0);                                 // 停止	
 	 }
 }
 
@@ -284,7 +306,7 @@ float r_y = 0;
 void Kinematics_Init(void)
 {
 	//轮子转动一圈，移动的距离为轮子的周长WHEEL_DIAMETER*3.1415926，编码器产生的脉冲信号为ENCODER_RESOLUTION。则电机编码器转一圈产生的脉冲信号除以轮子周长可得轮子前进1m的距离所对应编码器计数的变化
-    pulse_per_meter = (float)(ENCODER_RESOLUTION/(WHEEL_DIAMETER*3.1415926))/linear_correction_factor;      //14986.176
+    pulse_per_meter = (float)(ENCODER_RESOLUTION/(WHEEL_DIAMETER*3.1415926f))/linear_correction_factor;      //12513
     //宏定义依次对应 2280 0.058 修正系数给了1.0
     r_x = D_X/2;
     r_y = D_Y/2;
@@ -311,7 +333,7 @@ void Kinematics_Inverse(float* input, int* output)
 	v_w[3] = v_tx - v_ty + (r_x + r_y)*omega;
 
     //计算一个PID控制周期内，电机编码器计数值的变化
-	output[0] = (int)(v_w[0] * pulse_per_meter/PID_RATE);   //上左    *150
+	output[0] = (int)(v_w[0] * pulse_per_meter/PID_RATE);   //上左    *125
 	output[1] = (int)(v_w[1] * pulse_per_meter/PID_RATE);   //上右
 	output[2] = (int)(v_w[2] * pulse_per_meter/PID_RATE);   //下左
 	output[3] = (int)(v_w[3] * pulse_per_meter/PID_RATE);   //下右
