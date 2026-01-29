@@ -2,45 +2,34 @@
 #define ASSIGNED_BOX_PLANNER_GREEDY_3_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include "assigned_box_planner_greedy.h"
+#include "assigned_box_planner_greedy_2.h"
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+extern int last_err_stage;   // 错误阶段
+extern int last_err_detail;  // 错误详情
+
+// 特殊路径（不把炸弹当作障碍、允许经过一次障碍）的显示数据
+// 用于在菜单中单独查看"特殊路径"，并保持每次规划后的最新结果
+extern PlannerAllBoxPaths special_paths;
+
 typedef Point PlannerPointV3_Bomb;
 
 /**
- * 炸弹推箱规划算法 v3_Bomb - 带炸弹优化的版本（基于动态贪心）
+ * 炸弹推箱规划算法 v3 - 基于 v2 的炸弹版本
  * 
  * 算法核心：
- * - 基于 v3_BFS 动态贪心算法，增加炸弹机制
- * - 炸弹可以被推到障碍物上，炸毁该障碍及其上下左右相邻障碍
- * - 识别"关键炸段"：同方向连续的障碍组，推荐炸其中心位置
- * - 枚举不同的炸弹使用方案，比较baseline（不用炸弹）和炸弹方案
- * - 优先选择无错误的方案，在都成功时选择步数更少的方案
- * - 【继承特性】底层使用动态贪心：推完一个箱子/炸弹后重新选择下一个
- * - 【继承优化】底层考虑最佳推箱位：计算车到推箱位的真实距离而非车到箱子距离
- * 
- * 算法流程：
- * 1. 先计算不使用炸弹的baseline路径（底层使用推箱位优化的动态贪心）
- * 2. 识别地图上所有"关键炸段"（同方向连续障碍组）
- * 3. 对每个炸弹，枚举可能的炸段目标和插入位置
- *    - 距离剪枝：过滤距离过远的炸弹-炸段组合
- * 4. 对每种炸弹方案：
- *    a. 将炸弹插入到指定位置（在某些箱子之前/之后）
- *    b. 逐个推炸弹和箱子（底层自动应用推箱位优化）
- *    c. 炸弹爆炸后更新障碍物列表
- *    d. 推箱子时将其余箱子当作障碍物
- * 5. 比较baseline和所有炸弹方案：
- *    - 优先选择无错误的方案
- *    - 如果都成功，选择步数更少的
- * 6. 返回最优路径
- * 
- * 底层优化说明：
- * - 每次推箱子/炸弹时，底层算法会自动找到最佳推位
- * - 使用BFS计算车到推位的真实距离（而非曼哈顿距离）
- * - 考虑死点检测，过滤不可行的推位
+ * - 基础流程和 assigned_box_planner_greedy_2.c 一致
+ * - 把炸弹看作障碍
+ * - 分配目标完后，先使用 BFS+A* 给该箱子规划路径；规划过程中任何错误导致不成功则直接进行特殊路径计算
+ * - 特殊路径计算时不需要把炸弹当作障碍，路径允许经过一次障碍（该障碍为需炸掉的障碍）
+ * - 特殊路径计算出来后：先推炸弹。选炸弹：按「距特殊路径经过的障碍」BFS 距离升序；选目标：备选为「该障碍及其上下左右障碍」，按该炸弹到目标的 BFS 可达距离升序。
+ *   先试最优目标，不行则试次优目标，直至所有目标；该炸弹都推不到则试次优炸弹，依次尝试所有炸弹。推炸弹时仍为 BFS+A* 与评分方式取步数少者；除目标障碍外其他障碍、其他炸弹和箱子均当作障碍。
+ *   推完炸弹后进入推箱子环节（模拟 BFS+A* 路径 vs 评分方式推到目标点，取车步数少者；所有障碍、箱子、炸弹均考虑），推箱子环节失败则不再计算特殊路径，直接返回失败
  *
  * @param rows/cols                 网格尺寸
  * @param car                       小车初始坐标
@@ -51,8 +40,7 @@ typedef Point PlannerPointV3_Bomb;
  * @param path_buffer/path_capacity 输出路径缓存 / 容量
  * @param out_steps                 实际路径步数
  * @param out_box_target_indices    箱子到目标的映射（可选，传NULL则不输出）
- * @param out_used_bombs            使用的炸弹索引列表（可选，传NULL则不输出）
- * @param out_used_bomb_count       实际使用的炸弹数量
+ * @param out_final_paths           最终路径规划的所有箱子路径（可选，传NULL则不输出）
  *
  * @return 0  成功
  *         -1 参数为空
@@ -65,18 +53,18 @@ typedef Point PlannerPointV3_Bomb;
  *         -8 目标数少于箱子数
  *         -9 炸弹数超限(5)
  */
-int plan_boxes_with_bombs_v3(int rows, int cols, PlannerPointV3_Bomb car,
-                              const PlannerPointV3_Bomb *boxes, size_t box_count,
-                              const PlannerPointV3_Bomb *targets, size_t target_count,
-                              const PlannerPointV3_Bomb *bombs, size_t bomb_count,
-                              const PlannerPointV3_Bomb *obstacles, size_t obstacle_count,
-                              PlannerPointV3_Bomb *path_buffer, size_t path_capacity,
-                              size_t *out_steps, size_t *out_box_target_indices,
-                              size_t *out_used_bombs, size_t *out_used_bomb_count);
+int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_Bomb car,
+                         const PlannerPointV3_Bomb *boxes, size_t box_count,
+                         const PlannerPointV3_Bomb *targets, size_t target_count,
+                         const PlannerPointV3_Bomb *bombs, size_t bomb_count,
+                         const PlannerPointV3_Bomb *obstacles,
+                         size_t obstacle_count, PlannerPointV3_Bomb *path_buffer,
+                         size_t path_capacity, size_t *out_steps,
+                         size_t *out_box_target_indices,
+                         PlannerAllBoxPaths *out_final_paths);
 
 #ifdef __cplusplus
 }
 #endif
 
 #endif
-
