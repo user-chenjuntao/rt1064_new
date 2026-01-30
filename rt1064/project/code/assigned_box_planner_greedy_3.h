@@ -13,11 +13,14 @@ extern "C" {
 extern int last_err_stage;   // 错误阶段
 extern int last_err_detail;  // 错误详情
 
+/** 推箱/推炸弹时是否仅使用 BFS+A* 路径（方便配置）
+ *  0 = 路径与评分取优（默认）：有路径则与评分策略比较步数，取少者
+ *  1 = 仅用 BFS+A* 路径：只按 BFS+A* 算出的路径推动，无有效路径则直接失败 */
+extern int planner_v3_push_only_bfs_astar_path;
+
 // 特殊路径（不把炸弹当作障碍、允许经过一次障碍）的显示数据
 // 用于在菜单中单独查看"特殊路径"，并保持每次规划后的最新结果
 extern PlannerAllBoxPaths special_paths;
-
-typedef Point PlannerPointV3_Bomb;
 
 /**
  * 炸弹推箱规划算法 v3 - 基于 v2 的炸弹版本
@@ -53,12 +56,12 @@ typedef Point PlannerPointV3_Bomb;
  *         -8 目标数少于箱子数
  *         -9 炸弹数超限(5)
  */
-int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_Bomb car,
-                         const PlannerPointV3_Bomb *boxes, size_t box_count,
-                         const PlannerPointV3_Bomb *targets, size_t target_count,
-                         const PlannerPointV3_Bomb *bombs, size_t bomb_count,
-                         const PlannerPointV3_Bomb *obstacles,
-                         size_t obstacle_count, PlannerPointV3_Bomb *path_buffer,
+int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_BFS car,
+                         const PlannerPointV3_BFS *boxes, size_t box_count,
+                         const PlannerPointV3_BFS *targets, size_t target_count,
+                         const PlannerPointV3_BFS *bombs, size_t bomb_count,
+                         const PlannerPointV3_BFS *obstacles,
+                         size_t obstacle_count, PlannerPointV3_BFS *path_buffer,
                          size_t path_capacity, size_t *out_steps,
                          size_t *out_box_target_indices,
                          PlannerAllBoxPaths *out_final_paths);

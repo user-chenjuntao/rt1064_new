@@ -20,6 +20,10 @@ typedef struct {
   int valid;                    // 路径是否有效
   size_t path_len;              // 路径长度
   Point path[400];              // 箱子路径（最多400步）
+  Point obstacle_to_clear;      // 特殊路径：需炸掉的目标障碍坐标（仅 special_paths 使用）
+  int has_obstacle_to_clear;    // 特殊路径：是否有需炸掉的障碍
+  Point bomb_exploded_at;       // 炸弹实际爆炸位置（炸掉的障碍坐标）
+  int has_bomb_exploded;        // 是否使用了炸弹并已爆炸
 } PlannerBoxPathOutput;
 
 // 所有箱子的路径输出结构

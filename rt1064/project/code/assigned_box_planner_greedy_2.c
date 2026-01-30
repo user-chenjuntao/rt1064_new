@@ -1,4 +1,4 @@
-﻿#include "assigned_box_planner_greedy_2.h"
+#include "assigned_box_planner_greedy_2.h"
 
 #include <limits.h>
 #include <stdint.h>
@@ -298,12 +298,14 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
 }
 
 // A*搜索：使用预计算的距离作为启发函数
+// check_push: 1=在扩展时检测推位，若节点A到节点B的推位不合理（障碍、箱、边界外）则排除节点B；0=不检测（车路径等）
 // 返回值：1=成功找到路径，0=失败
 static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point target,
                                       const Point *obstacles, size_t obstacle_count,
                                       const Point *boxes, size_t box_count,
                                       const int dist[PLANNER_V3_BFS_MAX_CELLS],
-                                      Point *path, size_t path_cap, size_t *path_len) {
+                                      Point *path, size_t path_cap, size_t *path_len,
+                                      int check_push) {
   int total_cells = rows * cols;
   if (total_cells > PLANNER_V3_BFS_MAX_CELLS || total_cells <= 0) {
     return 0;
@@ -420,6 +422,21 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
       int next_idx = nr * cols + nc;
       if (next_idx < 0 || next_idx >= total_cells) {
         continue;
+      }
+      
+      /* 推位检测：若从节点A(curr)到节点B(next)的推位不合理（障碍、箱、边界外），则排除节点B */
+      if (check_push) {
+        int push_row = curr_row * 2 - nr;
+        int push_col = curr_col * 2 - nc;
+        if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
+          continue;
+        }
+        if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+          continue;
+        }
+        if (planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, SIZE_MAX)) {
+          continue;
+        }
       }
       
       if (in_closed[next_idx]) {
@@ -577,7 +594,7 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
     if (!planner_v3_bfs_astar_with_dist(rows, cols, car, target_push_pos,
                                     obstacles, obstacle_count,
                                     boxes, box_count, dist,
-                                    path, path_cap, path_len)) {
+                                    path, path_cap, path_len, 0)) {
       continue;  // A*失败，尝试下一个推箱位
     }
     
@@ -622,7 +639,7 @@ static int planner_v3_bfs_car_move_with_global_astar(int rows, int cols, Point *
   if (!planner_v3_bfs_astar_with_dist(rows, cols, *car_pos, target,
                                   obstacles, obstacle_count,
                                   boxes, box_count, dist,
-                                  temp_path, 256, &temp_len)) {
+                                  temp_path, 256, &temp_len, 0)) {
     return 0;  // A*失败
   }
   
@@ -1201,7 +1218,7 @@ static int planner_v3_bfs_compute_box_path_length(int rows, int cols, Point box_
   size_t path_len = 0;
   if (!planner_v3_bfs_astar_with_dist(rows, cols, box_start, target, obstacles, obstacle_count,
                                       temp_boxes, temp_count, dist,
-                                      temp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len)) {
+                                      temp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len, 1)) {
     return INT_MAX;
   }
 
@@ -1538,7 +1555,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       // 使用A*计算箱子路径
       if (planner_v3_bfs_astar_with_dist(rows, cols, box, target, obstacles, obstacle_count,
                                          temp_boxes, temp_count, box_path_dist,
-                                         box_path, PLANNER_V3_BFS_MAX_CELLS, &box_path_len)) {
+                                         box_path, PLANNER_V3_BFS_MAX_CELLS, &box_path_len, 1)) {
         if (box_path_len > 1) {
           has_box_path = 1;  // 有有效路径（至少包含起点和终点）
         }
@@ -1590,7 +1607,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       return -6;
     }
 
-    int force_score = 1;
+    int force_score = 0;
     int use_path = path_sim_ok && (!score_sim_ok || path_sim_steps <= score_sim_steps);
     if (force_score && score_sim_ok) {
       use_path = 0;
@@ -1643,7 +1660,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       if (planner_v3_bfs_astar_with_dist(rows, cols, current_car, car_start,
                                         obstacles, obstacle_count,
                                         empty_boxes, empty_box_count, dist,
-                                        return_path, 256, &return_len)) {
+                                        return_path, 256, &return_len, 0)) {
         // 将返回路径添加到输出（跳过起点，因为起点是当前车位置）
         for (size_t i = 1; i < return_len; ++i) {
           if (*out_steps >= path_capacity) {
