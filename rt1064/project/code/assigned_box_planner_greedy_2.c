@@ -322,6 +322,7 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
   typedef struct {
     int idx;
     int f_score;  // f = g + h
+    int car_to_push_dist;  // 车到推位的BFS距离；无check_push时用dist[idx]，用于tiebreaker
   } AStarNode;
   
   int g_score[PLANNER_V3_BFS_MAX_CELLS];
@@ -351,16 +352,20 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
   g_score[start_idx] = 0;
   open_set[open_count].idx = start_idx;
   open_set[open_count].f_score = dist[start_idx];  // f = g + h = 0 + h
+  open_set[open_count].car_to_push_dist = dist[start_idx];
   open_count++;
   in_open[start_idx] = 1;
   
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   
   while (open_count > 0) {
-    // 找到f_score最小的节点
+    // 找到f_score最小的节点；若f_score相同则优先选择车到推位BFS距离(dist)更短的节点
     int best_idx = 0;
     for (int i = 1; i < open_count; ++i) {
       if (open_set[i].f_score < open_set[best_idx].f_score) {
+        best_idx = i;
+      } else if (open_set[i].f_score == open_set[best_idx].f_score &&
+                 open_set[i].car_to_push_dist < open_set[best_idx].car_to_push_dist) {
         best_idx = i;
       }
     }
@@ -424,7 +429,9 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         continue;
       }
       
-      /* 推位检测：若从节点A(curr)到节点B(next)的推位不合理（障碍、箱、边界外），则排除节点B */
+      int car_to_push_dist = dist[next_idx];  /* 无车到推位计算时用目标距离作为tiebreaker */
+      
+      /* 推位检测：若从节点A(curr)到节点B(next)的推位不合理（障碍、箱、边界外），则排除节点B；推位 = from - (to-from) */
       if (check_push) {
         int push_row = curr_row * 2 - nr;
         int push_col = curr_col * 2 - nc;
@@ -461,6 +468,7 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         if (open_count < PLANNER_V3_BFS_MAX_CELLS) {
           open_set[open_count].idx = next_idx;
           open_set[open_count].f_score = f;
+          open_set[open_count].car_to_push_dist = car_to_push_dist;
           open_count++;
           in_open[next_idx] = 1;
         }
@@ -472,10 +480,11 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         int h = dist[next_idx];
         int f = tentative_g + h;
         
-        // 更新open_set中的f_score
+        // 更新open_set中的f_score和car_to_push_dist
         for (int i = 0; i < open_count; ++i) {
           if (open_set[i].idx == next_idx) {
             open_set[i].f_score = f;
+            open_set[i].car_to_push_dist = car_to_push_dist;
             break;
           }
         }

@@ -24,6 +24,10 @@ typedef struct {
   int has_obstacle_to_clear;    // 特殊路径：是否有需炸掉的障碍
   Point bomb_exploded_at;       // 炸弹实际爆炸位置（炸掉的障碍坐标）
   int has_bomb_exploded;        // 是否使用了炸弹并已爆炸
+  Point bomb_extra_exploded_at[5];  // 炸弹B/C等清除推位障碍时的爆炸位置（用于主菜单显示）
+  int bomb_extra_exploded_count;    // 上述辅助炸弹爆炸数量，0..5
+  Point bomb_on_path[5];           // 特殊路径经过的炸弹坐标（用于菜单标蓝）
+  int bomb_on_path_count;          // 上述数量，0..5
 } PlannerBoxPathOutput;
 
 // 所有箱子的路径输出结构
