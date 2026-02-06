@@ -28,6 +28,8 @@ typedef struct {
   int bomb_extra_exploded_count;    // 上述辅助炸弹爆炸数量，0..5
   Point bomb_on_path[5];           // 特殊路径经过的炸弹坐标（用于菜单标蓝）
   int bomb_on_path_count;          // 上述数量，0..5
+  int dropped_req1;                // 特殊路径：是否去掉要求1（1=去掉，0=未去掉）
+  int dropped_req2;                // 特殊路径：是否去掉要求2（1=去掉，0=未去掉）
 } PlannerBoxPathOutput;
 
 // 所有箱子的路径输出结构

@@ -10,40 +10,37 @@ extern int last_err_detail;  // 错误详情
 
 int planner_v3_push_only_bfs_astar_path = 0;  /* 0=路径与评分取优，1=仅用BFS+A*路径 */
 
-#define PLANNER_V3_BFS_MAX_BOXES 10
+#define PLANNER_V3_BFS_MAX_BOXES 5
 #define PLANNER_V3_BFS_MAX_CELLS 400
-#define PLANNER_V3_BFS_MAX_GREEDY_STEPS 5000
-#define PLANNER_V3_BFS_MAX_PATH_LEN 5000
+#define PLANNER_V3_BFS_MAX_GREEDY_STEPS 400
+#define PLANNER_V3_BFS_MAX_PATH_LEN 400
 #define PLANNER_V3_BFS_STRATEGY_PATH 1
 #define PLANNER_V3_BFS_STRATEGY_SCORE 2
 #define MAX_BOMBS 5
-#define PUSH_BOMB_SAVE_PATH_MAX 4096
+#define PUSH_BOMB_SAVE_PATH_MAX 400
+#define PLANNER_V3_BFS_MAX_CANDIDATE_TARGETS 5
 
 // 特殊路径（不把炸弹当作障碍、允许经过多个障碍，需可被一弹炸掉且炸弹可达）的显示数据
 // 用于在菜单中单独查看“特殊路径”，并保持每次规划后的最新结果
 PlannerAllBoxPaths special_paths = {0};
 
 // 特殊路径经过的多个障碍（用于推炸弹时排除，炸弹可达性校验）
-static Point s_special_path_obstacles[200];
+static Point s_special_path_obstacles[10];
 static size_t s_special_path_obstacle_count = 0;
 
-// 清空 special_paths：除“标志位/计数”外也清“内容字段”；已完成的箱子不清理；box_count 与 boxes 一致
+// 要求2下“所有推离方向都不行”的炸弹：规划时当作不可走，显示时仍按炸弹画；切换要求档位时重置
+static Point s_blocked_bombs[MAX_BOMBS];
+static size_t s_blocked_bomb_count = 0;
+
+// 清空 special_paths：除“标志位/计数”外也清“内容字段”；全部箱子都清理（含已完成）；box_count 与 boxes 一致
 static void planner_v3_bfs_clear_special_paths(const PlannerPointV3_BFS *boxes,
     const PlannerPointV3_BFS *targets, size_t box_count, size_t target_count) {
+  (void)boxes;
+  (void)targets;
+  (void)target_count;
   s_special_path_obstacle_count = 0;
   special_paths.box_count = box_count;  /* 与 PlannerPointV3_BFS boxes 数量一致，显示时索引对应 */
   for (size_t i = 0; i < box_count && i < PLANNER_V3_BFS_MAX_BOXES; ++i) {
-    int completed = 0;
-    if (boxes && targets && target_count > 0) {
-      for (size_t t = 0; t < target_count; ++t) {
-        if (boxes[i].row == targets[t].row && boxes[i].col == targets[t].col) {
-          completed = 1;
-          break;
-        }
-      }
-    }
-    if (completed)
-      continue;  /* 已完成的箱子不清理 */
     memset(&special_paths.box_paths[i], 0, sizeof(PlannerBoxPathOutput));
   }
 }
@@ -71,6 +68,22 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
 static size_t planner_v3_bfs_bomb_explode(const Point *obstacles, size_t obstacle_count,
                                           Point bomb_pos, Point *out_obstacles, size_t out_cap);
 
+static void planner_v3_bfs_bombs_sorted_by_dist_to_obstacle(int rows, int cols,
+    Point obstacle_to_clear,
+    const Point *obstacles, size_t obstacle_count,
+    const Point *bombs, size_t bomb_count,
+    const Point *boxes, size_t box_count,
+    size_t *bomb_order, size_t *bomb_order_count,
+    const Point *path_obstacles, size_t path_obstacle_count);
+
+static void planner_v3_bfs_targets_sorted_by_reachable_dist(int rows, int cols, Point car,
+    size_t bomb_idx, const Point *bombs, size_t bomb_count,
+    Point obstacle_to_clear,
+    const Point *obstacles, size_t obstacle_count,
+    const Point *boxes, size_t box_count,
+    Point *target_positions, size_t *target_count,
+    const Point *path_obstacles, size_t path_obstacle_count);
+
 // 工具函数
 static int planner_v3_bfs_abs(int v) { return v >= 0 ? v : -v; }
 
@@ -78,7 +91,18 @@ static int planner_v3_bfs_in_bounds(int rows, int cols, int row, int col) {
   return row >= 0 && row < rows && col >= 0 && col < cols;
 }
 
+// 检验路径中所有坐标是否在地图范围内；1=全部合法，0=存在越界
+static int planner_v3_bfs_path_in_bounds(int rows, int cols, const Point *path, size_t len) {
+  for (size_t i = 0; i < len; ++i) {
+    if (!planner_v3_bfs_in_bounds(rows, cols, path[i].row, path[i].col)) {
+      return 0;
+    }
+  }
+  return 1;
+}
+
 // 检查是否是障碍（包括炸弹）
+// 额外检查 s_blocked_bombs：要求2下推不动的炸弹当作不可走 cell
 static int planner_v3_bfs_is_obstacle(const Point *obstacles, size_t obstacle_count,
                                       const Point *bombs, size_t bomb_count,
                                       int row, int col) {
@@ -94,14 +118,26 @@ static int planner_v3_bfs_is_obstacle(const Point *obstacles, size_t obstacle_co
       return 1;
     }
   }
+  // 检查 blocked_bombs（规划时当作不可走，显示时仍按炸弹画）
+  for (size_t i = 0; i < s_blocked_bomb_count; ++i) {
+    if (s_blocked_bombs[i].row == row && s_blocked_bombs[i].col == col) {
+      return 1;
+    }
+  }
   return 0;
 }
 
 // 检查是否是障碍（不包括炸弹，用于特殊路径规划）
+// 额外检查 s_blocked_bombs：要求2下推不动的炸弹当作不可走 cell
 static int planner_v3_bfs_is_obstacle_no_bomb(const Point *obstacles, size_t obstacle_count,
                                                int row, int col) {
   for (size_t i = 0; i < obstacle_count; ++i) {
     if (obstacles[i].row == row && obstacles[i].col == col) {
+      return 1;
+    }
+  }
+  for (size_t i = 0; i < s_blocked_bomb_count; ++i) {
+    if (s_blocked_bombs[i].row == row && s_blocked_bombs[i].col == col) {
       return 1;
     }
   }
@@ -164,6 +200,15 @@ static Point planner_v3_bfs_check_bomb_path_push_obstacle(int rows, int cols,
                                                           const Point *obstacles, size_t obstacle_count,
                                                           const Point *bombs, size_t bomb_count, size_t bomb_idx,
                                                           const Point *boxes, size_t box_count);
+static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
+    int rows, int cols, Point *car_pos,
+    Point *bombs, size_t bomb_count, size_t bomb_idx,
+    Point obstacle_on_push_pos,
+    Point *obstacles, size_t *obstacle_count,
+    const Point *boxes, size_t box_count,
+    Point *path_buffer, size_t path_capacity, size_t *out_steps,
+    int recursion_depth,
+    Point *extra_exploded_out, size_t extra_cap, size_t *extra_count_out);
 static int planner_v3_bfs_point_on_path(Point pt, const Point *path, size_t path_len);
 
 // 判断某个位置是否是死点
@@ -282,10 +327,13 @@ static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstac
 
     const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     for (int i = 0; i < 4; ++i) {
-      int new_row = row + dirs[i][0];
-      int new_col = col + dirs[i][1];
-      int push_row = row - dirs[i][0];
-      int push_col = col - dirs[i][1];
+      int dr = dirs[i][0];
+      int dc = dirs[i][1];
+      int new_row = row + dr;
+      int new_col = col + dc;
+      /* 推位 = from - (to-from)，from=(row,col)，to=(new_row,new_col) */
+      int push_row = row - (new_row - row);
+      int push_col = col - (new_col - col);
 
       if (!planner_v3_bfs_in_bounds(rows, cols, new_row, new_col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -407,6 +455,7 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
 //   推位不合理包括：推位为障碍、箱子、炸弹或越界；箱子路径与炸弹路径均需车能到达推位格本身（非四邻即可）
 // push_mode: 仅当check_push=1时有效；0=箱子路径（推位需可站立且车可达推位格），1=炸弹路径（推位需可站立且车可达推位格）
 // car_start: 仅当check_push=1时有效；开始推时车的位置
+// forbidden_from/forbidden_to/forbidden_count: 禁止的推进方向；重规划时从 A 不能拓展到 B，其他点到 B 不受影响；传 NULL/0 表示无禁止
 static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point target,
                                       const Point *obstacles, size_t obstacle_count,
                                       const Point *bombs, size_t bomb_count,
@@ -414,7 +463,8 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
                                       const int dist[PLANNER_V3_BFS_MAX_CELLS],
                                       Point *path, size_t path_cap, size_t *path_len,
                                       int include_bombs, int allow_one_obstacle, Point *obstacle_passed,
-                                      int check_push, int push_mode, Point car_start) {
+                                      int check_push, int push_mode, Point car_start,
+                                      const Point *forbidden_from, const Point *forbidden_to, size_t forbidden_count) {
   int total_cells = rows * cols;
   if (total_cells > PLANNER_V3_BFS_MAX_CELLS || total_cells <= 0) {
     return 0;
@@ -602,6 +652,17 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
       if (next_idx < 0 || next_idx >= total_cells) {
         continue;
       }
+      /* 禁止边：重规划时从 A 不能拓展到 B，其他点到 B 不受影响 */
+      if (forbidden_count > 0 && forbidden_from && forbidden_to) {
+        int skip_edge = 0;
+        for (size_t fb = 0; fb < forbidden_count && !skip_edge; ++fb) {
+          if (forbidden_from[fb].row == curr_row && forbidden_from[fb].col == curr_col &&
+              forbidden_to[fb].row == nr && forbidden_to[fb].col == nc) {
+            skip_edge = 1;
+          }
+        }
+        if (skip_edge) continue;
+      }
       
       int car_to_push_dist = dist[next_idx];  /* check_push=0时用目标距离作为tiebreaker */
       
@@ -609,8 +670,8 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
       if (check_push) {
         int dr = nr - curr_row;
         int dc = nc - curr_col;
-        int push_row = curr_row - dr;
-        int push_col = curr_col - dc;
+        int push_row = curr_row - (nr - curr_row);
+        int push_col = curr_col - (nc - curr_col);
         if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
           continue;
         }
@@ -792,7 +853,7 @@ static int planner_v3_bfs_car_move_with_global_astar(int rows, int cols, Point *
                                   bombs, bomb_count,
                                   boxes, box_count, dist,
                                   temp_path, 256, &temp_len, include_bombs, 0, NULL,
-                                  0, 0, (Point){0, 0})) {
+                                  0, 0, (Point){0, 0}, NULL, NULL, 0)) {
     return 0;  // A*失败
   }
   
@@ -914,7 +975,7 @@ static int planner_v3_bfs_validate_boundary_path(int rows, int cols, Point bound
                                       temp_boxes, temp_count, dist,
                                       path, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len,
                                       include_bombs, 0, NULL,
-                                      1, 0, car_pos)) {
+                                      1, 0, car_pos, NULL, NULL, 0)) {
     return 0;
   }
   return 1;  /* 路径有效且推位已在 A* 内校验 */
@@ -942,9 +1003,25 @@ static int planner_v3_bfs_validate_box_path_push_positions(int rows, int cols,
     int dr = next_pos.row - current_pos.row;
     int dc = next_pos.col - current_pos.col;
     /* 推位 = from - (to-from)，from=current_pos, to=next_pos */
-    int push_row = current_pos.row - dr;
-    int push_col = current_pos.col - dc;
+    int push_row = current_pos.row - (next_pos.row - current_pos.row);
+    int push_col = current_pos.col - (next_pos.col - current_pos.col);
     if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
+      if (out_fail_step) *out_fail_step = i;
+      return 0;
+    }
+    // 在计算 push_row, push_col 之后、调用 distance_between 之前：
+    if (include_bombs) {
+      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, bombs, bomb_count, push_row, push_col)) {
+        if (out_fail_step) *out_fail_step = i;
+        return 0;
+      }
+    } else {
+      if (planner_v3_bfs_is_obstacle_no_bomb(obstacles, obstacle_count, push_row, push_col)) {
+        if (out_fail_step) *out_fail_step = i;
+        return 0;
+      }
+    }
+    if (planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, moving_idx)) {
       if (out_fail_step) *out_fail_step = i;
       return 0;
     }
@@ -988,8 +1065,8 @@ static int planner_v3_bfs_validate_bomb_path_push_positions(int rows, int cols,
     int dr = next_pos.row - current_pos.row;
     int dc = next_pos.col - current_pos.col;
     /* 推位 = from - (to-from)，from=current_pos, to=next_pos */
-    int push_row = current_pos.row - dr;
-    int push_col = current_pos.col - dc;
+    int push_row = current_pos.row - (next_pos.row - current_pos.row);
+    int push_col = current_pos.col - (next_pos.col - current_pos.col);
     if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col))
       return 0;
     /* 推位格必须可站立：非障碍、非（其他）炸弹、非箱子 */
@@ -1142,21 +1219,21 @@ static int planner_v3_bfs_is_valid_push_pos_for_obstacle(int rows, int cols, Poi
   return 1;
 }
 
-// 从路径障碍列表中选出距离箱子 box_start 曼哈顿距离最远的障碍（用于重算时只排除一个障碍并累计）
-static Point planner_v3_bfs_farthest_obstacle_from_box(Point box_start,
+// 从路径障碍列表中选出距离箱子 box_start 曼哈顿距离最近的障碍（用于重算时只排除一个障碍并累计）
+static Point planner_v3_bfs_nearest_obstacle_from_box(Point box_start,
     const Point *obstacles_on_path, size_t obstacles_on_path_count) {
   if (obstacles_on_path_count == 0) return (Point){-1, -1};
-  int max_dist = -1;
-  Point farthest = obstacles_on_path[0];
+  int min_dist = 0x7FFFFFFF;
+  Point nearest = obstacles_on_path[0];
   for (size_t i = 0; i < obstacles_on_path_count; ++i) {
     int d = planner_v3_bfs_abs(obstacles_on_path[i].row - box_start.row) +
             planner_v3_bfs_abs(obstacles_on_path[i].col - box_start.col);
-    if (d > max_dist) {
-      max_dist = d;
-      farthest = obstacles_on_path[i];
+    if (d < min_dist) {
+      min_dist = d;
+      nearest = obstacles_on_path[i];
     }
   }
-  return farthest;
+  return nearest;
 }
 
 // 特殊路径规划：忽略障碍和炸弹（不忽略箱子）进行一次BFS+A*路径计算，
@@ -1165,8 +1242,11 @@ static Point planner_v3_bfs_farthest_obstacle_from_box(Point box_start,
 // 3) 推动炸弹到目标的每一步推位都合理
 // 并且箱子的每一步推位合理（推位可为路径障碍本身或其相邻障碍，不能是其他障碍、边界外、其他箱子）
 // 4) 若 car_pos 有效(row>=0,col>=0)，检验每一步推位的可达性（车能否到达推位），失败则排除障碍重算
+// 0/1障碍时：先挑选炸弹及目标点，再检验推位合理性（在推位可达性前一步）、最后检验推位可达性；
+// 二者均只忽略选中的炸弹、炸弹B（若存在）、该炸弹的目标、炸弹B的目标；其他炸弹/障碍/箱子都考虑
 // 返回值：1=成功找到路径，0=失败
 // 如果成功且路径经过障碍，obstacle_passed会被设置为该障碍位置
+// apply_req1：1=要求1生效（炸弹路径里占据推位的障碍不尝试炸弹B，直接放弃该炸弹尝试别的炸弹）
 static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_start, Point target,
                                                 const Point *obstacles, size_t obstacle_count,
                                                 const Point *bombs, size_t bomb_count,
@@ -1175,7 +1255,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                                 Point car_pos,
                                                 Point *obstacle_passed, int *has_obstacle,
                                                 Point *out_path, size_t out_path_cap,
-                                                size_t *out_path_len) {
+                                                size_t *out_path_len,
+                                                int apply_req1) {
   if (out_path_len) {
     *out_path_len = 0;
   }
@@ -1227,7 +1308,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                       dist_ignore_obs_bomb,
                                       initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
                                       0, 0, NULL,
-                                      0, 0, (Point){0, 0})) {
+                                      0, 0, (Point){0, 0}, NULL, NULL, 0)) {
     return 0;
   }
 
@@ -1238,9 +1319,13 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
   // 记录已排除的路径（通过记录路径经过的障碍集合）
   // 使用简单的哈希集合来记录已排除的障碍组合
   #define MAX_EXCLUDED_PATHS 50
-  Point excluded_obstacle_sets[MAX_EXCLUDED_PATHS][200];
+  Point excluded_obstacle_sets[MAX_EXCLUDED_PATHS][10];
   size_t excluded_obstacle_counts[MAX_EXCLUDED_PATHS];
   size_t excluded_count = 0;
+  /* 禁止的推进方向 A→B：重规划时路径到 A 不能拓展到 B，其他点到 B 不受影响 */
+  Point excluded_dirs_from[MAX_EXCLUDED_PATHS];
+  Point excluded_dirs_to[MAX_EXCLUDED_PATHS];
+  size_t excluded_dir_count = 0;
   
   const int max_attempts = 100;  // 防止死循环的最大尝试次数
   int attempt = 0;
@@ -1277,24 +1362,24 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
       if (!planner_v3_bfs_obstacles_destroyable_by_one_bomb(obstacles_on_path,
                                                            obstacles_on_path_count,
                                                            &center_obs)) {
-        // 多个障碍不能被一颗炸弹炸掉，只排除距箱子曼哈顿距离最远的障碍并重新算路（仍累计）
-        Point farthest = planner_v3_bfs_farthest_obstacle_from_box(box_start,
+        // 多个障碍不能被一颗炸弹炸掉，只排除距箱子曼哈顿距离最近的障碍并重新算路（仍累计）
+        Point nearest = planner_v3_bfs_nearest_obstacle_from_box(box_start,
             obstacles_on_path, obstacles_on_path_count);
         int already_excluded = 0;
         for (size_t i = 0; i < excluded_count; ++i) {
           if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == farthest.row &&
-              excluded_obstacle_sets[i][0].col == farthest.col) {
+              excluded_obstacle_sets[i][0].row == nearest.row &&
+              excluded_obstacle_sets[i][0].col == nearest.col) {
             already_excluded = 1;
             break;
           }
         }
         if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
           excluded_obstacle_counts[excluded_count] = 1;
-          excluded_obstacle_sets[excluded_count][0] = farthest;
+          excluded_obstacle_sets[excluded_count][0] = nearest;
           excluded_count++;
         }
-        // 重算时累计所有已排除的障碍（每次只加最远一个，仍累计）
+        // 重算时累计所有已排除的障碍（每次只加最近一个，仍累计）
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1324,7 +1409,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             empty_bombs, 0, temp_boxes, temp_count,
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
-                                            0, 0, NULL, 0, 0, (Point){0, 0})) {
+                                            0, 0, NULL, 0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) return 0;
@@ -1339,7 +1425,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         Point to   = initial_path[i];
         int dr = to.row - from.row;
         int dc = to.col - from.col;
-        Point push_pos = (Point){ from.row - dr, from.col - dc };
+        Point push_pos = (Point){ from.row - (to.row - from.row), from.col - (to.col - from.col) };
         Point ref_obs = {-1, -1};
         if (planner_v3_bfs_point_in_list(obstacles_on_path, obstacles_on_path_count,
                                          from.row, from.col)) {
@@ -1365,24 +1451,24 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
       }
 
       if (push_check_failed) {
-        // 推位不合法，只排除距箱子曼哈顿距离最远的障碍并重新算路（仍累计）
-        Point farthest = planner_v3_bfs_farthest_obstacle_from_box(box_start,
+        // 推位不合法，只排除距箱子曼哈顿距离最近的障碍并重新算路（仍累计）
+        Point nearest = planner_v3_bfs_nearest_obstacle_from_box(box_start,
             obstacles_on_path, obstacles_on_path_count);
         int already_excluded = 0;
         for (size_t i = 0; i < excluded_count; ++i) {
           if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == farthest.row &&
-              excluded_obstacle_sets[i][0].col == farthest.col) {
+              excluded_obstacle_sets[i][0].row == nearest.row &&
+              excluded_obstacle_sets[i][0].col == nearest.col) {
             already_excluded = 1;
             break;
           }
         }
         if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
           excluded_obstacle_counts[excluded_count] = 1;
-          excluded_obstacle_sets[excluded_count][0] = farthest;
+          excluded_obstacle_sets[excluded_count][0] = nearest;
           excluded_count++;
         }
-        // 重算时累计所有已排除的障碍（每次只加最远一个，仍累计）
+        // 重算时累计所有已排除的障碍（每次只加最近一个，仍累计）
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1412,7 +1498,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             empty_bombs, 0, temp_boxes, temp_count,
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
-                                            0, 0, NULL, 0, 0, (Point){0, 0})) {
+                                            0, 0, NULL, 0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) return 0;
@@ -1452,30 +1539,56 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
             rows, cols, bombs[bi], center_obs,
             obstacles, obstacle_count, bombs, bomb_count, bi,
             boxes, box_count);
-        if (push_obs.row >= 0) continue;  /* 推位被障碍占据，该炸弹不可用 */
+        if (push_obs.row >= 0) {
+          /* 推位被障碍占据：要求1生效时不尝试炸弹B，直接放弃该炸弹尝试别的炸弹 */
+          if (apply_req1) {
+            continue;  /* 要求1：放弃该炸弹，尝试别的炸弹 */
+          }
+          /* 原逻辑：尝试和炸弹B一样的逻辑炸掉占据推位的障碍，不行则放弃该炸弹 */
+          if (car_pos.row < 0 || car_pos.col < 0) {
+            continue;  /* 无有效车位置，无法执行清除，放弃 */
+          }
+          Point temp_car = car_pos;
+          Point temp_obstacles[200];
+          size_t temp_obstacle_count = obstacle_count;
+          if (temp_obstacle_count > 200) temp_obstacle_count = 200;
+          memcpy(temp_obstacles, obstacles, temp_obstacle_count * sizeof(Point));
+          Point temp_bombs[MAX_BOMBS];
+          memcpy(temp_bombs, bombs, bomb_count * sizeof(Point));
+          Point temp_path[PUSH_BOMB_SAVE_PATH_MAX];
+          size_t temp_steps = 0;
+          if (!planner_v3_bfs_clear_push_pos_obstacle_recursive(
+                  rows, cols, &temp_car, temp_bombs, bomb_count, bi, push_obs,
+                  temp_obstacles, &temp_obstacle_count, boxes, box_count,
+                  temp_path, PUSH_BOMB_SAVE_PATH_MAX, &temp_steps,
+                  0, NULL, 0, NULL)) {
+            continue;  /* 无法用炸弹B清除推位障碍，放弃该炸弹 */
+          }
+          /* 可清除，选取该炸弹；执行时推炸弹前会先清除推位障碍再推 */
+        }
 
         bomb_reachable = 1;
         break;
       }
       if (!bomb_reachable) {
-        // 炸弹不可达，只排除距箱子曼哈顿距离最远的障碍并重新算路（仍累计）
-        Point farthest = planner_v3_bfs_farthest_obstacle_from_box(box_start,
+        // 炸弹不可达，只排除距箱子曼哈顿距离最近的障碍并重新算路（仍累计）
+        Point nearest = planner_v3_bfs_nearest_obstacle_from_box(box_start,
             obstacles_on_path, obstacles_on_path_count);
         int already_excluded = 0;
         for (size_t i = 0; i < excluded_count; ++i) {
           if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == farthest.row &&
-              excluded_obstacle_sets[i][0].col == farthest.col) {
+              excluded_obstacle_sets[i][0].row == nearest.row &&
+              excluded_obstacle_sets[i][0].col == nearest.col) {
             already_excluded = 1;
             break;
           }
         }
         if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
           excluded_obstacle_counts[excluded_count] = 1;
-          excluded_obstacle_sets[excluded_count][0] = farthest;
+          excluded_obstacle_sets[excluded_count][0] = nearest;
           excluded_count++;
         }
-        // 重算时累计所有已排除的障碍（每次只加最远一个，仍累计）
+        // 重算时累计所有已排除的障碍（每次只加最近一个，仍累计）
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1505,7 +1618,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             empty_bombs, 0, temp_boxes, temp_count,
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
-                                            0, 0, NULL, 0, 0, (Point){0, 0})) {
+                                            0, 0, NULL, 0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) return 0;
@@ -1540,28 +1654,33 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         }
       }
       if (reach_check_failed) {
-        /* 推位不可达时排除点A（从A推到B不可达，A=箱子推前位置=initial_path[reach_fail_step-1]）*/
-        Point fail_point;
+        /* 推位不可达时排除 A→B 方向（从 A 不能拓展到 B），不排除 A 点；A=箱子推前位置=initial_path[reach_fail_step-1]，B=initial_path[reach_fail_step] */
+        Point point_a, point_b;
         if (reach_fail_step > 0 && reach_fail_step < initial_path_len) {
-          fail_point = initial_path[reach_fail_step - 1];  /* 点A：推前箱子位置 */
+          point_a = initial_path[reach_fail_step - 1];
+          point_b = initial_path[reach_fail_step];
         } else {
-          fail_point = planner_v3_bfs_farthest_obstacle_from_box(box_start,
+          point_a = planner_v3_bfs_nearest_obstacle_from_box(box_start,
               obstacles_on_path, obstacles_on_path_count);
+          point_b = point_a;  /* 无法得到 B 时不再重算 */
         }
-        int already_excluded = 0;
-        for (size_t i = 0; i < excluded_count; ++i) {
-          if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == fail_point.row &&
-              excluded_obstacle_sets[i][0].col == fail_point.col) {
-            already_excluded = 1;
+        if (point_a.row == point_b.row && point_a.col == point_b.col) {
+          return 0;  /* 无法得到有效 A→B 方向，不再重算 */
+        }
+        int dir_already_excluded = 0;
+        for (size_t i = 0; i < excluded_dir_count; ++i) {
+          if (excluded_dirs_from[i].row == point_a.row && excluded_dirs_from[i].col == point_a.col &&
+              excluded_dirs_to[i].row == point_b.row && excluded_dirs_to[i].col == point_b.col) {
+            dir_already_excluded = 1;
             break;
           }
         }
-        if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
-          excluded_obstacle_counts[excluded_count] = 1;
-          excluded_obstacle_sets[excluded_count][0] = fail_point;
-          excluded_count++;
+        if (dir_already_excluded || excluded_dir_count >= MAX_EXCLUDED_PATHS) {
+          return 0;
         }
+        excluded_dirs_from[excluded_dir_count] = point_a;
+        excluded_dirs_to[excluded_dir_count] = point_b;
+        excluded_dir_count++;
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1607,7 +1726,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
                                             0, 0, NULL,
-                                            0, 0, (Point){0, 0})) {
+                                            0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) return 0;
@@ -1640,7 +1760,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
           Point to   = initial_path[i];
           int dr = to.row - from.row;
           int dc = to.col - from.col;
-          Point push_pos = (Point){ from.row - dr, from.col - dc };
+          Point push_pos = (Point){ from.row - (to.row - from.row), from.col - (to.col - from.col) };
           if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
             push_check_failed = 1;
             push_fail_step_0 = i;
@@ -1664,7 +1784,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
           Point to   = initial_path[i];
           int dr = to.row - from.row;
           int dc = to.col - from.col;
-          Point push_pos = (Point){ from.row - dr, from.col - dc };
+          Point push_pos = (Point){ from.row - (to.row - from.row), from.col - (to.col - from.col) };
           if (!planner_v3_bfs_is_valid_push_pos_for_obstacle(rows, cols, push_pos, obstacles_on_path[0],
                                                               obstacles, obstacle_count,
                                                               boxes, box_count, moving_idx)) {
@@ -1675,7 +1795,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
       }
 
       if (push_check_failed && obstacles_on_path_count == 1) {
-        // 推位不合法，排除该障碍（单障碍即“最远”），用已排除障碍累计后重新算路
+        // 推位不合法，排除该障碍（单障碍即“最近”），用已排除障碍累计后重新算路
         int already_excluded = 0;
         for (size_t i = 0; i < excluded_count; ++i) {
           if (excluded_obstacle_counts[i] == 1 &&
@@ -1728,7 +1848,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
                                             0, 0, NULL,
-                                            0, 0, (Point){0, 0})) {
+                                            0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
 
@@ -1740,28 +1861,28 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
       }
 
       if (push_check_failed && obstacles_on_path_count == 0) {
-        // 0 障碍时推位不合法，排除 A 点（A = 箱子推前位置 = initial_path[push_fail_step_0-1]）并重算
-        Point fail_point;
+        // 0 障碍时推位不合法，排除 A→B 方向（从 A 不能拓展到 B），不排除 A 点；A = initial_path[push_fail_step_0-1]，B = initial_path[push_fail_step_0]
+        Point point_a, point_b;
         if (push_fail_step_0 > 0 && push_fail_step_0 < initial_path_len) {
-          fail_point = initial_path[push_fail_step_0 - 1];
+          point_a = initial_path[push_fail_step_0 - 1];
+          point_b = initial_path[push_fail_step_0];
         } else {
           return 0;
         }
-        int already_excluded = 0;
-        for (size_t i = 0; i < excluded_count; ++i) {
-          if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == fail_point.row &&
-              excluded_obstacle_sets[i][0].col == fail_point.col) {
-            already_excluded = 1;
+        int dir_already_excluded = 0;
+        for (size_t i = 0; i < excluded_dir_count; ++i) {
+          if (excluded_dirs_from[i].row == point_a.row && excluded_dirs_from[i].col == point_a.col &&
+              excluded_dirs_to[i].row == point_b.row && excluded_dirs_to[i].col == point_b.col) {
+            dir_already_excluded = 1;
             break;
           }
         }
-        if (already_excluded || excluded_count >= MAX_EXCLUDED_PATHS) {
-          return 0;  /* 已排除过 A 点仍失败或排除数达上限，无法再通过排除重算 */
+        if (dir_already_excluded || excluded_dir_count >= MAX_EXCLUDED_PATHS) {
+          return 0;  /* 已排除过该方向仍失败或排除数达上限，无法再通过排除重算 */
         }
-        excluded_obstacle_counts[excluded_count] = 1;
-        excluded_obstacle_sets[excluded_count][0] = fail_point;
-        excluded_count++;
+        excluded_dirs_from[excluded_dir_count] = point_a;
+        excluded_dirs_to[excluded_dir_count] = point_b;
+        excluded_dir_count++;
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1809,7 +1930,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
                                             0, 0, NULL,
-                                            0, 0, (Point){0, 0})) {
+                                            0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) {
@@ -1818,57 +1940,241 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         continue;
       }
 
-      // 推位可达性检验：若提供了车位置，检验每一步推位车能否到达，失败则排除该失败点重算
-      // 检验时忽略特殊路径上的障碍和炸弹（路径障碍将被炸掉，路径炸弹将被推走）
-      reach_check_failed = 0;
-      reach_fail_step = 0;
-      if (car_pos.row >= 0 && car_pos.col >= 0 && initial_path_len >= 2) {
-        Point obs_excl_path[200];
-        size_t obs_excl_count = 0;
-        for (size_t k = 0; k < obstacle_count && obs_excl_count < 200; ++k) {
-          if (!planner_v3_bfs_point_in_list(obstacles_on_path, obstacles_on_path_count,
-                                            obstacles[k].row, obstacles[k].col)) {
-            obs_excl_path[obs_excl_count++] = obstacles[k];
-          }
-        }
-        Point bombs_excl_path[MAX_BOMBS];
-        size_t bombs_excl_count = 0;
-        for (size_t k = 0; k < bomb_count && bombs_excl_count < MAX_BOMBS; ++k) {
-          if (bombs[k].row < 0 || bombs[k].col < 0) continue;
-          if (!planner_v3_bfs_point_on_path(bombs[k], initial_path, initial_path_len)) {
-            bombs_excl_path[bombs_excl_count++] = bombs[k];
-          }
-        }
-        if (!planner_v3_bfs_validate_box_path_push_positions(rows, cols, initial_path, initial_path_len,
-            car_pos, obs_excl_path, obs_excl_count, bombs_excl_path, bombs_excl_count,
-            boxes, box_count, moving_idx, 1, &reach_fail_step)) {
-          reach_check_failed = 1;
-        }
-      }
-      if (reach_check_failed) {
-        /* 推位不可达时无论是否经过障碍都重算，排除点A（A=箱子推前位置=initial_path[reach_fail_step-1]）并累计 */
-        Point fail_point;
-        if (reach_fail_step > 0 && reach_fail_step < initial_path_len) {
-          fail_point = initial_path[reach_fail_step - 1];  /* 点A：推前箱子位置 */
-        } else if (obstacles_on_path_count > 0) {
-          fail_point = obstacles_on_path[0];
-        } else {
-          return 0;  /* 无法获取失败点，无法重算 */
-        }
-        int already_excluded = 0;
-        for (size_t i = 0; i < excluded_count; ++i) {
-          if (excluded_obstacle_counts[i] == 1 &&
-              excluded_obstacle_sets[i][0].row == fail_point.row &&
-              excluded_obstacle_sets[i][0].col == fail_point.col) {
-            already_excluded = 1;
+      // 若有障碍需清除：先挑选炸弹及目标点，再检验推位合理性（在推位可达性前一步）、最后检验推位可达性
+      // 二者均只忽略：选中的炸弹、炸弹B（若存在）、该炸弹的目标、炸弹B的目标；其他炸弹/障碍/箱子都考虑
+      size_t selected_bomb_idx_01 = SIZE_MAX;
+      Point selected_target_01 = {-1, -1};
+      size_t bomb_b_idx_01 = SIZE_MAX;
+      Point bomb_b_target_01 = {-1, -1};
+      if (obstacles_on_path_count == 1) {
+        Point single_obs = obstacles_on_path[0];
+        size_t bomb_order_01[MAX_BOMBS];
+        size_t bomb_order_count_01 = 0;
+        planner_v3_bfs_bombs_sorted_by_dist_to_obstacle(rows, cols, single_obs,
+            obstacles, obstacle_count, bombs, bomb_count, boxes, box_count,
+            bomb_order_01, &bomb_order_count_01,
+            obstacles_on_path, obstacles_on_path_count);
+        for (size_t boi = 0; boi < bomb_order_count_01; ++boi) {
+          size_t bi = bomb_order_01[boi];
+          Point target_positions_01[PLANNER_V3_BFS_MAX_CANDIDATE_TARGETS];
+          size_t target_count_01 = 0;
+          planner_v3_bfs_targets_sorted_by_reachable_dist(rows, cols, car_pos,
+              bi, bombs, bomb_count, single_obs, obstacles, obstacle_count,
+              boxes, box_count,
+              target_positions_01, &target_count_01,
+              obstacles_on_path, obstacles_on_path_count);
+          if (target_count_01 > 0) {
+            selected_bomb_idx_01 = bi;
+            selected_target_01 = target_positions_01[0];
             break;
           }
         }
-        if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
-          excluded_obstacle_counts[excluded_count] = 1;
-          excluded_obstacle_sets[excluded_count][0] = fail_point;
-          excluded_count++;
+        if (selected_bomb_idx_01 == SIZE_MAX) {
+          /* 单障碍无可用炸弹，排除该障碍并重算 */
+          int already_excluded = 0;
+          for (size_t i = 0; i < excluded_count; ++i) {
+            if (excluded_obstacle_counts[i] == 1 &&
+                excluded_obstacle_sets[i][0].row == single_obs.row &&
+                excluded_obstacle_sets[i][0].col == single_obs.col) {
+              already_excluded = 1;
+              break;
+            }
+          }
+          if (!already_excluded && excluded_count < MAX_EXCLUDED_PATHS) {
+            excluded_obstacle_counts[excluded_count] = 1;
+            excluded_obstacle_sets[excluded_count][0] = single_obs;
+            excluded_count++;
+          }
+          uint8_t exclude_obstacle[200] = {0};
+          for (size_t ex = 0; ex < excluded_count; ++ex) {
+            for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
+              Point excl_obs = excluded_obstacle_sets[ex][j];
+              for (size_t k = 0; k < obstacle_count; ++k) {
+                if (obstacles[k].row == excl_obs.row && obstacles[k].col == excl_obs.col) {
+                  exclude_obstacle[k] = 1;
+                }
+              }
+            }
+          }
+          Point filtered_obstacles[200];
+          size_t filtered_obstacle_count = 0;
+          for (size_t i = 0; i < obstacle_count && filtered_obstacle_count < 200; ++i) {
+            if (exclude_obstacle[i]) {
+              filtered_obstacles[filtered_obstacle_count++] = obstacles[i];
+            }
+          }
+          if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target,
+                filtered_obstacles, filtered_obstacle_count,
+                empty_bombs, 0, temp_boxes, temp_count,
+                dist_ignore_obs_bomb, 0)) {
+            return 0;
+          }
+          if (!planner_v3_bfs_astar_with_dist(rows, cols, box_start, target,
+                filtered_obstacles, filtered_obstacle_count,
+                empty_bombs, 0, temp_boxes, temp_count,
+                dist_ignore_obs_bomb,
+                initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
+                0, 0, NULL, 0, 0, (Point){0, 0},
+                excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
+            return 0;
+          }
+          if (initial_path_len == 0) return 0;
+          continue;
         }
+        /* 检查选中的炸弹推位是否被挡，若被挡则查找炸弹B及目标 */
+        Point push_obs_a = planner_v3_bfs_check_bomb_path_push_obstacle(
+            rows, cols, bombs[selected_bomb_idx_01], selected_target_01,
+            obstacles, obstacle_count, bombs, bomb_count, selected_bomb_idx_01,
+            boxes, box_count);
+        if (push_obs_a.row >= 0) {
+          /* 炸弹A的推位被挡，查找可清除该障碍的炸弹B */
+          const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+          Point cand_targets[5];
+          size_t cand_count = 0;
+          cand_targets[cand_count++] = push_obs_a;
+          for (int d = 0; d < 4 && cand_count < 5; ++d) {
+            int nr = push_obs_a.row + dirs[d][0], nc = push_obs_a.col + dirs[d][1];
+            if (planner_v3_bfs_in_bounds(rows, cols, nr, nc) &&
+                planner_v3_bfs_is_obstacle_no_bomb(obstacles, obstacle_count, nr, nc)) {
+              cand_targets[cand_count++] = (Point){nr, nc};
+            }
+          }
+          int bomb_b_dist_to_a[MAX_BOMBS];
+          for (size_t bi = 0; bi < bomb_count; ++bi) bomb_b_dist_to_a[bi] = INT_MAX;
+          for (size_t bi = 0; bi < bomb_count; ++bi) {
+            if (bi == selected_bomb_idx_01 || bombs[bi].row < 0) continue;
+            Point temp_b[MAX_BOMBS];
+            size_t tb = 0;
+            for (size_t bj = 0; bj < bomb_count && tb < MAX_BOMBS; ++bj) {
+              if (bj == bi || bj == selected_bomb_idx_01 || bombs[bj].row < 0) continue;
+              temp_b[tb++] = bombs[bj];
+            }
+            int d = planner_v3_bfs_distance_between(rows, cols, bombs[bi], bombs[selected_bomb_idx_01],
+                obstacles, obstacle_count, temp_b, tb, boxes, box_count, 1);
+            bomb_b_dist_to_a[bi] = (d == INT_MAX) ? INT_MAX : d;
+          }
+          for (size_t n = 0; n < bomb_count; ++n) {
+            size_t best_bi = SIZE_MAX;
+            int best_d = INT_MAX;
+            for (size_t bi = 0; bi < bomb_count; ++bi) {
+              if (bi == selected_bomb_idx_01 || bombs[bi].row < 0) continue;
+              if (bomb_b_dist_to_a[bi] < best_d) {
+                best_d = bomb_b_dist_to_a[bi];
+                best_bi = bi;
+              }
+            }
+            if (best_bi == SIZE_MAX) break;
+            bomb_b_dist_to_a[best_bi] = INT_MAX;
+            for (size_t ci = 0; ci < cand_count; ++ci) {
+              Point push_obs_b = planner_v3_bfs_check_bomb_path_push_obstacle(
+                  rows, cols, bombs[best_bi], cand_targets[ci],
+                  obstacles, obstacle_count, bombs, bomb_count, best_bi,
+                  boxes, box_count);
+              if (push_obs_b.row < 0) {
+                bomb_b_idx_01 = best_bi;
+                bomb_b_target_01 = cand_targets[ci];
+                break;
+              }
+            }
+            if (bomb_b_idx_01 != SIZE_MAX) break;
+          }
+        }
+      }
+
+      /* 构建用于推位检验的障碍/炸弹列表：有障碍时只忽略选中的炸弹、炸弹B、该炸弹的目标、炸弹B的目标 */
+      Point obs_for_push[200];
+      size_t obs_for_push_count = 0;
+      Point bombs_for_push[MAX_BOMBS];
+      size_t bombs_for_push_count = 0;
+      if (obstacles_on_path_count >= 1 && selected_bomb_idx_01 != SIZE_MAX) {
+        /* 有障碍：只忽略选中的炸弹、炸弹B、该炸弹的目标、炸弹B的目标；其他障碍/炸弹/箱子都考虑 */
+        for (size_t k = 0; k < obstacle_count && obs_for_push_count < 200; ++k) {
+          if (obstacles[k].row == selected_target_01.row && obstacles[k].col == selected_target_01.col)
+            continue;
+          if (bomb_b_target_01.row >= 0 && obstacles[k].row == bomb_b_target_01.row &&
+              obstacles[k].col == bomb_b_target_01.col)
+            continue;
+          if (planner_v3_bfs_point_in_list(obstacles_on_path, obstacles_on_path_count,
+                                            obstacles[k].row, obstacles[k].col))
+            continue;
+          obs_for_push[obs_for_push_count++] = obstacles[k];
+        }
+        for (size_t k = 0; k < bomb_count && bombs_for_push_count < MAX_BOMBS; ++k) {
+          if (bombs[k].row < 0 || bombs[k].col < 0) continue;
+          if (k == selected_bomb_idx_01) continue;
+          if (k == bomb_b_idx_01) continue;
+          bombs_for_push[bombs_for_push_count++] = bombs[k];
+        }
+      } else {
+        /* 0障碍：忽略路径上的障碍和炸弹 */
+        for (size_t k = 0; k < obstacle_count && obs_for_push_count < 200; ++k) {
+          if (!planner_v3_bfs_point_in_list(obstacles_on_path, obstacles_on_path_count,
+                                            obstacles[k].row, obstacles[k].col)) {
+            obs_for_push[obs_for_push_count++] = obstacles[k];
+          }
+        }
+        for (size_t k = 0; k < bomb_count && bombs_for_push_count < MAX_BOMBS; ++k) {
+          if (bombs[k].row < 0 || bombs[k].col < 0) continue;
+          if (!planner_v3_bfs_point_on_path(bombs[k], initial_path, initial_path_len)) {
+            bombs_for_push[bombs_for_push_count++] = bombs[k];
+          }
+        }
+      }
+
+      // 推位合理性检验：在推位可达性前一步执行，只忽略选中的炸弹、炸弹B、该炸弹的目标、炸弹B的目标；失败则排除该失败点重算
+      int reason_check_failed = 0;
+      size_t reason_fail_step = 0;
+      if (car_pos.row >= 0 && car_pos.col >= 0 && initial_path_len >= 2) {
+        if (!planner_v3_bfs_validate_box_path_push_positions(rows, cols, initial_path, initial_path_len,
+            car_pos, obs_for_push, obs_for_push_count, bombs_for_push, bombs_for_push_count,
+            boxes, box_count, moving_idx, 1, &reason_fail_step)) {
+          reason_check_failed = 1;
+        }
+      }
+      if (reason_check_failed) {
+        reach_fail_step = reason_fail_step;
+        reach_check_failed = 1;
+      } else {
+        // 推位可达性检验：与推位合理性使用相同的忽略规则
+        reach_check_failed = 0;
+        reach_fail_step = 0;
+        if (car_pos.row >= 0 && car_pos.col >= 0 && initial_path_len >= 2) {
+          if (!planner_v3_bfs_validate_box_path_push_positions(rows, cols, initial_path, initial_path_len,
+              car_pos, obs_for_push, obs_for_push_count, bombs_for_push, bombs_for_push_count,
+              boxes, box_count, moving_idx, 1, &reach_fail_step)) {
+            reach_check_failed = 1;
+          }
+        }
+      }
+      if (reach_check_failed) {
+        /* 推位不可达时无论是否经过障碍都重算，排除 A→B 方向（从 A 不能拓展到 B），不排除 A 点；A=箱子推前位置=initial_path[reach_fail_step-1]，B=initial_path[reach_fail_step] */
+        Point point_a, point_b;
+        if (reach_fail_step > 0 && reach_fail_step < initial_path_len) {
+          point_a = initial_path[reach_fail_step - 1];
+          point_b = initial_path[reach_fail_step];
+        } else if (obstacles_on_path_count > 0) {
+          point_a = obstacles_on_path[0];
+          point_b = point_a;  /* 无法得到 B 时不再重算 */
+        } else {
+          return 0;  /* 无法获取失败点，无法重算 */
+        }
+        if (point_a.row == point_b.row && point_a.col == point_b.col) {
+          return 0;  /* 无法得到有效 A→B 方向，不再重算 */
+        }
+        int dir_already_excluded = 0;
+        for (size_t i = 0; i < excluded_dir_count; ++i) {
+          if (excluded_dirs_from[i].row == point_a.row && excluded_dirs_from[i].col == point_a.col &&
+              excluded_dirs_to[i].row == point_b.row && excluded_dirs_to[i].col == point_b.col) {
+            dir_already_excluded = 1;
+            break;
+          }
+        }
+        if (dir_already_excluded || excluded_dir_count >= MAX_EXCLUDED_PATHS) {
+          return 0;
+        }
+        excluded_dirs_from[excluded_dir_count] = point_a;
+        excluded_dirs_to[excluded_dir_count] = point_b;
+        excluded_dir_count++;
         uint8_t exclude_obstacle[200] = {0};
         for (size_t ex = 0; ex < excluded_count; ++ex) {
           for (size_t j = 0; j < excluded_obstacle_counts[ex]; ++j) {
@@ -1916,7 +2222,8 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
                                             dist_ignore_obs_bomb,
                                             initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, &initial_path_len,
                                             0, 0, NULL,
-                                            0, 0, (Point){0, 0})) {
+                                            0, 0, (Point){0, 0},
+                                            excluded_dirs_from, excluded_dirs_to, excluded_dir_count)) {
           return 0;
         }
         if (initial_path_len == 0) {
@@ -2019,13 +2326,15 @@ static int planner_v3_bfs_find_nearest_bomb(int rows, int cols, Point car,
         }
       }
       
-      // 检查炸弹是否能被推到候选位置；推位 = from - (to-from)，to=candidate，from=candidate-dir，故 push = candidate - 2*dir
+      // 检查炸弹是否能被推到候选位置；推位 = from - (to-from)，from=candidate-dir，to=candidate
       int push_pos_reachable = 0;
       for (int d = 0; d < 4; ++d) {
         int dr = dirs[d][0];
         int dc = dirs[d][1];
-        int push_r = candidate.row - dr - dr;  /* from = candidate-dir, push = from - (to-from) = candidate - 2*dir */
-        int push_c = candidate.col - dc - dc;
+        int from_r = candidate.row - dr;
+        int from_c = candidate.col - dc;
+        int push_r = from_r - (candidate.row - from_r);
+        int push_c = from_c - (candidate.col - from_c);
         if (planner_v3_bfs_in_bounds(rows, cols, push_r, push_c)) {
           if (planner_v3_bfs_is_push_pos_reachable(rows, cols, car, (Point){push_r, push_c},
                                                    filtered_obstacles, filtered_obstacle_count,
@@ -2230,7 +2539,7 @@ static Point planner_v3_bfs_check_bomb_path_push_obstacle(int rows, int cols,
                                       dist_map,
                                       bomb_path, PLANNER_V3_BFS_MAX_PATH_LEN, &bomb_path_len,
                                       1, 0, NULL,
-                                      0, 0, (Point){0, 0})) {
+                                      0, 0, (Point){0, 0}, NULL, NULL, 0)) {
     return result;
   }
   
@@ -2240,7 +2549,7 @@ static Point planner_v3_bfs_check_bomb_path_push_obstacle(int rows, int cols,
     Point to = bomb_path[i];
     int dr = to.row - from.row;
     int dc = to.col - from.col;
-    Point push_pos = {from.row - dr, from.col - dc};
+    Point push_pos = (Point){ from.row - (to.row - from.row), from.col - (to.col - from.col) };
     
     if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
       continue;  // 推位越界，但这不是障碍问题
@@ -2506,7 +2815,8 @@ static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
 // 1) 炸弹A最终位置不是箱子、不是其他炸弹；2) 推位合理（无障碍或可清除）；3) 推位被挡时优先炸弹B到该障碍路径最短的
 // special_path/special_path_len：特殊路径，用于判断“推离路径”（最终位置不在路径上或推到障碍）
 // extra_exploded_out/extra_cap/extra_count_out：可选，用于主菜单显示炸弹B等清除推位时的爆炸位置
-// 返回值：1=成功处理，0=失败
+// apply_req2：1=要求2生效（推位被挡不尝试炸弹B，先尝试别的推离方向；若所有方向都不行则返回2，表示将该炸弹当障碍重算特殊路径）
+// 返回值：1=成功处理，0=失败，2=要求2下所有方向都不行，需将该炸弹当作障碍重新计算特殊路径
 #define PLANNER_V3_BFS_MAX_OFF_PATH_CANDIDATES 4
 static int planner_v3_bfs_handle_bomb_on_path(
     int rows, int cols, Point *car_pos,
@@ -2516,7 +2826,8 @@ static int planner_v3_bfs_handle_bomb_on_path(
     const Point *special_path, size_t special_path_len,
     Point *path_buffer, size_t path_capacity, size_t *out_steps,
     Point *bomb_target_out,
-    Point *extra_exploded_out, size_t extra_cap, size_t *extra_count_out) {
+    Point *extra_exploded_out, size_t extra_cap, size_t *extra_count_out,
+    int apply_req2) {
   
   Point bomb_pos = bombs[bomb_on_path_idx];
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
@@ -2615,6 +2926,7 @@ skip_dir:;
     }
   }
 
+  int had_skip_push_obs = 0;  /* 要求2下是否有方向因推位被挡而直接跳过（未尝试炸弹B） */
   for (size_t ti = 0; ti < cand_count; ++ti) {
     Point target_obs = cands[ti].target;
     Point push_obs = cands[ti].push_obs;
@@ -2632,6 +2944,11 @@ skip_dir:;
     memcpy(saved_path, path_buffer, save_len * sizeof(Point));
 
     if (push_obs.row >= 0) {
+      /* 要求2生效：不尝试炸弹B，直接尝试别的推离方向 */
+      if (apply_req2) {
+        had_skip_push_obs = 1;
+        continue;
+      }
       if (!planner_v3_bfs_clear_push_pos_obstacle_recursive(
               rows, cols, car_pos, bombs, bomb_count, bomb_on_path_idx,
               push_obs, obstacles, obstacle_count, boxes, box_count,
@@ -2676,6 +2993,10 @@ skip_dir:;
     *car_pos = saved_car;
     *out_steps = saved_steps;
     memcpy(path_buffer, saved_path, save_len * sizeof(Point));
+  }
+  /* 要求2生效且至少有一个方向因推位被挡而跳过：将该炸弹当作障碍重新计算特殊路径 */
+  if (apply_req2 && had_skip_push_obs) {
+    return 2;
   }
   return 0;
 }
@@ -2758,9 +3079,9 @@ static void planner_v3_bfs_bombs_sorted_by_dist_to_obstacle(int rows, int cols,
 }
 
 // 备选目标 = 特殊路径经过的障碍 + 其上下左右的障碍；按该炸弹到目标的BFS可达距离升序排列
+// 多障碍时：炸弹目标只能是中心障碍 C，不加入其上下左右作为备选；单障碍时可选中心及其邻接障碍
 // 多障碍时排除 path_obstacles 中全部障碍，否则仅排除候选点
 // 预筛选逻辑：BFS+A*能得到路径，且每一步推位都可达；输出 target_positions[0..*target_count-1]
-#define PLANNER_V3_BFS_MAX_CANDIDATE_TARGETS 5
 static void planner_v3_bfs_targets_sorted_by_reachable_dist(int rows, int cols, Point car,
     size_t bomb_idx, const Point *bombs, size_t bomb_count,
     Point obstacle_to_clear,
@@ -2783,16 +3104,19 @@ static void planner_v3_bfs_targets_sorted_by_reachable_dist(int rows, int cols, 
   size_t cand_count = 0;
 
   // 对每个候选目标：排除该候选点做 BFS+A* 得到路径，并校验每一步推位可达
+  // 多障碍时炸弹目标只能是中心障碍 C，不加入其上下左右作为备选；单障碍时可选中心及其邻接障碍
   Point candidate_points[5];
   size_t num_candidate_points = 0;
   candidate_points[num_candidate_points++] = obstacle_to_clear;
-  for (int di = 0; di < 4; ++di) {
-    int nr = obstacle_to_clear.row + dirs[di][0];
-    int nc = obstacle_to_clear.col + dirs[di][1];
-    if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc)) continue;
-    if (!planner_v3_bfs_is_obstacle_no_bomb(obstacles, obstacle_count, nr, nc)) continue;
-    candidate_points[num_candidate_points++] = (Point){nr, nc};
-    if (num_candidate_points >= 5) break;
+  if (!(path_obstacles && path_obstacle_count > 1)) {
+    for (int di = 0; di < 4; ++di) {
+      int nr = obstacle_to_clear.row + dirs[di][0];
+      int nc = obstacle_to_clear.col + dirs[di][1];
+      if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc)) continue;
+      if (!planner_v3_bfs_is_obstacle_no_bomb(obstacles, obstacle_count, nr, nc)) continue;
+      candidate_points[num_candidate_points++] = (Point){nr, nc};
+      if (num_candidate_points >= 5) break;
+    }
   }
 
   for (size_t ci = 0; ci < num_candidate_points && cand_count < PLANNER_V3_BFS_MAX_CANDIDATE_TARGETS; ++ci) {
@@ -2826,13 +3150,23 @@ static void planner_v3_bfs_targets_sorted_by_reachable_dist(int rows, int cols, 
     Point bomb_path[PLANNER_V3_BFS_MAX_PATH_LEN];
     size_t bomb_path_len = 0;
     /* A* 内已做推位检测，推位不合理的节点会被排除 */
-    if (!planner_v3_bfs_astar_with_dist(rows, cols, bombs[bomb_idx], cand,
+    int astar_ok = planner_v3_bfs_astar_with_dist(rows, cols, bombs[bomb_idx], cand,
             filtered_for_cand, nf, temp_bombs, temp_bomb_count,
             boxes, box_count, dist_map,
             bomb_path, PLANNER_V3_BFS_MAX_PATH_LEN, &bomb_path_len,
             1, 0, NULL,
-            1, 1, car)) {
-      continue;
+            1, 1, car, NULL, NULL, 0);
+    if (!astar_ok) {
+      /* A* 失败可能因推位被障碍占据；若炸弹可达且推位可清除（炸弹B逻辑），仍纳入候选 */
+      int d = planner_v3_bfs_distance_between(rows, cols, bombs[bomb_idx], cand,
+          filtered_for_cand, nf, temp_bombs, temp_bomb_count, boxes, box_count, 1);
+      if (d == INT_MAX) continue;
+      Point push_obs = planner_v3_bfs_check_bomb_path_push_obstacle(
+          rows, cols, bombs[bomb_idx], cand,
+          obstacles, obstacle_count, bombs, bomb_count, bomb_idx,
+          boxes, box_count);
+      if (push_obs.row < 0) continue;  /* 推位无障碍却 A* 失败，排除 */
+      /* 推位被挡，执行阶段会先清除再推，纳入候选 */
     }
 
     int d = planner_v3_bfs_distance_between(rows, cols, bombs[bomb_idx], cand,
@@ -2908,9 +3242,9 @@ static int planner_v3_bfs_simulate_push_bomb(int rows, int cols, Point car_start
       if (planner_v3_bfs_abs(dr) + planner_v3_bfs_abs(dc) != 1) {
         return INT_MAX;
       }
-      
-      int push_row = bomb.row - dr;
-      int push_col = bomb.col - dc;
+      /* 推位 = from - (to-from)，from=bomb，to=next_in_path */
+      int push_row = bomb.row - (next_in_path.row - bomb.row);
+      int push_col = bomb.col - (next_in_path.col - bomb.col);
       
       if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -2965,8 +3299,9 @@ static int planner_v3_bfs_simulate_push_bomb(int rows, int cols, Point car_start
       
       int new_bomb_row = bomb.row + dirs[i][0];
       int new_bomb_col = bomb.col + dirs[i][1];
-      int push_row = bomb.row - dirs[i][0];
-      int push_col = bomb.col - dirs[i][1];
+      /* 推位 = from - (to-from)，from=bomb，to=(new_bomb_row,new_bomb_col) */
+      int push_row = bomb.row - (new_bomb_row - bomb.row);
+      int push_col = bomb.col - (new_bomb_col - bomb.col);
       
       if (!planner_v3_bfs_in_bounds(rows, cols, new_bomb_row, new_bomb_col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -3252,7 +3587,8 @@ static int planner_v3_bfs_simulate_push_box_path(
     Point next = box_path[path_idx + 1];
     int dr = next.row - box.row, dc = next.col - box.col;
     if (planner_v3_bfs_abs(dr) + planner_v3_bfs_abs(dc) != 1) return INT_MAX;
-    int pr = box.row - dr, pc = box.col - dc;
+    /* 推位 = from - (to-from)，from=box，to=next */
+    int pr = box.row - (next.row - box.row), pc = box.col - (next.col - box.col);
     if (!planner_v3_bfs_in_bounds(rows, cols, next.row, next.col) ||
         !planner_v3_bfs_in_bounds(rows, cols, pr, pc)) return INT_MAX;
     if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, bombs, bomb_count, next.row, next.col) ||
@@ -3375,7 +3711,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
                                      bomb_path_dist,
                                      bomb_path, PLANNER_V3_BFS_MAX_CELLS, &bomb_path_len,
                                      1, 0, NULL,
-                                     1, 1, *car_pos)) {  // 1=把炸弹当作障碍，0=不允许经过障碍
+                                     1, 1, *car_pos, NULL, NULL, 0)) {  // 1=把炸弹当作障碍，0=不允许经过障碍
     if (bomb_path_len > 1) {
       has_bomb_path = 1;
     }
@@ -3460,9 +3796,9 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
         last_err_detail = 313; // v3: 炸弹路径出现非相邻跳跃
         return -6;
       }
-      
-      int push_row = bomb.row - dr;
-      int push_col = bomb.col - dc;
+      /* 推位 = from - (to-from)，from=bomb，to=next_in_path */
+      int push_row = bomb.row - (next_in_path.row - bomb.row);
+      int push_col = bomb.col - (next_in_path.col - bomb.col);
       
       // 检查是否越界（边界外）
       if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
@@ -3564,15 +3900,18 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
     const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     
     for (int i = 0; i < 4; ++i) {
-      candidates[i].dr = dirs[i][0];
-      candidates[i].dc = dirs[i][1];
+      int dr = dirs[i][0];
+      int dc = dirs[i][1];
+      candidates[i].dr = dr;
+      candidates[i].dc = dc;
       candidates[i].feasible = 0;
       candidates[i].score = INT_MAX;
       
-      int new_bomb_row = bomb.row + dirs[i][0];
-      int new_bomb_col = bomb.col + dirs[i][1];
-      int push_row = bomb.row - dirs[i][0];
-      int push_col = bomb.col - dirs[i][1];
+      int new_bomb_row = bomb.row + dr;
+      int new_bomb_col = bomb.col + dc;
+      /* 推位 = from - (to-from)，from=bomb，to=(new_bomb_row,new_bomb_col) */
+      int push_row = bomb.row - (new_bomb_row - bomb.row);
+      int push_col = bomb.col - (new_bomb_col - bomb.col);
       
       if (!planner_v3_bfs_in_bounds(rows, cols, new_bomb_row, new_bomb_col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -3852,8 +4191,11 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   int best = INT_MAX;
   for (int d = 0; d < 4; ++d) {
-    // 推箱位：车站在 box 的反方向
-    Point push_pos = {box.row - dirs[d][0], box.col - dirs[d][1]};
+    /* 推位 = from - (to-from)，from=box，to=box+dir */
+    int dr = dirs[d][0];
+    int dc = dirs[d][1];
+    int to_r = box.row + dr, to_c = box.col + dc;
+    Point push_pos = (Point){ box.row - (to_r - box.row), box.col - (to_c - box.col) };
     if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
       continue;
     }
@@ -3938,7 +4280,7 @@ static int planner_v3_bfs_compute_box_path_length(int rows, int cols, Point box_
                                       bombs, bomb_count, temp_boxes, temp_count, dist,
                                       temp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len,
                                       include_bombs, 0, NULL,
-                                      0, 0, (Point){0, 0})) {
+                                      0, 0, (Point){0, 0}, NULL, NULL, 0)) {
     return INT_MAX;
   }
 
@@ -4010,12 +4352,12 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
 
   uint8_t target_used[PLANNER_V3_BFS_MAX_CELLS] = {0};
 
-  // 依序分配目标：依次为箱子从空闲目标里选"箱子到目标 BFS 真实距离最近且可达"的目标
+  // 依序分配目标：分数 = BFS距离(不考虑车)*0.4 + 特殊路径距离*0.6；若其中一个不成功则分数完全等于另外一个
   size_t assigned = 0;
   for (size_t oi = 0; oi < n; ++oi) {
     size_t bi = order[oi];
     size_t best_t = SIZE_MAX;
-    int best_steps = INT_MAX;
+    int best_score = INT_MAX;
     int best_is_special = 0;
     Point best_obstacle_passed = {-1, -1};
     int best_has_obstacle = 0;
@@ -4024,42 +4366,49 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
       if (target_used[t]) {
         continue;
       }
-      // 直接尝试特殊路径规划（允许经过一次障碍，不把炸弹当作障碍）
       Point obstacle_passed = {-1, -1};
       int has_obstacle = 0;
       size_t sp_len = 0;
-      int steps = INT_MAX;
       int cur_is_special = 0;
-      
+
+      // 1) 箱子到目标的BFS距离（不考虑车，考虑障碍/炸弹/其他箱子）
+      int bfs_dist = planner_v3_bfs_compute_box_path_length(rows, cols, valid_boxes[bi],
+                                                            targets[t], obstacles, obstacle_count,
+                                                            bombs, bomb_count, boxes, box_count,
+                                                            source_indices[bi], 1);  // 1=把炸弹当作障碍
+
+      // 2) 箱子到目标的特殊路径距离
+      int sp_dist = INT_MAX;
       if (planner_v3_bfs_special_path_planning(rows, cols, valid_boxes[bi], targets[t],
                                                obstacles, obstacle_count, bombs, bomb_count,
                                                boxes, box_count, source_indices[bi],
                                                car,
                                                &obstacle_passed, &has_obstacle,
-                                               NULL, 0, &sp_len)) {
-        // 特殊路径规划成功，使用真实步数估算（路径长度-1）
-        if (sp_len > 0) {
-          steps = (int)(sp_len - 1);
-        } else {
-          steps = INT_MAX;
-        }
+                                               NULL, 0, &sp_len, 1) && sp_len > 0) {
+        sp_dist = (int)(sp_len - 1);
         cur_is_special = 1;
       } else {
-        // 特殊路径不可达，尝试正常路径规划（把炸弹当作障碍）
-        steps = planner_v3_bfs_compute_box_path_length(rows, cols, valid_boxes[bi],
-                                                        targets[t], obstacles, obstacle_count,
-                                                        bombs, bomb_count, boxes, box_count, 
-                                                        source_indices[bi], 1);  // 1=把炸弹当作障碍
-        if (steps == INT_MAX) {
-          continue;  // 正常路径也不可达
-        }
-        cur_is_special = 0;
         obstacle_passed.row = -1;
         obstacle_passed.col = -1;
         has_obstacle = 0;
       }
-      if (steps < best_steps || (steps == best_steps && t < best_t)) {
-        best_steps = steps;
+
+      // 两者都不成功则跳过该目标
+      if (bfs_dist == INT_MAX && sp_dist == INT_MAX) {
+        continue;
+      }
+      // 分数计算：两者都成功则 0.4*BFS + 0.6*特殊路径；否则等于成功的那个
+      int score;
+      if (bfs_dist == INT_MAX) {
+        score = sp_dist;
+      } else if (sp_dist == INT_MAX) {
+        score = bfs_dist;
+      } else {
+        score = (bfs_dist * 4 + sp_dist * 6 + 5) / 10;  /* 0.4*bfs + 0.6*sp, 四舍五入 */
+      }
+
+      if (score < best_score || (score == best_score && t < best_t)) {
+        best_score = score;
         best_t = t;
         best_is_special = cur_is_special;
         best_obstacle_passed = obstacle_passed;
@@ -4099,7 +4448,65 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
   return 0;
 }
 
+// 根据手动分配的「箱->目标」映射构建 goals，不重新分配目标
+// box_target_indices[i] = 箱子 i 对应的目标索引；仅对有效箱子（在界内、未完成）校验并写入
+// 返回 0 成功，-11 手动分配无效（目标越界或重复）
+static int planner_v3_bfs_build_goals_from_manual(int rows, int cols,
+    const Point *boxes, size_t box_count,
+    const Point *targets, size_t target_count,
+    const size_t *box_target_indices,
+    PlannerBoxGoalBFS *out_goals, size_t *out_goal_count,
+    size_t *out_mapping) {
+  if (!boxes || !targets || !box_target_indices || !out_goals || !out_goal_count) {
+    return -1;
+  }
+  if (target_count == 0) {
+    return -2;
+  }
+  uint8_t target_used[PLANNER_V3_BFS_MAX_CELLS];
+  memset(target_used, 0, sizeof(target_used));
+  size_t assigned = 0;
+  for (size_t i = 0; i < box_count && assigned < PLANNER_V3_BFS_MAX_BOXES; ++i) {
+    Point p = boxes[i];
+    if (p.row < 0 || p.col < 0) {
+      continue;
+    }
+    if (!planner_v3_bfs_in_bounds(rows, cols, p.row, p.col)) {
+      continue;
+    }
+    size_t ti = box_target_indices[i];
+    if (ti >= target_count) {
+      last_err_stage = 2;
+      last_err_detail = 105; /* v3: 手动分配目标索引越界 */
+      return -11;  /* 手动分配无效 */
+    }
+    if (target_used[ti]) {
+      last_err_stage = 2;
+      last_err_detail = 106; /* v3: 手动分配目标重复 */
+      return -11;  /* 手动分配无效 */
+    }
+    target_used[ti] = 1;
+    out_goals[assigned].box = p;
+    out_goals[assigned].target = targets[ti];
+    out_goals[assigned].target_idx = ti;
+    out_goals[assigned].source_idx = i;
+    out_goals[assigned].has_obstacle_to_clear = 0;
+    out_goals[assigned].obstacle_to_clear.row = -1;
+    out_goals[assigned].obstacle_to_clear.col = -1;
+    if (out_mapping) {
+      out_mapping[i] = ti;
+    }
+    assigned++;
+  }
+  if (assigned == 0) {
+    return -2;  /* 无有效箱子 */
+  }
+  *out_goal_count = assigned;
+  return 0;
+}
+
 // 主推箱规划函数（纯BFS+A*版本，支持炸弹）
+// use_fixed_goals: 1=不重新分配目标，始终按 goals 中箱->目标对应关系执行；0=每轮重新贪心分配
 static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                    const PlannerBoxGoalBFS *goals,
                                    size_t goal_count, size_t box_count,
@@ -4108,7 +4515,8 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                    Point *path_buffer,
                                    size_t path_capacity, size_t *out_steps,
                                    PlannerAllBoxPaths *out_final_paths,
-                                   Point *bombs_mutable) {
+                                   Point *bombs_mutable,
+                                   int use_fixed_goals) {
   if (!goals || !path_buffer || !out_steps) {
     return -1;
   }
@@ -4123,6 +4531,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
   }
 
   *out_steps = 0;
+  s_blocked_bomb_count = 0;  /* 每次规划开始时清空 */
 
   Point current_car = car;
   Point car_start = car;  // 保存起点，用于最后返回
@@ -4204,18 +4613,32 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       }
     }
     
-    // 重新分配目标
-    size_t temp_mapping[PLANNER_V3_BFS_MAX_BOXES];
-    int assign_res = planner_v3_bfs_assign_targets(
-        rows, cols, current_car, active_boxes, active_box_count,
-        active_targets, active_target_count, current_obstacles, current_obstacle_count,
-        bombs_mutable, bomb_count,
-        new_goals, &new_goal_count, temp_mapping);
-    
-    if (assign_res != 0 || new_goal_count == 0) {
-      last_err_stage = 2;    // 动态选目标失败
-      last_err_detail = 102; // v3: 动态重分配失败
-      return -6;   // 重新分配失败
+    // 重新分配目标（或使用固定分配：箱->目标按初始 goals 不变）
+    if (use_fixed_goals) {
+      new_goal_count = 0;
+      for (size_t j = 0; j < active_box_count && new_goal_count < PLANNER_V3_BFS_MAX_BOXES; ++j) {
+        size_t orig = active_to_original[j];
+        new_goals[new_goal_count].box = active_boxes[j];
+        new_goals[new_goal_count].target = goals[orig].target;
+        new_goals[new_goal_count].target_idx = goals[orig].target_idx;
+        new_goals[new_goal_count].source_idx = goals[orig].source_idx;
+        new_goals[new_goal_count].has_obstacle_to_clear = 0;
+        new_goals[new_goal_count].obstacle_to_clear.row = -1;
+        new_goals[new_goal_count].obstacle_to_clear.col = -1;
+        new_goal_count++;
+      }
+    } else {
+      size_t temp_mapping[PLANNER_V3_BFS_MAX_BOXES];
+      int assign_res = planner_v3_bfs_assign_targets(
+          rows, cols, current_car, active_boxes, active_box_count,
+          active_targets, active_target_count, current_obstacles, current_obstacle_count,
+          bombs_mutable, bomb_count,
+          new_goals, &new_goal_count, temp_mapping);
+      if (assign_res != 0 || new_goal_count == 0) {
+        last_err_stage = 2;    // 动态选目标失败
+        last_err_detail = 102; // v3: 动态重分配失败
+        return -6;   // 重新分配失败
+      }
     }
     
     // 选择下一个要推的箱子：只依据车到箱子的BFS真实距离
@@ -4330,7 +4753,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                            bombs_mutable, bomb_count, temp_boxes, temp_count, box_path_dist,
                                            box_path, PLANNER_V3_BFS_MAX_CELLS, &box_path_len,
                                            1, 0, NULL,
-                                           1, 0, current_car)) {
+                                           1, 0, current_car, NULL, NULL, 0)) {
           if (box_path_len > 1) {
             has_box_path = 1;
           }
@@ -4344,46 +4767,66 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     }
 
     // 2) 规划不成功则直接进行特殊路径计算；特殊路径出来后先推炸弹再推箱子
+    // 降级顺序：先要求1+2 → 131则去掉要求1只保留2 → 再131则去掉2只保留1 → 再131则去掉1和2
     if (use_special_path) {
-      Point sp_obstacle = {-1, -1};
-      int sp_has_obs = 0;
-      Point sp_path[PLANNER_V3_BFS_MAX_PATH_LEN];
-      size_t sp_len = 0;
-      if (!planner_v3_bfs_special_path_planning(rows, cols, box, target,
-                                                current_obstacles, current_obstacle_count,
-                                                bombs_mutable, bomb_count,
-                                                current_boxes, goal_count, box_idx,
-                                                current_car,
-                                                &sp_obstacle, &sp_has_obs,
-                                                sp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &sp_len)) {
-        last_err_stage = 2;
-        last_err_detail = 105; // v3: 正常路径规划失败且特殊路径也不可达
-        return -6;
-      }
-      has_obstacle_to_clear = sp_has_obs;
-      obstacle_to_clear = sp_obstacle;
-      // 记录特殊路径用于菜单显示（索引与 boxes 一致）
-      if (orig_box_idx < PLANNER_V3_BFS_MAX_BOXES) {
-        special_paths.box_paths[orig_box_idx].valid = 1;
-        special_paths.box_paths[orig_box_idx].path_len = (sp_len < 400) ? (size_t)sp_len : 400;
-        for (size_t pi = 0; pi < special_paths.box_paths[orig_box_idx].path_len; ++pi) {
-          special_paths.box_paths[orig_box_idx].path[pi] = sp_path[pi];
-        }
-        special_paths.box_paths[orig_box_idx].has_obstacle_to_clear = has_obstacle_to_clear ? 1 : 0;
-        special_paths.box_paths[orig_box_idx].obstacle_to_clear = obstacle_to_clear;
-        {
-          size_t bombs_on_path_idx[MAX_BOMBS];
-          size_t bombs_on_path_cnt = 0;
-          planner_v3_bfs_find_bombs_on_path(sp_path, sp_len, bombs_mutable, bomb_count,
-                                            bombs_on_path_idx, &bombs_on_path_cnt);
-          special_paths.box_paths[orig_box_idx].bomb_on_path_count = (int)(bombs_on_path_cnt <= 5 ? bombs_on_path_cnt : 5);
-          for (size_t bop = 0; bop < (size_t)special_paths.box_paths[orig_box_idx].bomb_on_path_count; ++bop) {
-            special_paths.box_paths[orig_box_idx].bomb_on_path[bop] = bombs_mutable[bombs_on_path_idx[bop]];
-          }
-        }
-      }
+      int apply_req1 = 1;
+      int apply_req2 = 1;
+      int relax;
+      for (relax = 0; relax < 4; ++relax) {
+        if (relax == 1) { apply_req1 = 0; apply_req2 = 1; }
+        else if (relax == 2) { apply_req1 = 1; apply_req2 = 0; }
+        else if (relax == 3) { apply_req1 = 0; apply_req2 = 0; }
 
-      // 推炸弹：先选炸弹（距特殊路径经过的障碍最近的优先），再选目标（备选=该障碍及其上下左右障碍，按可达距离升序），
+        /* 切换要求档位时重置 blocked_bombs */
+        s_blocked_bomb_count = 0;
+
+        int special_substep_fail = 0;  /* 特殊路径子步骤失败时置1，用于切换要求档位 */
+
+        Point sp_obstacle = {-1, -1};
+        int sp_has_obs = 0;
+        Point sp_path[PLANNER_V3_BFS_MAX_PATH_LEN];
+        size_t sp_len = 0;
+        if (!planner_v3_bfs_special_path_planning(rows, cols, box, target,
+                                                  current_obstacles, current_obstacle_count,
+                                                  bombs_mutable, bomb_count,
+                                                  current_boxes, goal_count, box_idx,
+                                                  current_car,
+                                                  &sp_obstacle, &sp_has_obs,
+                                                  sp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &sp_len,
+                                                  apply_req1)) {
+          if (relax < 3) continue;
+          last_err_stage = 2;
+          last_err_detail = 131; // v3: 正常路径规划失败且特殊路径也不可达
+          return -6;
+        }
+        has_obstacle_to_clear = sp_has_obs;
+        obstacle_to_clear = sp_obstacle;
+
+        for (;;) {
+          // 记录特殊路径用于菜单显示（索引与 boxes 一致）
+          if (orig_box_idx < PLANNER_V3_BFS_MAX_BOXES) {
+            special_paths.box_paths[orig_box_idx].valid = 1;
+            special_paths.box_paths[orig_box_idx].path_len = (sp_len < 400) ? (size_t)sp_len : 400;
+            for (size_t pi = 0; pi < special_paths.box_paths[orig_box_idx].path_len; ++pi) {
+              special_paths.box_paths[orig_box_idx].path[pi] = sp_path[pi];
+            }
+            special_paths.box_paths[orig_box_idx].has_obstacle_to_clear = has_obstacle_to_clear ? 1 : 0;
+            special_paths.box_paths[orig_box_idx].obstacle_to_clear = obstacle_to_clear;
+            special_paths.box_paths[orig_box_idx].dropped_req1 = apply_req1 ? 0 : 1;
+            special_paths.box_paths[orig_box_idx].dropped_req2 = apply_req2 ? 0 : 1;
+            {
+              size_t bombs_on_path_idx[MAX_BOMBS];
+              size_t bombs_on_path_cnt = 0;
+              planner_v3_bfs_find_bombs_on_path(sp_path, sp_len, bombs_mutable, bomb_count,
+                                                bombs_on_path_idx, &bombs_on_path_cnt);
+              special_paths.box_paths[orig_box_idx].bomb_on_path_count = (int)(bombs_on_path_cnt <= 5 ? bombs_on_path_cnt : 5);
+              for (size_t bop = 0; bop < (size_t)special_paths.box_paths[orig_box_idx].bomb_on_path_count; ++bop) {
+                special_paths.box_paths[orig_box_idx].bomb_on_path[bop] = bombs_mutable[bombs_on_path_idx[bop]];
+              }
+            }
+          }
+
+          // 推炸弹：先选炸弹（距特殊路径经过的障碍最近的优先），再选目标（备选=该障碍及其上下左右障碍，按可达距离升序），
       // 先试最优目标，不行则试次优目标，直至所有目标；该炸弹都推不到则试次优炸弹，依次尝试所有炸弹
       if (has_obstacle_to_clear && obstacle_to_clear.row >= 0 && obstacle_to_clear.col >= 0) {
         Point saved_car = current_car;
@@ -4394,9 +4837,14 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
         if (saved_steps > PUSH_BOMB_SAVE_PATH_MAX) {
           last_err_stage = 3;
           last_err_detail = 300; // v3: 推炸弹前路径过长无法保存状态
-          return -6;
+          special_substep_fail = 1;
+          goto exit_inner_special_loop;
         }
         memcpy(saved_path, path_buffer, saved_steps * sizeof(Point));
+        Point saved_obstacles[200];
+        size_t saved_obstacle_count = current_obstacle_count;
+        if (saved_obstacle_count > 200) saved_obstacle_count = 200;
+        memcpy(saved_obstacles, current_obstacles, saved_obstacle_count * sizeof(Point));
 
         size_t bomb_order[MAX_BOMBS];
         size_t bomb_order_count = 0;
@@ -4454,6 +4902,26 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
             memcpy(bombs_mutable, saved_bombs, bomb_count * sizeof(Point));
             *out_steps = saved_steps;
             memcpy(path_buffer, saved_path, saved_steps * sizeof(Point));
+            memcpy(current_obstacles, saved_obstacles, saved_obstacle_count * sizeof(Point));
+            current_obstacle_count = saved_obstacle_count;
+
+            Point push_obs = planner_v3_bfs_check_bomb_path_push_obstacle(
+                rows, cols, bombs_mutable[bomb_idx], bomb_targets[bt],
+                current_obstacles, current_obstacle_count, bombs_mutable, bomb_count, bomb_idx,
+                current_boxes, goal_count);
+            if (push_obs.row >= 0) {
+              if (apply_req1) {
+                continue;  /* 要求1：推位被挡不尝试炸弹B，尝试下一目标 */
+              }
+              if (!planner_v3_bfs_clear_push_pos_obstacle_recursive(
+                      rows, cols, &current_car, bombs_mutable, bomb_count, bomb_idx,
+                      push_obs, current_obstacles, &current_obstacle_count,
+                      current_boxes, goal_count,
+                      path_buffer, path_capacity, out_steps,
+                      0, NULL, 0, NULL)) {
+                continue;  /* 推位被障碍占据且无法用炸弹B清除，尝试下一目标 */
+              }
+            }
 
             int bomb_result = planner_v3_bfs_push_bomb(rows, cols, &current_car,
                 bombs_mutable, bomb_count, bomb_idx, bomb_targets[bt],
@@ -4467,11 +4935,12 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           }
         }
 
-        // 仅当尝试了所有炸弹及各自备选目标均失败后才返回
+        // 仅当尝试了所有炸弹及各自备选目标均失败后才切换要求档位
         if (!push_success) {
           last_err_stage = 3;
           last_err_detail = 301; // v3: 尝试了所有炸弹都不行
-          return -6;
+          special_substep_fail = 1;
+          goto exit_inner_special_loop;
         }
         Point bomb_target_pos = bombs_mutable[chosen_bomb_idx];
         if (orig_box_idx < PLANNER_V3_BFS_MAX_BOXES) {
@@ -4507,14 +4976,16 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
             Point bomb_target = {-1, -1};
             Point extra_bomb_pos[PLANNER_V3_BFS_MAX_EXTRA_BOMB_DISPLAY];
             size_t extra_bomb_count = 0;
-            if (planner_v3_bfs_handle_bomb_on_path(rows, cols, &current_car,
+            int hret = planner_v3_bfs_handle_bomb_on_path(rows, cols, &current_car,
                                                     bombs_mutable, bomb_count, bomb_on_path_idx,
                                                     current_obstacles, &current_obstacle_count,
                                                     current_boxes, goal_count,
                                                     sp_path, sp_len,
                                                     path_buffer, path_capacity, out_steps,
                                                     &bomb_target,
-                                                    extra_bomb_pos, PLANNER_V3_BFS_MAX_EXTRA_BOMB_DISPLAY, &extra_bomb_count)) {
+                                                    extra_bomb_pos, PLANNER_V3_BFS_MAX_EXTRA_BOMB_DISPLAY, &extra_bomb_count,
+                                                    apply_req2);
+            if (hret == 1) {
               // 炸弹处理成功，记录用于显示（炸弹A + 炸弹B等清除推位的爆炸位置）
               if (orig_box_idx < PLANNER_V3_BFS_MAX_BOXES && bomb_target.row >= 0) {
                 special_paths.box_paths[orig_box_idx].has_bomb_exploded = 1;
@@ -4529,14 +5000,49 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                   special_paths.box_paths[orig_box_idx].bomb_extra_exploded_at[ei] = extra_bomb_pos[ei];
                 }
               }
+            } else if (hret == 2) {
+              /* 要求2：所有推离方向都不行，将该炸弹当作障碍重新计算特殊路径
+               * 使用 blocked_bombs 而非 obstacles：规划时当作不可走，显示时仍按炸弹画 */
+              if (s_blocked_bomb_count >= MAX_BOMBS) {
+                last_err_stage = 3;
+                last_err_detail = 302;
+                special_substep_fail = 1;
+                goto exit_inner_special_loop;
+              }
+              s_blocked_bombs[s_blocked_bomb_count++] = bombs_mutable[bomb_on_path_idx];
+              if (!planner_v3_bfs_special_path_planning(rows, cols, box, target,
+                                                       current_obstacles, current_obstacle_count,
+                                                       bombs_mutable, bomb_count,
+                                                       current_boxes, goal_count, box_idx,
+                                                       current_car,
+                                                       &sp_obstacle, &sp_has_obs,
+                                                       sp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &sp_len,
+                                                       apply_req1)) {
+                last_err_stage = 2;
+                last_err_detail = 131;
+                special_substep_fail = 1;
+                goto exit_inner_special_loop;
+              }
+              has_obstacle_to_clear = sp_has_obs;
+              obstacle_to_clear = sp_obstacle;
+              continue;  /* 内层 for(;;)：用新路径重新推炸弹/推路径上炸弹 */
             } else {
-              // 炸弹处理失败
+              // 炸弹处理失败，切换要求档位
               last_err_stage = 3;
               last_err_detail = 302; // v3: 特殊路径上的炸弹无法处理
-              return -6;
+              special_substep_fail = 1;
+              goto exit_inner_special_loop;
             }
           }
         }
+        }
+        break;  /* 特殊路径+推炸弹成功，退出内层 for(;;) */
+      }
+
+exit_inner_special_loop:
+      if (special_substep_fail) {
+        if (relax < 3) continue;
+        return -6;  /* 四档都试过仍失败，last_err 已在上方设置 */
       }
 
       // 推箱子前重新计算路径（考虑所有障碍、箱子、炸弹）
@@ -4545,7 +5051,8 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                                  target_dist, 1)) {
         last_err_stage = 2;
         last_err_detail = 121; // v3: 特殊路径推炸弹后单箱推送全局BFS失败
-        return -6;
+        special_substep_fail = 1;
+        goto exit_inner_special_loop;
       }
       temp_count = 0;
       for (size_t i = 0; i < goal_count; ++i) {
@@ -4562,15 +5069,18 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                             bombs_mutable, bomb_count, temp_boxes, temp_count, box_path_dist,
                                             box_path, PLANNER_V3_BFS_MAX_CELLS, &box_path_len,
                                             1, 0, NULL,
-                                            1, 0, current_car) || box_path_len <= 1) {
+                                            1, 0, current_car, NULL, NULL, 0) || box_path_len <= 1) {
           last_err_stage = 2;
-          last_err_detail = 106; // v3: 特殊路径推炸弹后箱子路径规划失败
-          return -6;  // 推箱子环节失败不再计算特殊路径，直接返回
+          last_err_detail = 132; // v3: 特殊路径推炸弹后箱子路径规划失败
+          special_substep_fail = 1;
+          goto exit_inner_special_loop;
         }
         has_box_path = 1;
       }
+      break;  /* 本档 relax 成功，退出 relax 循环 */
     }
-    
+    }  /* 关闭 if (use_special_path) */
+
     // 先模拟路径策略与评分策略，选取步数少的再实际执行
     int box_path_steps = INT_MAX;
     int box_score_steps = INT_MAX;
@@ -4610,9 +5120,9 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           last_err_detail = 107; // v3: 箱子路径出现非相邻跳跃
           return -6;
         }
-        
-        int push_row = box.row - dr;
-        int push_col = box.col - dc;
+        /* 推位 = from - (to-from)，from=box，to=next_in_path */
+        int push_row = box.row - (next_in_path.row - box.row);
+        int push_col = box.col - (next_in_path.col - box.col);
         
         // 检查是否越界（边界外）
         if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
@@ -4737,15 +5247,18 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       
       while (box.row != target.row || box.col != target.col) {
         for (int i = 0; i < 4; ++i) {
-          candidates[i].dr = dirs[i][0];
-          candidates[i].dc = dirs[i][1];
+          int dr = dirs[i][0];
+          int dc = dirs[i][1];
+          candidates[i].dr = dr;
+          candidates[i].dc = dc;
           candidates[i].feasible = 0;
           candidates[i].score = INT_MAX;
           
-          int new_box_row = box.row + dirs[i][0];
-          int new_box_col = box.col + dirs[i][1];
-          int push_row = box.row - dirs[i][0];
-          int push_col = box.col - dirs[i][1];
+          int new_box_row = box.row + dr;
+          int new_box_col = box.col + dc;
+          /* 推位 = from - (to-from)，from=box，to=(new_box_row,new_box_col) */
+          int push_row = box.row - (new_box_row - box.row);
+          int push_col = box.col - (new_box_col - box.col);
           
           if (!planner_v3_bfs_in_bounds(rows, cols, new_box_row, new_box_col) ||
               !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -4940,6 +5453,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       }
     }
     
+    
     // 箱子到达目标，标记为"消失"
     if (box.row == target.row && box.col == target.col) {
       current_boxes[box_idx].row = -1;
@@ -4983,7 +5497,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                         empty_boxes, empty_box_count, dist,
                                         return_path, 256, &return_len,
                                         1, 0, NULL,
-                                        0, 0, (Point){0, 0})) {
+                                        0, 0, (Point){0, 0}, NULL, NULL, 0)) {
         for (size_t i = 1; i < return_len; ++i) {
           if (*out_steps >= path_capacity) {
             return -7;
@@ -5076,7 +5590,135 @@ int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_BFS car,
     return assign_res;
   }
 
-  return planner_v3_bfs_run_assigned(rows, cols, car, assigned, assigned_count, box_count,
+  int res = planner_v3_bfs_run_assigned(rows, cols, car, assigned, assigned_count, box_count,
                                  obstacles, obstacle_count, bombs, bomb_count, path_buffer,
-                                 path_capacity, out_steps, out_final_paths, bombs_mutable);
+                                 path_capacity, out_steps, out_final_paths, bombs_mutable, 0);
+  if (res != 0) {
+    return res;
+  }
+
+  // 输出前检验路径坐标合理性，若任一坐标超出地图范围则不输出
+  if (*out_steps > 0 && !planner_v3_bfs_path_in_bounds(rows, cols, path_buffer, *out_steps)) {
+    *out_steps = 0;
+    if (out_final_paths) {
+      out_final_paths->box_count = 0;
+      for (size_t k = 0; k < PLANNER_V3_BFS_MAX_BOXES; ++k) {
+        out_final_paths->box_paths[k].valid = 0;
+        out_final_paths->box_paths[k].path_len = 0;
+      }
+    }
+    return -10;  /* 路径坐标超出地图范围 */
+  }
+
+  if (out_final_paths && out_final_paths->box_count > 0) {
+    for (size_t k = 0; k < out_final_paths->box_count && k < PLANNER_V3_BFS_MAX_BOXES; ++k) {
+      if (!out_final_paths->box_paths[k].valid || out_final_paths->box_paths[k].path_len == 0) {
+        continue;
+      }
+      size_t plen = out_final_paths->box_paths[k].path_len;
+      if (plen > 400) {
+        plen = 400;
+      }
+      if (!planner_v3_bfs_path_in_bounds(rows, cols, out_final_paths->box_paths[k].path, plen)) {
+        *out_steps = 0;
+        out_final_paths->box_count = 0;
+        for (size_t i = 0; i < PLANNER_V3_BFS_MAX_BOXES; ++i) {
+          out_final_paths->box_paths[i].valid = 0;
+          out_final_paths->box_paths[i].path_len = 0;
+        }
+        return -10;  /* 路径坐标超出地图范围 */
+      }
+    }
+  }
+
+  return 0;
+}
+
+// 使用手动分配的「箱->目标」进行规划，不自动重新分配目标
+// box_target_indices[箱子索引] = 目标索引，长度至少 box_count；目标不得重复
+// 返回值与 plan_boxes_greedy_v3 一致，另 -11 表示手动分配无效（目标越界或重复）
+int plan_boxes_greedy_v3_manual_assignment(int rows, int cols, PlannerPointV3_BFS car,
+                         const PlannerPointV3_BFS *boxes, size_t box_count,
+                         const PlannerPointV3_BFS *targets, size_t target_count,
+                         const PlannerPointV3_BFS *bombs, size_t bomb_count,
+                         const PlannerPointV3_BFS *obstacles,
+                         size_t obstacle_count,
+                         const size_t *box_target_indices,
+                         PlannerPointV3_BFS *path_buffer,
+                         size_t path_capacity, size_t *out_steps,
+                         size_t *out_box_target_indices,
+                         PlannerAllBoxPaths *out_final_paths) {
+  if (!boxes || !targets || !path_buffer || !out_steps || !box_target_indices) {
+    return -1;
+  }
+  *out_steps = 0;
+  planner_v3_bfs_clear_special_paths(boxes, targets, box_count, target_count);
+  if (box_count == 0 || target_count == 0) {
+    return -2;
+  }
+  if (box_count > PLANNER_V3_BFS_MAX_BOXES) {
+    return -3;
+  }
+  if (path_capacity == 0) {
+    return -4;
+  }
+  if (bomb_count > MAX_BOMBS) {
+    return -9;
+  }
+  if (out_box_target_indices) {
+    for (size_t i = 0; i < box_count; ++i) {
+      out_box_target_indices[i] = SIZE_MAX;
+    }
+  }
+  Point bombs_mutable[MAX_BOMBS];
+  if (bomb_count > 0 && bombs) {
+    memcpy(bombs_mutable, bombs, bomb_count * sizeof(Point));
+  }
+  PlannerBoxGoalBFS assigned[PLANNER_V3_BFS_MAX_BOXES];
+  size_t assigned_count = 0;
+  int build_res = planner_v3_bfs_build_goals_from_manual(rows, cols,
+      boxes, box_count, targets, target_count, box_target_indices,
+      assigned, &assigned_count, out_box_target_indices);
+  if (build_res != 0) {
+    *out_steps = 0;
+    return build_res;
+  }
+  int res = planner_v3_bfs_run_assigned(rows, cols, car, assigned, assigned_count, box_count,
+                                 obstacles, obstacle_count, bombs, bomb_count, path_buffer,
+                                 path_capacity, out_steps, out_final_paths, bombs_mutable, 1);
+  if (res != 0) {
+    return res;
+  }
+  if (*out_steps > 0 && !planner_v3_bfs_path_in_bounds(rows, cols, path_buffer, *out_steps)) {
+    *out_steps = 0;
+    if (out_final_paths) {
+      out_final_paths->box_count = 0;
+      for (size_t k = 0; k < PLANNER_V3_BFS_MAX_BOXES; ++k) {
+        out_final_paths->box_paths[k].valid = 0;
+        out_final_paths->box_paths[k].path_len = 0;
+      }
+    }
+    return -10;
+  }
+  if (out_final_paths && out_final_paths->box_count > 0) {
+    for (size_t k = 0; k < out_final_paths->box_count && k < PLANNER_V3_BFS_MAX_BOXES; ++k) {
+      if (!out_final_paths->box_paths[k].valid || out_final_paths->box_paths[k].path_len == 0) {
+        continue;
+      }
+      size_t plen = out_final_paths->box_paths[k].path_len;
+      if (plen > 400) {
+        plen = 400;
+      }
+      if (!planner_v3_bfs_path_in_bounds(rows, cols, out_final_paths->box_paths[k].path, plen)) {
+        *out_steps = 0;
+        out_final_paths->box_count = 0;
+        for (size_t i = 0; i < PLANNER_V3_BFS_MAX_BOXES; ++i) {
+          out_final_paths->box_paths[i].valid = 0;
+          out_final_paths->box_paths[i].path_len = 0;
+        }
+        return -10;
+      }
+    }
+  }
+  return 0;
 }

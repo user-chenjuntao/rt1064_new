@@ -12,6 +12,7 @@ extern "C" {
 
 extern int last_err_stage;   // 错误阶段
 extern int last_err_detail;  // 错误详情
+extern int last_special_path_fail_reason;  // 特殊路径失败子原因（仅当 last_err_detail==131 时有效）
 
 /** 推箱/推炸弹时是否仅使用 BFS+A* 路径（方便配置）
  *  0 = 路径与评分取优（默认）：有路径则与评分策略比较步数，取少者
@@ -30,7 +31,7 @@ extern PlannerAllBoxPaths special_paths;
  * - 把炸弹看作障碍
  * - 分配目标完后，先使用 BFS+A* 给该箱子规划路径；规划过程中任何错误导致不成功则直接进行特殊路径计算
  * - 特殊路径计算时不需要把炸弹当作障碍，路径允许经过多个障碍（这些障碍需可被一颗炸弹炸掉、炸弹可达、推位合理）
- * - 特殊路径计算出来后：先推炸弹。选炸弹：按「距特殊路径经过的障碍」BFS 距离升序；选目标：备选为「中心障碍及其上下左右障碍」，按该炸弹到目标的 BFS 可达距离升序。推炸弹时排除所有路径障碍，考虑其他障碍、箱子、其他炸弹。
+ * - 特殊路径计算出来后：先推炸弹。选炸弹：按「距特殊路径经过的障碍」BFS 距离升序；选目标：多障碍时只能选中心障碍 C，单障碍时备选为「中心障碍及其上下左右障碍」，按该炸弹到目标的 BFS 可达距离升序。推炸弹时排除所有路径障碍，考虑其他障碍、箱子、其他炸弹。
  *   先试最优目标，不行则试次优目标，直至所有目标；该炸弹都推不到则试次优炸弹，依次尝试所有炸弹。推炸弹时仍为 BFS+A* 与评分方式取步数少者；除目标障碍外其他障碍、其他炸弹和箱子均当作障碍。
  *   推完炸弹后进入推箱子环节（模拟 BFS+A* 路径 vs 评分方式推到目标点，取车步数少者；所有障碍、箱子、炸弹均考虑），推箱子环节失败则不再计算特殊路径，直接返回失败
  *
@@ -62,6 +63,25 @@ int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_BFS car,
                          const PlannerPointV3_BFS *bombs, size_t bomb_count,
                          const PlannerPointV3_BFS *obstacles,
                          size_t obstacle_count, PlannerPointV3_BFS *path_buffer,
+                         size_t path_capacity, size_t *out_steps,
+                         size_t *out_box_target_indices,
+                         PlannerAllBoxPaths *out_final_paths);
+
+/**
+ * 使用手动分配的「箱->目标」进行规划（v3，支持炸弹）
+ * 与 plan_boxes_greedy_v3 参数一致，多出 box_target_indices：
+ *   box_target_indices[箱子索引] = 目标索引，长度至少 box_count；每个目标最多被分配一次
+ * 规划过程中不再自动重新分配目标，始终按该映射执行。
+ * 返回值与 plan_boxes_greedy_v3 相同，另 -11 表示手动分配无效（目标索引越界或目标重复）。
+ */
+int plan_boxes_greedy_v3_manual_assignment(int rows, int cols, PlannerPointV3_BFS car,
+                         const PlannerPointV3_BFS *boxes, size_t box_count,
+                         const PlannerPointV3_BFS *targets, size_t target_count,
+                         const PlannerPointV3_BFS *bombs, size_t bomb_count,
+                         const PlannerPointV3_BFS *obstacles,
+                         size_t obstacle_count,
+                         const size_t *box_target_indices,
+                         PlannerPointV3_BFS *path_buffer,
                          size_t path_capacity, size_t *out_steps,
                          size_t *out_box_target_indices,
                          PlannerAllBoxPaths *out_final_paths);

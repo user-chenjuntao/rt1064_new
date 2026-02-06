@@ -9,6 +9,7 @@ extern int last_err_detail;  // 错误详情
 
 int last_err_stage = 0;
 int last_err_detail = 0;
+int last_special_path_fail_reason = 0;  
 
 #define PLANNER_V3_BFS_MAX_BOXES 10
 #define PLANNER_V3_BFS_MAX_CELLS 400
@@ -193,10 +194,13 @@ static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstac
 
     const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
     for (int i = 0; i < 4; ++i) {
-      int new_row = row + dirs[i][0];
-      int new_col = col + dirs[i][1];
-      int push_row = row - dirs[i][0];
-      int push_col = col - dirs[i][1];
+      int dr = dirs[i][0];
+      int dc = dirs[i][1];
+      int new_row = row + dr;
+      int new_col = col + dc;
+      /* 推位 = from - (to-from)，from=(row,col)，to=(new_row,new_col) */
+      int push_row = row - (new_row - row);
+      int push_col = col - (new_col - col);
 
       if (!planner_v3_bfs_in_bounds(rows, cols, new_row, new_col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -433,8 +437,8 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
       
       /* 推位检测：若从节点A(curr)到节点B(next)的推位不合理（障碍、箱、边界外），则排除节点B；推位 = from - (to-from) */
       if (check_push) {
-        int push_row = curr_row * 2 - nr;
-        int push_col = curr_col * 2 - nc;
+        int push_row = curr_row - (nr - curr_row);
+        int push_col = curr_col - (nc - curr_col);
         if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
           continue;
         }
@@ -539,10 +543,13 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
   int valid_count = 0;
   
   for (int d = 0; d < 4; ++d) {
-    int push_r = box.row - dirs[d][0];
-    int push_c = box.col - dirs[d][1];
-    int new_box_r = box.row + dirs[d][0];
-    int new_box_c = box.col + dirs[d][1];
+    int dr = dirs[d][0];
+    int dc = dirs[d][1];
+    int new_box_r = box.row + dr;
+    int new_box_c = box.col + dc;
+    /* 推位 = from - (to-from)，from=box，to=(new_box_r,new_box_c) */
+    int push_r = box.row - (new_box_r - box.row);
+    int push_c = box.col - (new_box_c - box.col);
     
     if (!planner_v3_bfs_in_bounds(rows, cols, push_r, push_c)) continue;
     if (!planner_v3_bfs_in_bounds(rows, cols, new_box_r, new_box_c)) continue;
@@ -779,9 +786,9 @@ static int planner_v3_bfs_push_box_with_strategy(
         SET_ERR(2, 7);
         return -6;
       }
-
-      int push_row = box.row - dr;
-      int push_col = box.col - dc;
+      /* 推位 = from - (to-from)，from=box，to=next_in_path */
+      int push_row = box.row - (next_in_path.row - box.row);
+      int push_col = box.col - (next_in_path.col - box.col);
 
       if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -873,15 +880,18 @@ static int planner_v3_bfs_push_box_with_strategy(
     const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
 
     for (int i = 0; i < 4; ++i) {
-      candidates[i].dr = dirs[i][0];
-      candidates[i].dc = dirs[i][1];
+      int dr = dirs[i][0];
+      int dc = dirs[i][1];
+      candidates[i].dr = dr;
+      candidates[i].dc = dc;
       candidates[i].feasible = 0;
       candidates[i].score = INT_MAX;
 
-      int new_box_row = box.row + dirs[i][0];
-      int new_box_col = box.col + dirs[i][1];
-      int push_row = box.row - dirs[i][0];
-      int push_col = box.col - dirs[i][1];
+      int new_box_row = box.row + dr;
+      int new_box_col = box.col + dc;
+      /* 推位 = from - (to-from)，from=box，to=(new_box_row,new_box_col) */
+      int push_row = box.row - (new_box_row - box.row);
+      int push_col = box.col - (new_box_col - box.col);
 
       if (!planner_v3_bfs_in_bounds(rows, cols, new_box_row, new_box_col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
@@ -1142,8 +1152,10 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   int best = INT_MAX;
   for (int d = 0; d < 4; ++d) {
-    // 推箱位：车站在 box 的反方向
-    Point push_pos = {box.row - dirs[d][0], box.col - dirs[d][1]};
+    int dr = dirs[d][0];
+    int dc = dirs[d][1];
+    /* 推位 = from - (to-from)，from=box，to=box+dir */
+    Point push_pos = (Point){ box.row - ((box.row + dr) - box.row), box.col - ((box.col + dc) - box.col) };
     if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
       continue;
     }
