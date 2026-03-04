@@ -45,6 +45,8 @@ extern PlannerAllBoxPaths special_paths;
  * @param out_steps                 实际路径步数
  * @param out_box_target_indices    箱子到目标的映射（可选，传NULL则不输出）
  * @param out_final_paths           最终路径规划的所有箱子路径（可选，传NULL则不输出）
+ * 特殊用法：若仅需计算步数，可令 path_buffer==NULL 且 path_capacity==0，
+ *          此时内部使用临时缓冲区，只输出 out_steps，不向外部写入完整路径。
  *
  * @return 0  成功
  *         -1 参数为空
@@ -73,6 +75,8 @@ int plan_boxes_greedy_v3(int rows, int cols, PlannerPointV3_BFS car,
  *   box_target_indices[箱子索引] = 目标索引，长度至少 box_count；每个目标最多被分配一次
  * 规划过程中不再自动重新分配目标，始终按该映射执行。
  * 返回值与 plan_boxes_greedy_v3 相同，另 -11 表示手动分配无效（目标索引越界或目标重复）。
+ * 同样支持“只计算步数”用法：path_buffer==NULL 且 path_capacity==0 时，
+ * 只计算并返回 out_steps，不向调用者写入整体路径。
  */
 int plan_boxes_greedy_v3_manual_assignment(int rows, int cols, PlannerPointV3_BFS car,
                          const PlannerPointV3_BFS *boxes, size_t box_count,

@@ -18,6 +18,57 @@ int last_special_path_fail_reason = 0;
 #define PLANNER_V3_BFS_STRATEGY_PATH 1
 #define PLANNER_V3_BFS_STRATEGY_SCORE 2
 
+/* BFS 访问标记，避免每轮 memset */
+static uint32_t s_bfs_visit_stamp = 0;
+static uint32_t s_bfs_visit_mark[PLANNER_V3_BFS_MAX_CELLS];
+/* A* open/closed 标记，避免每轮 memset */
+static uint32_t s_astar_run_stamp = 0;
+static uint32_t s_astar_mark[PLANNER_V3_BFS_MAX_CELLS];
+
+/* 占用网格：按格子索引，O(1) 判断障碍/箱子。每格 1 字节：低 4 位标志，高 4 位箱子索引(0..10, 15=无) */
+#define OCC_OBSTACLE      0x01
+#define OCC_BOX           0x08
+#define OCC_BOX_INDEX_MASK 0xF0
+#define OCC_BOX_INDEX_SHIFT 4
+#define OCC_NO_BOX_INDEX  15
+
+static void planner_v3_bfs_build_occupancy_grid(int rows, int cols,
+    const Point *obstacles, size_t obstacle_count,
+    const Point *boxes, size_t box_count,
+    uint8_t *grid) {
+  size_t n = (size_t)(rows * cols);
+  if (n > PLANNER_V3_BFS_MAX_CELLS) n = PLANNER_V3_BFS_MAX_CELLS;
+  memset(grid, 0, n);
+  for (size_t i = 0; i < obstacle_count; ++i) {
+    int r = obstacles[i].row, c = obstacles[i].col;
+    if (r >= 0 && r < rows && c >= 0 && c < cols)
+      grid[(size_t)(r * cols + c)] |= OCC_OBSTACLE;
+  }
+  for (size_t i = 0; i < box_count; ++i) {
+    int r = boxes[i].row, c = boxes[i].col;
+    if (r < 0 || c < 0) continue;
+    if (r >= 0 && r < rows && c >= 0 && c < cols) {
+      size_t idx = (size_t)(r * cols + c);
+      grid[idx] |= OCC_BOX;
+      grid[idx] = (grid[idx] & 0x0F) | (uint8_t)((i <= (size_t)OCC_NO_BOX_INDEX ? i : OCC_NO_BOX_INDEX) << OCC_BOX_INDEX_SHIFT);
+    }
+  }
+}
+
+#define OCC_IS_OBSTACLE(grid, cols, row, col) \
+  (((grid)[(size_t)((row) * (cols) + (col))] & OCC_OBSTACLE) != 0)
+#define OCC_HAS_BOX(grid, cols, row, col) \
+  (((grid)[(size_t)((row) * (cols) + (col))] & OCC_BOX) != 0)
+#define OCC_HAS_BOX_EXCLUDING(grid, cols, row, col, skip_idx) \
+  (OCC_HAS_BOX_EXCLUDING_IMPL((grid), (cols), (row), (col), (skip_idx)))
+static inline int OCC_HAS_BOX_EXCLUDING_IMPL(const uint8_t *g, int cols, int row, int col, size_t skip_idx) {
+  size_t idx = (size_t)(row * cols + col);
+  uint8_t cell = g[idx];
+  if (!(cell & OCC_BOX)) return 0;
+  if (skip_idx == SIZE_MAX) return 1;
+  return (size_t)(cell >> OCC_BOX_INDEX_SHIFT) != skip_idx;
+}
+
 typedef struct {
   Point box;
   Point target;
@@ -62,6 +113,8 @@ static int planner_v3_bfs_adjacent_blockers(int rows, int cols, const Point *obs
                                    size_t obstacle_count, const Point *boxes,
                                    size_t box_count, size_t skip_idx, int row,
                                    int col) {
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
   int count = 0;
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   for (int i = 0; i < 4; ++i) {
@@ -71,8 +124,8 @@ static int planner_v3_bfs_adjacent_blockers(int rows, int cols, const Point *obs
       count++;
       continue;
     }
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, nr, nc) ||
-        planner_v3_bfs_is_box_at(boxes, box_count, nr, nc, skip_idx)) {
+    if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc) ||
+        OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, skip_idx)) {
       count++;
     }
   }
@@ -85,10 +138,8 @@ static int planner_v3_bfs_adjacent_blockers(int rows, int cols, const Point *obs
 // 2. 如果只有两个被挡住的方向，且这两个方向不同时为"上、下"或"左、右"时，才是死点
 // 3. 其余情况不为死点
 // 返回值：1=是死点，0=不是死点
-static int planner_v3_bfs_is_deadlock(int rows, int cols, const Point *obstacles,
-                                     size_t obstacle_count, const Point *boxes,
-                                     size_t box_count, size_t skip_idx, int row,
-                                     int col) {
+static int planner_v3_bfs_is_deadlock_occ(const uint8_t *occ_grid, int rows, int cols,
+                                          size_t skip_idx, int row, int col) {
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};  // 上、下、左、右
   int blocked[4] = {0, 0, 0, 0};  // 记录每个方向是否被阻挡
   
@@ -100,8 +151,8 @@ static int planner_v3_bfs_is_deadlock(int rows, int cols, const Point *obstacles
       blocked[i] = 1;
       continue;
     }
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, nr, nc) ||
-        planner_v3_bfs_is_box_at(boxes, box_count, nr, nc, skip_idx)) {
+    if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc) ||
+        OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, skip_idx)) {
       blocked[i] = 1;
     }
   }
@@ -136,6 +187,15 @@ static int planner_v3_bfs_is_deadlock(int rows, int cols, const Point *obstacles
   return 0;
 }
 
+static int planner_v3_bfs_is_deadlock(int rows, int cols, const Point *obstacles,
+                                     size_t obstacle_count, const Point *boxes,
+                                     size_t box_count, size_t skip_idx, int row,
+                                     int col) {
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
+  return planner_v3_bfs_is_deadlock_occ(occ_grid, rows, cols, skip_idx, row, col);
+}
+
 // 检查箱子从start是否能被推到target（不考虑死点，只检查物理可达性）
 static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstacles,
                                 size_t obstacle_count, const Point *boxes,
@@ -149,19 +209,21 @@ static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstac
       !planner_v3_bfs_in_bounds(rows, cols, target.row, target.col)) {
     return 0;
   }
-  if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, start.row, start.col) ||
-      planner_v3_bfs_is_obstacle(obstacles, obstacle_count, target.row, target.col)) {
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
+  if (OCC_IS_OBSTACLE(occ_grid, cols, start.row, start.col) ||
+      OCC_IS_OBSTACLE(occ_grid, cols, target.row, target.col)) {
     return 0;
   }
-  if (planner_v3_bfs_is_box_at(boxes, box_count, start.row, start.col, SIZE_MAX) ||
-      planner_v3_bfs_is_box_at(boxes, box_count, target.row, target.col, SIZE_MAX)) {
+  if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, start.row, start.col, SIZE_MAX) ||
+      OCC_HAS_BOX_EXCLUDING(occ_grid, cols, target.row, target.col, SIZE_MAX)) {
     return 0;
   }
   if (!planner_v3_bfs_in_bounds(rows, cols, target.row, target.col)) {
     return 0;
   }
-  if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, target.row, target.col) ||
-      planner_v3_bfs_is_box_at(boxes, box_count, target.row, target.col, SIZE_MAX)) {
+  if (OCC_IS_OBSTACLE(occ_grid, cols, target.row, target.col) ||
+      OCC_HAS_BOX_EXCLUDING(occ_grid, cols, target.row, target.col, SIZE_MAX)) {
     return 0;
   }
 
@@ -169,16 +231,16 @@ static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstac
     return 1;
   }
 
-  uint8_t visited[PLANNER_V3_BFS_MAX_CELLS];
   int queue[PLANNER_V3_BFS_MAX_CELLS];
   int head = 0;
   int tail = 0;
 
-  memset(visited, 0, sizeof(visited));
+  s_bfs_visit_stamp++;
+  uint32_t stamp = s_bfs_visit_stamp;
 
   int start_idx = start.row * cols + start.col;
   queue[tail++] = start_idx;
-  visited[start_idx] = 1;
+  s_bfs_visit_mark[start_idx] = stamp;
 
   while (head < tail) {
     if (head >= PLANNER_V3_BFS_MAX_CELLS) {
@@ -207,19 +269,19 @@ static int planner_v3_bfs_can_reach_goal(int rows, int cols, const Point *obstac
         continue;
       }
 
-      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_row, new_col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+      if (OCC_IS_OBSTACLE(occ_grid, cols, new_row, new_col) ||
+          OCC_IS_OBSTACLE(occ_grid, cols, push_row, push_col)) {
         continue;
       }
 
-      if (planner_v3_bfs_is_box_at(boxes, box_count, new_row, new_col, moving_idx) ||
-          planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, moving_idx)) {
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, new_row, new_col, moving_idx) ||
+          OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_row, push_col, moving_idx)) {
         continue;
       }
 
       int idx = new_row * cols + new_col;
-      if (!visited[idx]) {
-        visited[idx] = 1;
+      if (s_bfs_visit_mark[idx] != stamp) {
+        s_bfs_visit_mark[idx] = stamp;
         queue[tail++] = idx;
       }
     }
@@ -243,25 +305,28 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
   for (int i = 0; i < total_cells; ++i) {
     dist[i] = INT_MAX;
   }
+
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
   
-  uint8_t visited[PLANNER_V3_BFS_MAX_CELLS];
   int queue[PLANNER_V3_BFS_MAX_CELLS];
-  memset(visited, 0, sizeof(visited));
-  
+  s_bfs_visit_stamp++;
+  uint32_t stamp = s_bfs_visit_stamp;
+
   int head = 0;
   int tail = 0;
-  
+
   // 从终点开始BFS
   int target_idx = target.row * cols + target.col;
   queue[tail++] = target_idx;
-  visited[target_idx] = 1;
+  s_bfs_visit_mark[target_idx] = stamp;
   dist[target_idx] = 0;
-  
+
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
-  
+
   while (head < tail) {
     if (head >= PLANNER_V3_BFS_MAX_CELLS) break;
-    
+
     int curr_idx = queue[head++];
     int curr_row = curr_idx / cols;
     int curr_col = curr_idx % cols;
@@ -275,11 +340,10 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
         continue;
       }
       
-      // 检查障碍物和箱子
-      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+      if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc)) {
         continue;
       }
-      if (planner_v3_bfs_is_box_at(boxes, box_count, nr, nc, box_count)) {
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, SIZE_MAX)) {
         continue;
       }
       
@@ -288,8 +352,8 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
         continue;
       }
       
-      if (!visited[next_idx]) {
-        visited[next_idx] = 1;
+      if (s_bfs_visit_mark[next_idx] != stamp) {
+        s_bfs_visit_mark[next_idx] = stamp;
         dist[next_idx] = curr_dist + 1;
         if (tail < PLANNER_V3_BFS_MAX_CELLS) {
           queue[tail++] = next_idx;
@@ -297,7 +361,133 @@ static int planner_v3_bfs_global_bfs_from_target(int rows, int cols, Point targe
       }
     }
   }
-  
+
+  return 1;
+}
+
+/* 使用预构建的 occ_grid 做 BFS，从 start 出发计算每个可达格子到 start 的真实距离；
+ * 不在内部重复 build，占用网格由调用方提前构建并传入，便于热点路径每轮只 build 一次。 */
+static int planner_v3_bfs_global_bfs_from_point_use_occ(int rows, int cols, Point start,
+                                                    const uint8_t *occ_grid,
+                                                    int dist[PLANNER_V3_BFS_MAX_CELLS]) {
+  int total_cells = rows * cols;
+  if (total_cells > PLANNER_V3_BFS_MAX_CELLS || total_cells <= 0 || !occ_grid) {
+    return 0;
+  }
+
+  for (int i = 0; i < total_cells; ++i) {
+    dist[i] = INT_MAX;
+  }
+
+  int queue[PLANNER_V3_BFS_MAX_CELLS];
+  s_bfs_visit_stamp++;
+  uint32_t stamp = s_bfs_visit_stamp;
+
+  int head = 0;
+  int tail = 0;
+
+  int start_idx = start.row * cols + start.col;
+  if (start_idx < 0 || start_idx >= total_cells) {
+    return 0;
+  }
+  /* 起点本身不能是障碍或箱子 */
+  if (OCC_IS_OBSTACLE(occ_grid, cols, start.row, start.col) ||
+      OCC_HAS_BOX_EXCLUDING(occ_grid, cols, start.row, start.col, SIZE_MAX)) {
+    return 0;
+  }
+
+  queue[tail++] = start_idx;
+  s_bfs_visit_mark[start_idx] = stamp;
+  dist[start_idx] = 0;
+
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+
+  while (head < tail) {
+    if (head >= PLANNER_V3_BFS_MAX_CELLS) break;
+
+    int curr_idx = queue[head++];
+    int curr_row = curr_idx / cols;
+    int curr_col = curr_idx % cols;
+    int curr_dist = dist[curr_idx];
+
+    for (int d = 0; d < 4; ++d) {
+      int nr = curr_row + dirs[d][0];
+      int nc = curr_col + dirs[d][1];
+
+      if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc)) {
+        continue;
+      }
+
+      if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc)) {
+        continue;
+      }
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, SIZE_MAX)) {
+        continue;
+      }
+
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) {
+        continue;
+      }
+
+      if (s_bfs_visit_mark[next_idx] != stamp) {
+        s_bfs_visit_mark[next_idx] = stamp;
+        dist[next_idx] = curr_dist + 1;
+        if (tail < PLANNER_V3_BFS_MAX_CELLS) {
+          queue[tail++] = next_idx;
+        }
+      }
+    }
+  }
+
+  return 1;
+}
+
+// 全局BFS：从起点 source 开始，计算起点到每个可达格子的真实距离
+static int planner_v3_bfs_global_bfs_from_source(int rows, int cols, Point source,
+                                             const Point *obstacles, size_t obstacle_count,
+                                             const Point *boxes, size_t box_count,
+                                             int dist[PLANNER_V3_BFS_MAX_CELLS]) {
+  int total_cells = rows * cols;
+  if (total_cells > PLANNER_V3_BFS_MAX_CELLS || total_cells <= 0) {
+    return 0;
+  }
+  for (int i = 0; i < total_cells; ++i) {
+    dist[i] = INT_MAX;
+  }
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
+  int queue[PLANNER_V3_BFS_MAX_CELLS];
+  s_bfs_visit_stamp++;
+  uint32_t stamp = s_bfs_visit_stamp;
+  int head = 0;
+  int tail = 0;
+  int source_idx = source.row * cols + source.col;
+  queue[tail++] = source_idx;
+  s_bfs_visit_mark[source_idx] = stamp;
+  dist[source_idx] = 0;
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  while (head < tail) {
+    if (head >= PLANNER_V3_BFS_MAX_CELLS) break;
+    int curr_idx = queue[head++];
+    int curr_row = curr_idx / cols;
+    int curr_col = curr_idx % cols;
+    int curr_dist = dist[curr_idx];
+    for (int d = 0; d < 4; ++d) {
+      int nr = curr_row + dirs[d][0];
+      int nc = curr_col + dirs[d][1];
+      if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc)) continue;
+      if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc)) continue;
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, SIZE_MAX)) continue;
+      int next_idx = nr * cols + nc;
+      if (next_idx < 0 || next_idx >= total_cells) continue;
+      if (s_bfs_visit_mark[next_idx] != stamp) {
+        s_bfs_visit_mark[next_idx] = stamp;
+        dist[next_idx] = curr_dist + 1;
+        if (tail < PLANNER_V3_BFS_MAX_CELLS) queue[tail++] = next_idx;
+      }
+    }
+  }
   return 1;
 }
 
@@ -321,6 +511,9 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
     *path_len = 1;
     return 1;
   }
+
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
   
   // A*数据结构
   typedef struct {
@@ -331,34 +524,33 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
   
   int g_score[PLANNER_V3_BFS_MAX_CELLS];
   int parent[PLANNER_V3_BFS_MAX_CELLS];
-  uint8_t in_open[PLANNER_V3_BFS_MAX_CELLS];
-  uint8_t in_closed[PLANNER_V3_BFS_MAX_CELLS];
-  
+  s_astar_run_stamp += 2;
+  uint32_t open_mark = s_astar_run_stamp - 1;
+  uint32_t closed_mark = s_astar_run_stamp;
+
   for (int i = 0; i < total_cells; ++i) {
     g_score[i] = INT_MAX;
     parent[i] = -1;
-    in_open[i] = 0;
-    in_closed[i] = 0;
   }
-  
+
   // 简单的优先队列（数组实现）
   AStarNode open_set[PLANNER_V3_BFS_MAX_CELLS];
   int open_count = 0;
-  
+
   int start_idx = start.row * cols + start.col;
   int target_idx = target.row * cols + target.col;
-  
+
   // 检查起点到终点的距离是否有效
   if (dist[start_idx] == INT_MAX) {
     return 0;  // 起点无法到达终点
   }
-  
+
   g_score[start_idx] = 0;
   open_set[open_count].idx = start_idx;
   open_set[open_count].f_score = dist[start_idx];  // f = g + h = 0 + h
   open_set[open_count].car_to_push_dist = dist[start_idx];
   open_count++;
-  in_open[start_idx] = 1;
+  s_astar_mark[start_idx] = open_mark;
   
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   
@@ -382,9 +574,8 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
       open_set[i] = open_set[i + 1];
     }
     open_count--;
-    in_open[curr_idx] = 0;
-    in_closed[curr_idx] = 1;
-    
+    s_astar_mark[curr_idx] = closed_mark;
+
     // 到达目标
     if (curr_idx == target_idx) {
       // 回溯路径
@@ -421,10 +612,10 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         continue;
       }
       
-      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, nr, nc)) {
+      if (OCC_IS_OBSTACLE(occ_grid, cols, nr, nc)) {
         continue;
       }
-      if (planner_v3_bfs_is_box_at(boxes, box_count, nr, nc, box_count)) {
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, nr, nc, SIZE_MAX)) {
         continue;
       }
       
@@ -442,21 +633,21 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         if (!planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
           continue;
         }
-        if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+        if (OCC_IS_OBSTACLE(occ_grid, cols, push_row, push_col)) {
           continue;
         }
-        if (planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, SIZE_MAX)) {
+        if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_row, push_col, SIZE_MAX)) {
           continue;
         }
       }
       
-      if (in_closed[next_idx]) {
+      if (s_astar_mark[next_idx] == closed_mark) {
         continue;
       }
-      
+
       int tentative_g = g_score[curr_idx] + 1;
-      
-      if (!in_open[next_idx]) {
+
+      if (s_astar_mark[next_idx] != open_mark) {
         // 新节点
         g_score[next_idx] = tentative_g;
         parent[next_idx] = curr_idx;
@@ -474,7 +665,7 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
           open_set[open_count].f_score = f;
           open_set[open_count].car_to_push_dist = car_to_push_dist;
           open_count++;
-          in_open[next_idx] = 1;
+          s_astar_mark[next_idx] = open_mark;
         }
       } else if (tentative_g < g_score[next_idx]) {
         // 找到更好的路径
@@ -536,6 +727,8 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
                                                      size_t box_count, size_t moving_idx,
                                                      Point *path, size_t path_cap,
                                                      size_t *path_len, Point *out_push_pos) {
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   
   // 找到所有有效的推箱位
@@ -553,9 +746,9 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
     
     if (!planner_v3_bfs_in_bounds(rows, cols, push_r, push_c)) continue;
     if (!planner_v3_bfs_in_bounds(rows, cols, new_box_r, new_box_c)) continue;
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_r, push_c)) continue;
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_box_r, new_box_c)) continue;
-    if (planner_v3_bfs_is_box_at(boxes, box_count, new_box_r, new_box_c, moving_idx)) continue;
+    if (OCC_IS_OBSTACLE(occ_grid, cols, push_r, push_c)) continue;
+    if (OCC_IS_OBSTACLE(occ_grid, cols, new_box_r, new_box_c)) continue;
+    if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, new_box_r, new_box_c, moving_idx)) continue;
     
     // 检查推过去后箱子能否继续到目标
     if (planner_v3_bfs_can_reach_goal(rows, cols, obstacles, obstacle_count, boxes,
@@ -571,7 +764,13 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
     return 0;  // 没有有效的推箱位
   }
   
-  // 按距离排序推箱位
+  // 按车到推位的距离排序推箱位：
+  // 优化：只做一次从 car 出发的全局 BFS，然后直接读取每个推位的距离，
+  // 避免对每个推位单独做一遍 BFS。
+  int dist_from_car[PLANNER_V3_BFS_MAX_CELLS];
+  int have_dist_from_car = planner_v3_bfs_global_bfs_from_source(
+      rows, cols, car, obstacles, obstacle_count, boxes, box_count, dist_from_car);
+
   typedef struct {
     Point pos;
     int dist;
@@ -580,8 +779,13 @@ static int planner_v3_bfs_follow_box_with_global_astar(int rows, int cols, Point
   PushPosWithDist sorted_positions[4];
   for (int i = 0; i < valid_count; ++i) {
     sorted_positions[i].pos = valid_push_positions[i];
-    int dist = planner_v3_bfs_distance_between(rows, cols, car, valid_push_positions[i],
-                                               obstacles, obstacle_count, boxes, box_count);
+    int dist = INT_MAX;
+    if (have_dist_from_car) {
+      int idx = valid_push_positions[i].row * cols + valid_push_positions[i].col;
+      if (idx >= 0 && idx < rows * cols) {
+        dist = dist_from_car[idx];
+      }
+    }
     sorted_positions[i].dist = (dist == INT_MAX) ? INT_MAX / 100 : dist;
   }
   
@@ -768,10 +972,13 @@ static int planner_v3_bfs_push_box_with_strategy(
     }                                    \
   } while (0)
 
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+
   while (box.row != target.row || box.col != target.col) {
     if (step_count++ >= PLANNER_V3_BFS_MAX_GREEDY_STEPS) {
       return -5;
     }
+    planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, boxes, box_count, occ_grid);
 
     if (strategy == PLANNER_V3_BFS_STRATEGY_PATH) {
       if (!has_box_path || box_path_idx + 1 >= box_path_len) {
@@ -795,13 +1002,13 @@ static int planner_v3_bfs_push_box_with_strategy(
         SET_ERR(2, 7);
         return -6;
       }
-      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, next_in_path.row, next_in_path.col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+      if (OCC_IS_OBSTACLE(occ_grid, cols, next_in_path.row, next_in_path.col) ||
+          OCC_IS_OBSTACLE(occ_grid, cols, push_row, push_col)) {
         SET_ERR(2, 7);
         return -6;
       }
-      if (planner_v3_bfs_is_box_at(boxes, box_count, next_in_path.row, next_in_path.col, box_idx) ||
-          planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, box_idx)) {
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, next_in_path.row, next_in_path.col, box_idx) ||
+          OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_row, push_col, box_idx)) {
         SET_ERR(2, 7);
         return -6;
       }
@@ -879,6 +1086,23 @@ static int planner_v3_bfs_push_box_with_strategy(
     DirCandidate candidates[4];
     const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
 
+    /* 每步一次：从 target 的全局 BFS（不包含当前箱子），得到各格到 target 距离 */
+    Point temp_boxes_for_dist[PLANNER_V3_BFS_MAX_BOXES];
+    size_t temp_box_count = 0;
+    for (size_t j = 0; j < box_count; ++j) {
+      if (j == box_idx) continue;
+      if (boxes[j].row < 0 || boxes[j].col < 0) continue;
+      temp_boxes_for_dist[temp_box_count++] = boxes[j];
+    }
+    int dist_to_target[PLANNER_V3_BFS_MAX_CELLS];
+    int have_dist_to_target = planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles,
+        obstacle_count, temp_boxes_for_dist, temp_box_count, dist_to_target);
+
+    /* 每步一次：从 car 的全局 BFS（同布局），得到车到各格距离 */
+    int dist_from_car[PLANNER_V3_BFS_MAX_CELLS];
+    int have_dist_from_car = planner_v3_bfs_global_bfs_from_source(rows, cols, *car_pos, obstacles,
+        obstacle_count, boxes, box_count, dist_from_car);
+
     for (int i = 0; i < 4; ++i) {
       int dr = dirs[i][0];
       int dc = dirs[i][1];
@@ -897,12 +1121,12 @@ static int planner_v3_bfs_push_box_with_strategy(
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
         continue;
       }
-      if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_box_row, new_box_col) ||
-          planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_row, push_col)) {
+      if (OCC_IS_OBSTACLE(occ_grid, cols, new_box_row, new_box_col) ||
+          OCC_IS_OBSTACLE(occ_grid, cols, push_row, push_col)) {
         continue;
       }
-      if (planner_v3_bfs_is_box_at(boxes, box_count, new_box_row, new_box_col, box_idx) ||
-          planner_v3_bfs_is_box_at(boxes, box_count, push_row, push_col, box_idx)) {
+      if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, new_box_row, new_box_col, box_idx) ||
+          OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_row, push_col, box_idx)) {
         continue;
       }
 
@@ -917,27 +1141,10 @@ static int planner_v3_bfs_push_box_with_strategy(
       Point push_from = {push_row, push_col};
 
       int dist_after = INT_MAX / 100;
-      // 计算 dist_after 时，不把当前正在移动的箱子当作障碍
-      // 构建临时箱子数组（排除当前正在移动的箱子）
-      Point temp_boxes_for_dist[PLANNER_V3_BFS_MAX_BOXES];
-      size_t temp_box_count = 0;
-      for (size_t j = 0; j < box_count; ++j) {
-        if (j == box_idx) {
-          continue;  // 忽略当前正在移动的箱子
-        }
-        if (boxes[j].row < 0 || boxes[j].col < 0) {
-          continue;  // 忽略已完成的箱子
-        }
-        temp_boxes_for_dist[temp_box_count++] = boxes[j];
-      }
-      
-      // 重新计算不包含当前箱子的距离
-      int temp_target_dist[PLANNER_V3_BFS_MAX_CELLS];
-      if (planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
-                                                temp_boxes_for_dist, temp_box_count, temp_target_dist)) {
+      if (have_dist_to_target) {
         int idx = new_box_row * cols + new_box_col;
-        if (idx >= 0 && idx < rows * cols && temp_target_dist[idx] != INT_MAX) {
-          dist_after = temp_target_dist[idx];
+        if (idx >= 0 && idx < rows * cols && dist_to_target[idx] != INT_MAX) {
+          dist_after = dist_to_target[idx];
         }
       }
 
@@ -955,13 +1162,10 @@ static int planner_v3_bfs_push_box_with_strategy(
       }
 
       int car_to_push = INT_MAX / 100;
-      int car_to_push_dist[PLANNER_V3_BFS_MAX_CELLS];
-      if (planner_v3_bfs_global_bfs_from_target(rows, cols, push_from, obstacles,
-                                                obstacle_count, boxes,
-                                                box_count, car_to_push_dist)) {
-        int car_idx = car_pos->row * cols + car_pos->col;
-        if (car_idx >= 0 && car_idx < rows * cols && car_to_push_dist[car_idx] != INT_MAX) {
-          car_to_push = car_to_push_dist[car_idx];
+      if (have_dist_from_car) {
+        int push_idx = push_from.row * cols + push_from.col;
+        if (push_idx >= 0 && push_idx < rows * cols && dist_from_car[push_idx] != INT_MAX) {
+          car_to_push = dist_from_car[push_idx];
         }
       }
 
@@ -1133,6 +1337,68 @@ static size_t planner_v3_bfs_collect_boxes(int rows, int cols, const Point *boxe
   return kept;
 }
 
+/* 已有从车出发的 dist_map 与预构建的 occ_grid 时，对单个箱子仅扫描 4 个推位，
+ * 直接查表 dist_map[push_pos] 取最小值，避免为每个箱子/方向单独 BFS。 */
+static int planner_v3_bfs_score_car_to_box_given_dist_occ(int rows, int cols, size_t box_idx,
+                                       const Point *current_boxes, size_t box_count,
+                                       const int *dist_map, const uint8_t *occ_grid) {
+  if (!current_boxes || !dist_map || !occ_grid || box_idx >= box_count) {
+    return INT_MAX;
+  }
+  Point box = current_boxes[box_idx];
+  if (box.row < 0 || box.col < 0) {
+    return INT_MAX;
+  }
+  if (!planner_v3_bfs_in_bounds(rows, cols, box.row, box.col)) {
+    return INT_MAX;
+  }
+
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  int best = INT_MAX;
+  int total_cells = rows * cols;
+
+  for (int d = 0; d < 4; ++d) {
+    int dr = dirs[d][0];
+    int dc = dirs[d][1];
+    /* 推位 = box - dir，to = box + dir */
+    Point push_pos = (Point){ box.row - dr, box.col - dc };
+    if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
+      continue;
+    }
+    if (OCC_IS_OBSTACLE(occ_grid, cols, push_pos.row, push_pos.col)) {
+      continue;
+    }
+    if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_pos.row, push_pos.col, SIZE_MAX)) {
+      continue;
+    }
+
+    int new_box_row = box.row + dr;
+    int new_box_col = box.col + dc;
+    if (!planner_v3_bfs_in_bounds(rows, cols, new_box_row, new_box_col)) {
+      continue;
+    }
+    if (OCC_IS_OBSTACLE(occ_grid, cols, new_box_row, new_box_col)) {
+      continue;
+    }
+    if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, new_box_row, new_box_col, box_idx)) {
+      continue;
+    }
+    if (planner_v3_bfs_is_deadlock_occ(occ_grid, rows, cols, box_idx, new_box_row, new_box_col)) {
+      continue;
+    }
+
+    int push_idx = push_pos.row * cols + push_pos.col;
+    if (push_idx < 0 || push_idx >= total_cells) {
+      continue;
+    }
+    if (dist_map[push_idx] != INT_MAX && dist_map[push_idx] < best) {
+      best = dist_map[push_idx];
+    }
+  }
+
+  return best;
+}
+
 // 评分：车到箱子的 BFS 真实距离（按"到达该箱子任意推箱位"的最短距离计算）
 static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t box_idx,
                                        const Point *current_boxes, size_t box_count,
@@ -1149,6 +1415,8 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
     return INT_MAX;
   }
 
+  uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+  planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, current_boxes, box_count, occ_grid);
   const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
   int best = INT_MAX;
   for (int d = 0; d < 4; ++d) {
@@ -1159,10 +1427,10 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
     if (!planner_v3_bfs_in_bounds(rows, cols, push_pos.row, push_pos.col)) {
       continue;
     }
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, push_pos.row, push_pos.col)) {
+    if (OCC_IS_OBSTACLE(occ_grid, cols, push_pos.row, push_pos.col)) {
       continue;
     }
-    if (planner_v3_bfs_is_box_at(current_boxes, box_count, push_pos.row, push_pos.col, SIZE_MAX)) {
+    if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, push_pos.row, push_pos.col, SIZE_MAX)) {
       continue;
     }
     
@@ -1175,13 +1443,11 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
       continue;
     }
     
-    // 检查新位置是否在障碍上
-    if (planner_v3_bfs_is_obstacle(obstacles, obstacle_count, new_box_row, new_box_col)) {
+    if (OCC_IS_OBSTACLE(occ_grid, cols, new_box_row, new_box_col)) {
       continue;
     }
     
-    // 检查新位置是否在其他箱子上
-    if (planner_v3_bfs_is_box_at(current_boxes, box_count, new_box_row, new_box_col, box_idx)) {
+    if (OCC_HAS_BOX_EXCLUDING(occ_grid, cols, new_box_row, new_box_col, box_idx)) {
       continue;
     }
     
@@ -1469,8 +1735,14 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     }
     
     // 选择下一个要推的箱子：只依据车到箱子的BFS真实距离
+    // 优化：每轮仅 build 一次 occ_grid，做一次从车出发的全局 BFS，之后对每个候选箱子只扫描 4 个推位查 dist_map[push_pos]
     size_t selected_box_idx = SIZE_MAX;
     int best_car_dist = INT_MAX;
+    uint8_t occ_grid[PLANNER_V3_BFS_MAX_CELLS];
+    int dist_map[PLANNER_V3_BFS_MAX_CELLS];
+
+    planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, current_boxes, goal_count, occ_grid);
+    (void)planner_v3_bfs_global_bfs_from_point_use_occ(rows, cols, current_car, occ_grid, dist_map);
     
     for (size_t i = 0; i < new_goal_count; ++i) {
       // 找到对应的原始箱子索引
@@ -1487,10 +1759,9 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
         continue;
       }
       
-      // 计算车到箱子的BFS真实距离
-      int car_dist = planner_v3_bfs_score_car_to_box(
-          rows, cols, current_car, orig_idx, current_boxes, goal_count,
-          obstacles, obstacle_count);
+      // 对每个候选箱子只扫描 4 个推位，取最小 dist_map[push_pos] 作为车到箱子距离
+      int car_dist = planner_v3_bfs_score_car_to_box_given_dist_occ(
+          rows, cols, orig_idx, current_boxes, goal_count, dist_map, occ_grid);
       
       if (car_dist < best_car_dist) {
         best_car_dist = car_dist;
