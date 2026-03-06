@@ -30,6 +30,7 @@ typedef struct {
   int bomb_on_path_count;          // 上述数量，0..5
   int dropped_req1;                // 特殊路径：是否去掉要求1（1=去掉，0=未去掉）
   int dropped_req2;                // 特殊路径：是否去掉要求2（1=去掉，0=未去掉）
+  int dropped_req3;                // 特殊路径：是否去掉要求3（1=去掉，0=未去掉）
 } PlannerBoxPathOutput;
 
 // 所有箱子的路径输出结构
