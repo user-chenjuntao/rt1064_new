@@ -81,8 +81,6 @@ void LPUART1_IRQHandler(void)
 {
     if(kLPUART_RxDataRegFullFlag & LPUART_GetStatusFlags(LPUART1))
     {
-		extern void uart_rx_interrupt_handler();
-		uart_rx_interrupt_handler();
         // 接收中断
     #if DEBUG_UART_USE_INTERRUPT                        // 如果开启 debug 串口中断
         debug_interrupr_handler();                      // 调用 debug 串口接收处理函数 数据会被 debug 环形缓冲区读取

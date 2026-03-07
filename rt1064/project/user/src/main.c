@@ -1,55 +1,56 @@
 /*********************************************************************************************************************
-* RT1064DVL6A Opensourec Library 即（RT1064DVL6A 开源库）是一个基于官方 SDK 接口的第三方开源库
-* Copyright (c) 2022 SEEKFREE 逐飞科技
+* RT1064DVL6A Opensourec Library ?(RT1064DVL6A ???)??????? SDK ?????????
+* Copyright (c) 2022 SEEKFREE ????
 * 
-* 本文件是 RT1064DVL6A 开源库的一部分
+* ???? RT1064DVL6A ???????
 * 
-* RT1064DVL6A 开源库 是免费软件
-* 您可以根据自由软件基金会发布的 GPL（GNU General Public License，即 GNU通用公共许可证）的条款
-* 即 GPL 的第3版（即 GPL3.0）或（您选择的）任何后来的版本，重新发布和/或修改它
+* RT1064DVL6A ??? ?????
+* ??????????????? GPL(GNU General Public License,? GNU???????)???
+* ? GPL ??3?(? GPL3.0)?(????)???????,?????/????
 * 
-* 本开源库的发布是希望它能发挥作用，但并未对其作任何的保证
-* 甚至没有隐含的适销性或适合特定用途的保证
-* 更多细节请参见 GPL
+* ????????????????,???????????
+* ????????????????????
+* ??????? GPL
 * 
-* 您应该在收到本开源库的同时收到一份 GPL 的副本
-* 如果没有，请参阅<https://www.gnu.org/licenses/>
+* ????????????????? GPL ???
+* ????,???<https://www.gnu.org/licenses/>
 * 
-* 额外注明：
-* 本开源库使用 GPL3.0 开源许可证协议 以上许可申明为译文版本
-* 许可申明英文版在 libraries/doc 文件夹下的 GPL3_permission_statement.txt 文件中
-* 许可证副本在 libraries 文件夹下 即该文件夹下的 LICENSE 文件
-* 欢迎各位使用并传播本程序 但修改内容时必须保留逐飞科技的版权声明（即本声明）
+* ????:
+* ?????? GPL3.0 ??????? ???????????
+* ???????? libraries/doc ????? GPL3_permission_statement.txt ???
+* ?????? libraries ???? ??????? LICENSE ??
+* ???????????? ???????????????????(????)
 * 
-* 文件名称          main
-* 公司名称          成都逐飞科技有限公司
-* 版本信息          查看 libraries/doc 文件夹内 version 文件 版本说明
-* 开发环境          IAR 8.32.4 or MDK 5.33
-* 适用平台          RT1064DVL6A
-* 店铺链接          https://seekfree.taobao.com/
+* ????          main
+* ????          ??????????
+* ????          ?? libraries/doc ???? version ?? ????
+* ????          IAR 8.32.4 or MDK 5.33
+* ????          RT1064DVL6A
+* ????          https://seekfree.taobao.com/
 * 
-* 修改记录
-* 日期              作者                备注
+* ????
+* ??              ??                ??
 * 2022-09-21        SeekFree            first version
 ********************************************************************************************************************/
 
 #include "zf_common_headfile.h"
+#include "assigned_box_planner_greedy_3.h"
 
 
-#define IPS200_TYPE     (IPS200_TYPE_SPI)                                 // 并口两寸屏 这里宏定义填写 IPS200_TYPE_PARALLEL8
-                                                                                // SPI 两寸屏 这里宏定义填写 IPS200_TYPE_SPI
+#define IPS200_TYPE     (IPS200_TYPE_SPI)                                 // ????? ??????? IPS200_TYPE_PARALLEL8
+                                                                                // SPI ??? ??????? IPS200_TYPE_SPI
 #define PIT_PRIORITY_0    (PIT_IRQn)
 #define PIT_PRIORITY_1    (PIT_IRQn)
 #define PIT_PRIORITY_2    (PIT_IRQn)
 
 
 
-// 打开新的工程或者工程移动了位置务必执行以下操作
-// 第一步 关闭上面所有打开的文件
-// 第二步 project->clean  等待下方进度条走完
+// ???????????????????????
+// ??? ???????????
+// ??? project->clean  ?????????
 
-// 本例程是开源库移植用空工程
-
+// ?????????????
+uint16_t t=0;
 int v1= 0;
 int v2= 0;
 int speed_base = 350;//122 245
@@ -66,36 +67,70 @@ uint16 timer_box_cnt = 0;
 //	{0,1},{0,2},{0,3},{1,0},{4,7},
 //	{3,7},{6,2},{6,6}
 //};
+/*PlannerPointV3_BFS car = {1, 2};
+PlannerPointV3_BFS boxes[] = {
+    {1, 7},
+    {7, 4},
+    {10, 4},
+};
+PlannerPointV3_BFS targets[] = {
+    {9, 5},
+    {9, 6},
+    {9, 7},
+};
+PlannerPointV3_BFS obstacles[] = {
+    {5, 1},  {6, 1},  {7, 1},  {8, 1},
+    {0, 7},  {2, 7},  {3, 7},  {4, 7},
+    {4, 6},  {4, 5},  {5, 5},  {6, 5},
+    {7, 5},  {8, 5},  {8, 6},  {8, 7},
+    {8, 8},  {9, 8},  {10, 8}, {11, 8},
+    {12, 8}, {12, 7}, {12, 6}, {12, 5},
+    {12, 4}, {12, 3}, {11, 3}, {10, 3},
+    {10, 5}, {10, 6}, {1, 9},
+};*/
+PlannerPointV3_BFS car = {6,0};
+
+PlannerPointV3_BFS boxes[] = {
+    {7,2}, {7,10}, {8,1}
+};
+PlannerPointV3_BFS targets[] = {
+    {0,13}, {3,1}, {9,5}
+};  // ?????????????
+
+PlannerPointV3_BFS obstacles[] = {
+
+    {0,1}, {0,5}, {0,8}, {1,3}, {1,6}, {1,8}, {1,9}, {1,10}, {1,11}, {2,0}, {2,2}, {2,3}, {2,4}, {2,6}, {2,8}, {3,2}, {3,4}, {3,6}, {3,8}, {3,11}, {4,1}, {4,2}, {4,4}, {5,2}, {5,10}, {5,11}, {6,11}, {7,4}, {8,4}, {8,5}, {8,6}, {8,7}, {8,8}, {8,9}, {8,10}, {8,11}, {9,4}
 
 
-PlannerPointV3_Bomb bombs[] = {{3, 3}};
+};//
+PlannerPointV3_BFS bombs[] = {
+	{6,1}, {6,9}, {7,11}
+
+};
 	//
 //Point car = {5,1};
 size_t steps;
-int res;
+int res=100;
 PlannerPointV3_BFS path[GREEDY_AREA];
 size_t used_bomb_count = 0;
 size_t box_target_mapping[100];
-PlannerChainInfo chain_info;
+//PlannerChainInfo chain_info;
 PlannerAllBoxPaths first_paths, final_paths;
-size_t used_bombs[1];
-PlannerBoxOverlap overlaps[PLANNER_V3_BFS_MAX_BOXES];
+//PlannerBoxOverlap overlaps[PLANNER_V3_BFS_MAX_BOXES];
 
-Point corner_path[50];   // 拐点缓冲区
-size_t corner_steps = 0;   // 拐点数量
+Point corner_path[50];   // ?????
+size_t corner_steps = 0;   // ????
 
-// 重构链状态信息（在assigned_box_planner_greedy_2.c中定义）
-extern PlannerRebuildChainStatus g_rebuild_chain_status;
+// ???????(?assigned_box_planner_greedy_2.c???)
+//extern PlannerRebuildChainStatus g_rebuild_chain_status;
 
-// 数组数量变量
+// ??????
 size_t boxes_count = 0;
 size_t targets_count = 0;
 size_t obstacles_count = 0;
 size_t bombs_count = 0;
 
-uint8 data_control_flag = 0;
-
-// 读取数组数量的函数
+// ?????????
 void read_array_counts(void)
 {
     boxes_count = sizeof(boxes) / sizeof(boxes[0]);
@@ -104,20 +139,39 @@ void read_array_counts(void)
     bombs_count = sizeof(bombs) / sizeof(bombs[0]);
 }
 
+// 生成 size_t 数组的下一个排列（字典序），返回 1 表示有下一排列，0 表示已是最后一个
+static int next_permutation(size_t *arr, size_t n)
+{
+    if (n <= 1) return 0;
+    size_t i = n - 1;
+    while (i > 0 && arr[i - 1] >= arr[i]) i--;
+    if (i == 0) return 0;
+    size_t j = n - 1;
+    while (arr[j] <= arr[i - 1]) j--;
+    size_t t = arr[i - 1];
+    arr[i - 1] = arr[j];
+    arr[j] = t;
+    for (size_t k = i, e = n - 1; k < e; k++, e--) {
+        t = arr[k];
+        arr[k] = arr[e];
+        arr[e] = t;
+    }
+    return 1;
+}
+
 int main(void)
 {
-    clock_init(SYSTEM_CLOCK_600M);  // 不可删除
-    debug_init();                   // 调试端口初始化
+    clock_init(SYSTEM_CLOCK_600M);  // ????
+    debug_init();                   // ???????
 
-    // 读取数组数量
+    // ??????
     read_array_counts();
     
-    // 此处编写用户代码 例如外设初始化代码等
-    system_delay_ms(300);           //等待主板其他外设上电完成
-    uart_blob_init();
+    // ???????? ??????????
+    system_delay_ms(300);           //????????????
 	flash_init();
 	menu_init();
-	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
+//	uart_init(UART_2, 115200, UART2_TX_B18, UART2_RX_B19);
     ips200_show_string(0, 0, "mt9v03x init.");
 /*    while(1)
     {
@@ -125,7 +179,7 @@ int main(void)
             ips200_show_string(0, 16, "mt9v03x reinit.");
         else
             break;
-        system_delay_ms(500);                                                   // 短延时快速闪灯表示异常
+        system_delay_ms(500);                                                   // ???????????
     }*/
 	key_init(20);
 	motor_init();
@@ -141,27 +195,114 @@ int main(void)
 	PID_Init(&Camera_y_pid, &Camera_y_PidInitStruct);
 	PID_Init(&Gyro_rotate_pid, &Gyro_Rotate_PidInitStruct);
 	Kinematics_Init();
-
-	
-	
-
 	imu963ra_init();
 	Attitude_Init();
-	pit_ms_init(PIT_CH0, 20);                                                  // 初始化 PIT_CH0 为周期中断 20ms 周期
-    interrupt_set_priority(PIT_PRIORITY_0, 2);                                    // 设置 PIT0 对周期中断的中断优先级为 2
-	pit_ms_init(PIT_CH1, 10);                                                  // 初始化 PIT_CH1 为周期中断 10ms 周期
-    interrupt_set_priority(PIT_PRIORITY_1, 1);                                    // 设置 PIT1 对周期中断的中断优先级为 1
-	pit_ms_init(PIT_CH2, 2);                                                  // 初始化 PIT_CH2 为周期中断 2ms 周期
-    interrupt_set_priority(PIT_PRIORITY_2, 0);                                    // 设置 PIT2 对周期中断的中断优先级为 0
-    interrupt_set_priority(LPUART1_IRQn, 3);  // 设置中断优先级（中等）
+	pit_ms_init(PIT_CH0, 20);                                                  // ??? PIT_CH0 ????? 20ms ??
+    interrupt_set_priority(PIT_PRIORITY_0, 2);                                    // ?? PIT0 ???????????? 2
+	pit_ms_init(PIT_CH1, 10);                                                  // ??? PIT_CH1 ????? 10ms ??
+    interrupt_set_priority(PIT_PRIORITY_1, 1);                                    // ?? PIT1 ???????????? 1
+	pit_ms_init(PIT_CH2, 1);                                                  // ??? PIT_CH2 ????? 2ms ??
+    interrupt_set_priority(PIT_PRIORITY_2, 0);                                    // ?? PIT2 ???????????? 0
+    interrupt_set_priority(LPUART1_IRQn, 3);  // ???????(??)
     interrupt_global_enable(0);
-	ips200_show_string(0, 16, "init success.");
+
+	// 对 manual 的排列全部尝试，取 steps 最小的成功结果
+	size_t manual[boxes_count];  // 至少容纳 boxes_count，此处取 8
+	size_t best_manual[boxes_count];
+	size_t best_steps = (size_t)-1;   // 未成功时保持最大值
+	int best_res = -1;
+	PlannerPointV3_BFS best_path[GREEDY_AREA];
+	size_t best_box_target_mapping[100];
+	static PlannerAllBoxPaths best_final_paths;
+	static PlannerAllBoxPaths best_special_paths;
+	for (size_t i = 0; i < boxes_count; i++)
+		manual[i] = i;
+	do {
+		res = plan_boxes_greedy_v3_manual_assignment(
+							10, 14, car,
+	                        boxes, boxes_count,
+	                        targets, targets_count,
+	                        bombs, bombs_count,
+	                        obstacles, obstacles_count,
+							manual,
+	                        path, GREEDY_AREA, &steps,
+	                        box_target_mapping, &final_paths);
+		if (res == 0 && steps < best_steps) {
+			best_steps = steps;
+			memcpy(best_manual, manual, sizeof(manual));
+			best_res = 0;
+			for (size_t k = 0; k < GREEDY_AREA; k++) best_path[k] = path[k];
+			for (size_t k = 0; k < boxes_count; k++) best_box_target_mapping[k] = box_target_mapping[k];
+			best_final_paths = final_paths;
+		}
+	} while (next_permutation(manual, boxes_count));
+	// 若至少有一次成功，采用步数最少的那次
+	if (best_res == 0) {
+		res = best_res;
+		steps = best_steps;
+		for (size_t k = 0; k < GREEDY_AREA; k++) path[k] = best_path[k];
+		for (size_t k = 0; k < boxes_count; k++) box_target_mapping[k] = best_box_target_mapping[k];
+		final_paths = best_final_paths;
+		/*res = plan_boxes_greedy_v3_manual_assignment(
+							10, 14, car,
+	                        boxes, boxes_count,
+	                        targets, targets_count,
+	                        bombs, bombs_count,
+	                        obstacles, obstacles_count,
+							best_manual,
+	                        path, GREEDY_AREA, &steps,
+	                        box_target_mapping, &final_paths);*/
+	}
+	/*manual[0] = 2; manual[1] = 0; manual[2] = 1;  // 固定分配，测试用
+	res = plan_boxes_greedy_v3_manual_assignment(
+							10, 14, car,
+	                        boxes, boxes_count,
+	                        targets, targets_count,
+	                        bombs, bombs_count,
+	                        obstacles, obstacles_count,
+							manual,
+	                        path, GREEDY_AREA, &steps,
+	                        box_target_mapping, &final_paths);*/
+// ret == 0 成功；ret == -11 表示分配无效（目标越界或重复）
+	// ????????????? v3
+	/*res = plan_boxes_greedy_v3(10, 14, car,
+	                        boxes, boxes_count,
+	                        targets, targets_count,
+	                       	bombs, bombs_count,
+	                        obstacles, obstacles_count,
+	                        path, GREEDY_AREA, &steps,
+	                        box_target_mapping, &final_paths);*/
+
+	//res = plan_boxes_greedy_v3_bfs(14, 10, car, boxes, boxes_count,targets,targets_count,obstacles, obstacles_count, path, GREEDY_AREA, &steps, box_target_mapping, &final_paths);
+
+	path_follow_init(0.40f, (float)pulse_per_meter);
+	
+		if (res == 0)
+	{
+		ips200_show_string(0, 16, "path init.");
+		
+	}
+	else
+	{
+		ips200_show_string(0, 16, "path reinit.");
+	}
+	corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
+
+	if (corner_steps > 0)
+	{
+		// ???????????
+		path_follow_set_path(corner_path, corner_steps);
+	}
+
+	
+	ips200_show_string(0, 32, "init success.");
 //	system_delay_ms(1000);
-    // 此处编写用户代码 例如外设初始化代码等
+    // ???????? ??????????
     while(1)
     {
-		process_blob_data();
-       // 此处编写需要循环执行的代码
+		ips200_show_uint(0, 100, t , 5);
+		color_distance_handle();
+        // ?????????????
 		/*
 		if(mt9v03x_finish_flag)
 		{
@@ -170,40 +311,6 @@ int main(void)
 		}
 		*/
 		
-		// 使用实际接收到的数据计数，并检查数据接收是否完成
-		extern size_t actual_obstacles_count;
-		extern size_t actual_boxes_count;
-		extern size_t actual_targets_count;
-		extern bool data_reception_complete;
-		
-		if (data_reception_complete && data_control_flag == 0)
-		{
-			// 使用实际接收到的数据数量，而不是数组大小
-			res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, actual_boxes_count, 
-			                              targets, actual_targets_count, 
-			                              obstacles, actual_obstacles_count, 
-			                              path, GREEDY_AREA, &steps, box_target_mapping, 
-			                              &chain_info, &first_paths, &final_paths, overlaps);
-			path_follow_init(0.40f, (float)pulse_per_meter);
-			
-			// res = plan_boxes_greedy_v3_bfs(15, 11, car, boxes, 3,targets,3,obstacles, 25, path, GREEDY_AREA, &steps, box_target_mapping, &chain_info, &first_paths, &final_paths, overlaps);
-			if (res == 0)
-			{
-				ips200_show_string(0, 250, "path init.");
-			}
-			else
-			{
-				ips200_show_string(0, 250, "path reinit.");
-			}
-			corner_steps = path_follow_extract_corners(path, steps, corner_path, 50);
-
-			if (corner_steps > 0)
-			{
-				// 使用提取的拐点设置路径
-				path_follow_set_path(corner_path, corner_steps);
-			}
-			data_control_flag = 1;
-		}
 		
 		
         menu_switch();
@@ -213,23 +320,23 @@ int main(void)
 			menu_display();
 //		}
 		image_data_clear();
-        // 此处编写需要循环执行的代码
+        // ?????????????
     }
 }
 
 void pit_0_handler (void)
 {
-    key_scanner();                                                              // 周期中断触发 标志位置位
+    key_scanner();                                                              // ?????? ?????
 }
 
 void pit_1_handler (void)
 {
 //    encoder_read_filtered(&encoder_data_1, &encoder_data_2, &encoder_data_3, &encoder_data_4);
 	encoder_get();
-    distance_speed_strategy();//计算出的四个速度从0到3，分别是上左，上右，下左，下右
+    distance_speed_strategy();//?????????0?3,?????,??,??,??
 	// speed_encoder[0]=25;
     if (car_go_flag == 1 && car_stop_flag == 0)
-    {//修改位置在这里
+    {//???????
         motor_control(speed_encoder);
 		// motor_pwm(straight_speed,0,0,0);
     }
@@ -247,18 +354,12 @@ void pit_1_handler (void)
 void pit_2_handler (void)
 {
 	//ICM_hubu();
-	Attitude_Calculate();
-	
+	//Attitude_Calculate();
+	if(res!=0){
+
+		t+=1;
+
+	}
 
 	                                                                 
-}
-
-
-void uart_rx_interrupt_handler(void) {
-    
-    // 查询式读取1字节（无数据则直接退出，确保中断快速执行）
-    if (uart_query_byte(UART_INDEX, &get_data)) {
-        // 用fifo_write_buffer写入1字节（length=1，地址为get_data的地址）
-        fifo_write_buffer(&uart_data_fifo, &get_data, 1);
-    }
 }
