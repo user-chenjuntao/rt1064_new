@@ -11,6 +11,15 @@ extern "C" {
 extern int last_err_stage;   // 错误阶段
 extern int last_err_detail;  // 错误详情
 
+/* last_err_detail common / v2 codes */
+#define LAST_ERR_DETAIL_NONE                              0
+#define LAST_ERR_DETAIL_V2_NO_FEASIBLE_TARGET            1
+#define LAST_ERR_DETAIL_V2_PATH_NOT_CONTINUOUS           2
+#define LAST_ERR_DETAIL_V2_NO_CANDIDATE_BOX              3
+#define LAST_ERR_DETAIL_V2_REASSIGN_FAILED               4
+#define LAST_ERR_DETAIL_V2_SINGLE_BOX_BFS_FAILED         6
+#define LAST_ERR_DETAIL_V2_PUSH_SIM_BOTH_FAILED          7
+
 typedef Point PlannerPointV3_BFS;
 
 

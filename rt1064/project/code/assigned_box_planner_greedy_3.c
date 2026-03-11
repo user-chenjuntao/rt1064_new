@@ -4,7 +4,7 @@
 *
 * 主要特性 :
 *   1. 支持多箱、多目标、多炸弹与障碍物的综合路径规划
-*   2. 通过匈牙利算法进行箱子→目标的自动分配（也支持手动映射）
+*   2. 通过贪心策略进行箱子→目标的自动分配（也支持手动映射）
 *   3. 使用 BFS 预计算距离图，并结合 A* 进行小车及箱子（炸弹）路径搜索
 *   4. 内置多种“特殊路径”和回滚机制，以提升在复杂场景下的成功率与可解释性
 /*********************************************************************************************************************/
@@ -42,6 +42,30 @@ int planner_v3_push_only_bfs_astar_path = 0;
 #define OCC_NO_BOX_INDEX  15
 #define MAX_BOMBS 5          // 支持的最大炸弹数量
 
+#define PLANNER_V3_BFS_FORBIDDEN_EDGE_BITS  (PLANNER_V3_BFS_MAX_CELLS * 4)
+#define PLANNER_V3_BFS_FORBIDDEN_EDGE_WORDS ((PLANNER_V3_BFS_FORBIDDEN_EDGE_BITS + 31) / 32)
+
+static inline int planner_v3_bfs_forbidden_edge_test(const uint32_t *bits, int edge_idx) {
+  if (!bits || edge_idx < 0 || edge_idx >= PLANNER_V3_BFS_FORBIDDEN_EDGE_BITS) {
+    return 0;
+  }
+  int word_idx = edge_idx >> 5;
+  int bit_idx = edge_idx & 31;
+  return (bits[word_idx] & (1u << bit_idx)) != 0;
+}
+
+static inline void planner_v3_bfs_forbidden_edge_set(uint32_t *bits, int edge_idx) {
+  if (!bits || edge_idx < 0 || edge_idx >= PLANNER_V3_BFS_FORBIDDEN_EDGE_BITS) {
+    return;
+  }
+  int word_idx = edge_idx >> 5;
+  int bit_idx = edge_idx & 31;
+  bits[word_idx] |= (1u << bit_idx);
+}
+
+/* Optional O(1) forbidden-edge bitset used by special-path A* replanning. */
+static const uint32_t *s_astar_forbidden_edge_bits = NULL;
+
 
 static Point s_blocked_bombs[MAX_BOMBS];
 static size_t s_blocked_bomb_count = 0;
@@ -74,7 +98,6 @@ typedef struct PlannerV3AstarScratch {
 static PlannerV3AstarScratch s_astar_scratch;
 
 typedef struct PlannerV3PlanLoopScratch {
-  Point saved_path_buffer[PLANNER_V3_BFS_MAX_CELLS];
   Point saved_obstacles_a[200];
   Point saved_obstacles_b[200];
   int target_dist[PLANNER_V3_BFS_MAX_CELLS];
@@ -193,7 +216,7 @@ static inline int OCC_HAS_BOX_EXCLUDING_IMPL(const uint8_t *g, int cols, int row
 #define PUSH_BOMB_SAVE_PATH_MAX 400
 #define PLANNER_V3_BFS_MAX_CANDIDATE_TARGETS 9
 
-// 特殊路径失败时的细分错误码（当 last_err_detail == 131 时使用）
+// 特殊路径失败时的细分错误码（当 last_err_detail == LAST_ERR_DETAIL_V3_SPECIAL_PATH_FAILED 时使用）
 
 #define SPECIAL_PATH_FAIL_NONE 400
 #define SPECIAL_PATH_FAIL_REQ1 401
@@ -236,9 +259,8 @@ static inline int OCC_HAS_BOX_EXCLUDING_IMPL(const uint8_t *g, int cols, int row
 #define FIRST_PUSH_BOMB_FAIL_ALL_ATTEMPTS_FAILED 508
 #define FIRST_PUSH_BOMB_FAIL_PATH_BUFFER_OVERFLOW 509
 
-// 匈牙利算法内部使用的最大规模与“无穷大”代价值
-#define PLANNER_V3_HUNGARIAN_MAX_N 32
-#define PLANNER_V3_HUNGARIAN_INF 1000000
+// 大代价值常量（用于不可达场景的兜底比较）
+#define PLANNER_V3_LARGE_COST 1000000
 
 
 
@@ -1062,7 +1084,12 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
         continue;
       }
 
-      if (forbidden_count > 0 && forbidden_from && forbidden_to) {
+      if (s_astar_forbidden_edge_bits) {
+        int edge_idx = curr_idx * 4 + d;
+        if (planner_v3_bfs_forbidden_edge_test(s_astar_forbidden_edge_bits, edge_idx)) {
+          continue;
+        }
+      } else if (forbidden_count > 0 && forbidden_from && forbidden_to) {
         int skip_edge = 0;
         for (size_t fb = 0; fb < forbidden_count && !skip_edge; ++fb) {
           if (forbidden_from[fb].row == curr_row && forbidden_from[fb].col == curr_col &&
@@ -1070,7 +1097,9 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
             skip_edge = 1;
           }
         }
-        if (skip_edge) continue;
+        if (skip_edge) {
+          continue;
+        }
       }
       
       int car_to_push_dist = dist[next_idx];
@@ -1176,27 +1205,110 @@ static int planner_v3_bfs_astar_with_dist(int rows, int cols, Point start, Point
   return 0;
 }
 
-// ???????????????????????? global_bfs_from_target ???
+// 计算任意两点最短距离：从 start 做 BFS，命中 target 立即返回（early-exit）
 static int planner_v3_bfs_distance_between(int rows, int cols, Point start, Point target,
                                            const Point *obstacles, size_t obstacle_count,
                                            const Point *bombs, size_t bomb_count,
                                            const Point *boxes, size_t box_count,
                                            int include_bombs,
                                            const uint8_t *occ_prebuilt) {
+  int total_cells = rows * cols;
+  if (total_cells > PLANNER_V3_BFS_MAX_CELLS || total_cells <= 0) {
+    return INT_MAX;
+  }
   if (!planner_v3_bfs_in_bounds(rows, cols, start.row, start.col) ||
       !planner_v3_bfs_in_bounds(rows, cols, target.row, target.col)) {
     return INT_MAX;
   }
-  int dist[PLANNER_V3_BFS_MAX_CELLS];
-  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
-                                             bombs, bomb_count, boxes, box_count, dist, include_bombs, occ_prebuilt)) {
+  if (start.row == target.row && start.col == target.col) {
+    return 0;
+  }
+
+  uint8_t *occ_buf = s_bfs_scratch.occ_buf;
+  const uint8_t *occ = occ_prebuilt;
+  if (!occ) {
+    planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, bombs, bomb_count, boxes, box_count, 1, occ_buf);
+    occ = occ_buf;
+  }
+
+  if (include_bombs) {
+    if (planner_v3_bfs_is_obstacle(occ, cols, start.row, start.col)) {
+      return INT_MAX;
+    }
+  } else {
+    if (planner_v3_bfs_is_obstacle_no_bomb(occ, cols, start.row, start.col)) {
+      return INT_MAX;
+    }
+  }
+  if (planner_v3_bfs_is_box_at(occ, cols, start.row, start.col, SIZE_MAX)) {
     return INT_MAX;
   }
-  int idx = start.row * cols + start.col;
-  if (idx < 0 || idx >= rows * cols) {
+
+  int start_idx = start.row * cols + start.col;
+  int target_idx = target.row * cols + target.col;
+  if (start_idx < 0 || start_idx >= total_cells || target_idx < 0 || target_idx >= total_cells) {
     return INT_MAX;
   }
-  return dist[idx];
+
+  int *queue = s_bfs_scratch.queue;
+  s_bfs_visit_stamp++;
+  uint32_t stamp = s_bfs_visit_stamp;
+  int head = 0;
+  int tail = 0;
+  int depth = 0;
+
+  queue[tail++] = start_idx;
+  s_bfs_visit_mark[start_idx] = stamp;
+
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  while (head < tail) {
+    int level_end = tail;
+    while (head < level_end) {
+      int curr_idx = queue[head++];
+      int curr_row = curr_idx / cols;
+      int curr_col = curr_idx % cols;
+
+      for (int d = 0; d < 4; ++d) {
+        int nr = curr_row + dirs[d][0];
+        int nc = curr_col + dirs[d][1];
+        if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc)) {
+          continue;
+        }
+        int next_idx = nr * cols + nc;
+        if (next_idx < 0 || next_idx >= total_cells) {
+          continue;
+        }
+        if (s_bfs_visit_mark[next_idx] == stamp) {
+          continue;
+        }
+
+        int blocked = 0;
+        if (include_bombs) {
+          blocked = planner_v3_bfs_is_obstacle(occ, cols, nr, nc);
+        } else {
+          blocked = planner_v3_bfs_is_obstacle_no_bomb(occ, cols, nr, nc);
+        }
+        if (!blocked && planner_v3_bfs_is_box_at(occ, cols, nr, nc, SIZE_MAX)) {
+          blocked = 1;
+        }
+
+        if (next_idx == target_idx) {
+          return depth + 1;
+        }
+        if (blocked) {
+          continue;
+        }
+
+        s_bfs_visit_mark[next_idx] = stamp;
+        if (tail < PLANNER_V3_BFS_MAX_CELLS) {
+          queue[tail++] = next_idx;
+        }
+      }
+    }
+    depth++;
+  }
+
+  return INT_MAX;
 }
 
 // ?��????????????????????? 1 ?????????
@@ -1300,40 +1412,65 @@ static int planner_v3_bfs_validate_boundary_path(int rows, int cols, Point bound
     return 0;
   }
 
+  // 仅做“推位合理性”检测：至少存在一个可行首推方向，且车可到该推位。
+  uint8_t occ_local[PLANNER_V3_BFS_MAX_CELLS];
+  const uint8_t *occ = occ_prebuilt;
+  if (!occ) {
+    planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, bombs, bomb_count, boxes, box_count, 1, occ_local);
+    occ = occ_local;
+  }
 
-  Point temp_boxes[PLANNER_V3_BFS_MAX_BOXES];
-  size_t temp_count = 0;
-  for (size_t i = 0; i < box_count; ++i) {
-    if (i == moving_idx) {
+  Point boxes_for_car[PLANNER_V3_BFS_MAX_BOXES];
+  size_t bc = (box_count < PLANNER_V3_BFS_MAX_BOXES) ? box_count : PLANNER_V3_BFS_MAX_BOXES;
+  for (size_t i = 0; i < bc; ++i) {
+    boxes_for_car[i] = boxes[i];
+  }
+  if (moving_idx < bc) {
+    boxes_for_car[moving_idx] = boundary_pos;
+  }
+
+  const int dirs[4][2] = {{-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+  for (int d = 0; d < 4; ++d) {
+    int nr = boundary_pos.row + dirs[d][0];
+    int nc = boundary_pos.col + dirs[d][1];
+    int pr = boundary_pos.row - dirs[d][0];
+    int pc = boundary_pos.col - dirs[d][1];
+    if (!planner_v3_bfs_in_bounds(rows, cols, nr, nc) ||
+        !planner_v3_bfs_in_bounds(rows, cols, pr, pc)) {
       continue;
     }
-    if (boxes[i].row < 0 || boxes[i].col < 0) {
+
+    if (include_bombs) {
+      if (planner_v3_bfs_is_obstacle(occ, cols, nr, nc) ||
+          planner_v3_bfs_is_obstacle(occ, cols, pr, pc)) {
+        continue;
+      }
+    } else {
+      if (planner_v3_bfs_is_obstacle_no_bomb(occ, cols, nr, nc) ||
+          planner_v3_bfs_is_obstacle_no_bomb(occ, cols, pr, pc)) {
+        continue;
+      }
+    }
+    if (planner_v3_bfs_is_box_at(occ, cols, nr, nc, moving_idx) ||
+        planner_v3_bfs_is_box_at(occ, cols, pr, pc, moving_idx)) {
       continue;
     }
-    temp_boxes[temp_count++] = boxes[i];
-  }
-  
 
-  int dist[PLANNER_V3_BFS_MAX_CELLS];
-  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
-                                             bombs, bomb_count, temp_boxes, temp_count, dist, include_bombs, NULL)) {
-    return 0;
-  }
-  
+    Point next_pos = {nr, nc};
+    if (!planner_v3_bfs_can_reach_goal(rows, cols, obstacles, obstacle_count, bombs, bomb_count,
+                                       boxes, box_count, moving_idx, next_pos, target, include_bombs, occ_prebuilt)) {
+      continue;
+    }
 
-  Point path[PLANNER_V3_BFS_MAX_PATH_LEN];
-  size_t path_len = 0;
-
-  if (!planner_v3_bfs_astar_with_dist(rows, cols, boundary_pos, target,
-                                      obstacles, obstacle_count,
-                                      bombs, bomb_count,
-                                      temp_boxes, temp_count, dist,
-                                      path, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len,
-                                      include_bombs,
-                                      1, 0, car_pos, 0, NULL, NULL, 0, NULL)) {
-    return 0;
+    int car_dist = planner_v3_bfs_distance_between(rows, cols, car_pos, (Point){pr, pc},
+                                                    obstacles, obstacle_count, bombs, bomb_count,
+                                                    boxes_for_car, bc, include_bombs, NULL);
+    if (car_dist != INT_MAX) {
+      return 1;
+    }
   }
-  return 1;
+
+  return 0;
 }
 
 // ��?�A????��????????????????????��??push_from?????????????????????
@@ -1621,10 +1758,9 @@ static int planner_v3_bfs_special_dir_to_index(int dr, int dc) {
 static int planner_v3_bfs_special_add_forbidden_edge(
     int rows, int cols,
     Point from, Point to,
-    uint8_t *forbidden_edge_mark,
-    Point *forbidden_from, Point *forbidden_to,
+    uint32_t *forbidden_edge_bits,
     size_t *forbidden_count, size_t forbidden_cap) {
-  if (!forbidden_edge_mark || !forbidden_from || !forbidden_to || !forbidden_count) {
+  if (!forbidden_edge_bits || !forbidden_count) {
     return 0;
   }
   if (!planner_v3_bfs_in_bounds(rows, cols, from.row, from.col) ||
@@ -1637,15 +1773,13 @@ static int planner_v3_bfs_special_add_forbidden_edge(
   }
   int from_idx = from.row * cols + from.col;
   int mark_idx = from_idx * 4 + dir;
-  if (forbidden_edge_mark[mark_idx]) {
+  if (planner_v3_bfs_forbidden_edge_test(forbidden_edge_bits, mark_idx)) {
     return 0;
   }
   if (*forbidden_count >= forbidden_cap) {
     return 0;
   }
-  forbidden_edge_mark[mark_idx] = 1;
-  forbidden_from[*forbidden_count] = from;
-  forbidden_to[*forbidden_count] = to;
+  planner_v3_bfs_forbidden_edge_set(forbidden_edge_bits, mark_idx);
   (*forbidden_count)++;
   return 1;
 }
@@ -1655,7 +1789,7 @@ static int planner_v3_bfs_special_replan_with_marks(
     const Point *obstacles, size_t obstacle_count,
     const uint8_t *excluded_obstacle_mark,
     const Point *temp_boxes, size_t temp_count,
-    const Point *excluded_dirs_from, const Point *excluded_dirs_to, size_t excluded_dir_count,
+    const uint32_t *forbidden_edge_bits, size_t forbidden_edge_count,
     int dist_ignore_obs_bomb[PLANNER_V3_BFS_MAX_CELLS],
     Point *initial_path, size_t *initial_path_len) {
   Point filtered_obstacles[200];
@@ -1669,13 +1803,17 @@ static int planner_v3_bfs_special_replan_with_marks(
                                              dist_ignore_obs_bomb, 0, NULL)) {
     return 0;
   }
-  if (!planner_v3_bfs_astar_with_dist(rows, cols, box_start, target,
+  const uint32_t *saved_forbidden_bits = s_astar_forbidden_edge_bits;
+  s_astar_forbidden_edge_bits = (forbidden_edge_bits && forbidden_edge_count > 0) ? forbidden_edge_bits : NULL;
+  int astar_ok = planner_v3_bfs_astar_with_dist(rows, cols, box_start, target,
                                       filtered_obstacles, filtered_obstacle_count,
                                       NULL, 0, temp_boxes, temp_count,
                                       dist_ignore_obs_bomb,
                                       initial_path, PLANNER_V3_BFS_MAX_PATH_LEN, initial_path_len,
                                       0, 0, 0, (Point){0, 0}, 0,
-                                      excluded_dirs_from, excluded_dirs_to, excluded_dir_count, NULL)) {
+                                      NULL, NULL, 0, NULL);
+  s_astar_forbidden_edge_bits = saved_forbidden_bits;
+  if (!astar_ok) {
     return 0;
   }
   return (*initial_path_len > 0) ? 1 : 0;
@@ -1686,8 +1824,7 @@ static int planner_v3_bfs_special_add_next_forbidden_edge_from_path(
     int rows, int cols,
     const Point *path, size_t path_len,
     size_t preferred_step,
-    uint8_t *forbidden_edge_mark,
-    Point *forbidden_from, Point *forbidden_to,
+    uint32_t *forbidden_edge_bits,
     size_t *forbidden_count, size_t forbidden_cap) {
   if (!path || path_len < 2) {
     return 0;
@@ -1696,7 +1833,7 @@ static int planner_v3_bfs_special_add_next_forbidden_edge_from_path(
       planner_v3_bfs_should_check_push_step(path, preferred_step)) {
     if (planner_v3_bfs_special_add_forbidden_edge(
             rows, cols, path[preferred_step - 1], path[preferred_step],
-            forbidden_edge_mark, forbidden_from, forbidden_to,
+            forbidden_edge_bits,
             forbidden_count, forbidden_cap)) {
       return 1;
     }
@@ -1710,7 +1847,7 @@ static int planner_v3_bfs_special_add_next_forbidden_edge_from_path(
     }
     if (planner_v3_bfs_special_add_forbidden_edge(
             rows, cols, path[i - 1], path[i],
-            forbidden_edge_mark, forbidden_from, forbidden_to,
+            forbidden_edge_bits,
             forbidden_count, forbidden_cap)) {
       return 1;
     }
@@ -1721,7 +1858,7 @@ static int planner_v3_bfs_special_add_next_forbidden_edge_from_path(
     }
     if (planner_v3_bfs_special_add_forbidden_edge(
             rows, cols, path[i - 1], path[i],
-            forbidden_edge_mark, forbidden_from, forbidden_to,
+            forbidden_edge_bits,
             forbidden_count, forbidden_cap)) {
       return 1;
     }
@@ -1818,9 +1955,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
   uint8_t excluded_obstacle_mark[PLANNER_V3_BFS_MAX_CELLS] = {0};
 
 
-  uint8_t forbidden_edge_mark[PLANNER_V3_BFS_MAX_CELLS * 4] = {0};
-  Point excluded_dirs_from[PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS];
-  Point excluded_dirs_to[PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS];
+  uint32_t forbidden_edge_bits[PLANNER_V3_BFS_FORBIDDEN_EDGE_WORDS] = {0};
   size_t excluded_dir_count = 0;
   
   const int max_attempts = 22;
@@ -1834,7 +1969,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
               rows, cols, box_start, target,
               obstacles, obstacle_count, excluded_obstacle_mark,
               temp_boxes, temp_count,
-              excluded_dirs_from, excluded_dirs_to, excluded_dir_count,
+              forbidden_edge_bits, excluded_dir_count,
               dist_ignore_obs_bomb, initial_path, &initial_path_len)) {
         continue;
       }
@@ -2085,7 +2220,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         // ?????????
         planner_v3_bfs_special_add_next_forbidden_edge_from_path(
             rows, cols, initial_path, initial_path_len, push_fail_step_multi,
-            forbidden_edge_mark, excluded_dirs_from, excluded_dirs_to,
+            forbidden_edge_bits,
             &excluded_dir_count, PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS);
         continue;
       }
@@ -2105,7 +2240,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
 
         if (planner_v3_bfs_special_add_next_forbidden_edge_from_path(
                 rows, cols, initial_path, initial_path_len, reach_fail_step,
-                forbidden_edge_mark, excluded_dirs_from, excluded_dirs_to,
+                forbidden_edge_bits,
                 &excluded_dir_count, PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS)) {
           continue;
         } else {
@@ -2177,7 +2312,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         // ?????????
         planner_v3_bfs_special_add_next_forbidden_edge_from_path(
             rows, cols, initial_path, initial_path_len, push_fail_step_0,
-            forbidden_edge_mark, excluded_dirs_from, excluded_dirs_to,
+            forbidden_edge_bits,
             &excluded_dir_count, PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS);
         continue;
       }
@@ -2354,7 +2489,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
         if (push_pos_invalid) {
           planner_v3_bfs_special_add_next_forbidden_edge_from_path(
               rows, cols, initial_path, initial_path_len, push_fail_step_01,
-              forbidden_edge_mark, excluded_dirs_from, excluded_dirs_to,
+              forbidden_edge_bits,
               &excluded_dir_count, PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS);
           continue;
         }
@@ -2374,7 +2509,7 @@ static int planner_v3_bfs_special_path_planning(int rows, int cols, Point box_st
 
         if (planner_v3_bfs_special_add_next_forbidden_edge_from_path(
                 rows, cols, initial_path, initial_path_len, reach_fail_step,
-                forbidden_edge_mark, excluded_dirs_from, excluded_dirs_to,
+                forbidden_edge_bits,
                 &excluded_dir_count, PLANNER_V3_BFS_SPECIAL_MAX_EXCLUDED_PATHS)) {
           continue;
         } else if (obstacles_on_path_count > 0) {
@@ -2680,9 +2815,6 @@ static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
         memcpy(saved_bombs, bombs, bomb_count * sizeof(Point));
         Point saved_car = *car_pos;
         size_t saved_steps = *out_steps;
-        size_t save_len = saved_steps < PUSH_BOMB_SAVE_PATH_MAX ? saved_steps : PUSH_BOMB_SAVE_PATH_MAX;
-        Point saved_path[PUSH_BOMB_SAVE_PATH_MAX];
-        memcpy(saved_path, path_buffer, save_len * sizeof(Point));
 
         int push_result = planner_v3_bfs_push_bomb(rows, cols, car_pos,
                                                     bombs, bomb_count, bi, cand_target,
@@ -2711,7 +2843,6 @@ static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
         memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
         *car_pos = saved_car;
         *out_steps = saved_steps;
-        memcpy(path_buffer, saved_path, save_len * sizeof(Point));
       } else {
 
         Point saved_obstacles[200];
@@ -2721,9 +2852,6 @@ static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
         memcpy(saved_bombs, bombs, bomb_count * sizeof(Point));
         Point saved_car = *car_pos;
         size_t saved_steps = *out_steps;
-        size_t save_len = saved_steps < PUSH_BOMB_SAVE_PATH_MAX ? saved_steps : PUSH_BOMB_SAVE_PATH_MAX;
-        Point saved_path[PUSH_BOMB_SAVE_PATH_MAX];
-        memcpy(saved_path, path_buffer, save_len * sizeof(Point));
 
         if (planner_v3_bfs_clear_push_pos_obstacle_recursive(
                 rows, cols, car_pos, bombs, bomb_count, bi,
@@ -2759,7 +2887,6 @@ static int planner_v3_bfs_clear_push_pos_obstacle_recursive(
           memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
           *car_pos = saved_car;
           *out_steps = saved_steps;
-          memcpy(path_buffer, saved_path, save_len * sizeof(Point));
         }
       }
     }
@@ -2919,9 +3046,6 @@ skip_dir:;
     memcpy(saved_bombs, bombs, bomb_count * sizeof(Point));
     Point saved_car = *car_pos;
     size_t saved_steps = *out_steps;
-    size_t save_len = saved_steps < PUSH_BOMB_SAVE_PATH_MAX ? saved_steps : PUSH_BOMB_SAVE_PATH_MAX;
-    Point saved_path[PUSH_BOMB_SAVE_PATH_MAX];
-    memcpy(saved_path, path_buffer, save_len * sizeof(Point));
 
     if (push_obs.row >= 0) {
 
@@ -2939,7 +3063,6 @@ skip_dir:;
         memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
         *car_pos = saved_car;
         *out_steps = saved_steps;
-        memcpy(path_buffer, saved_path, save_len * sizeof(Point));
         continue;
       }
     }
@@ -2972,7 +3095,6 @@ skip_dir:;
     memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
     *car_pos = saved_car;
     *out_steps = saved_steps;
-    memcpy(path_buffer, saved_path, save_len * sizeof(Point));
   }
 
   if (apply_req2 && had_skip_push_obs) {
@@ -3224,6 +3346,15 @@ static int planner_v3_bfs_simulate_push_bomb(int rows, int cols, Point car_start
   int reverse_count = 0;
   uint8_t occ_buf[PLANNER_V3_BFS_MAX_CELLS];
   planner_v3_bfs_build_occupancy_grid(rows, cols, filtered_obstacles, filtered_obstacle_count, temp_bombs, temp_bomb_count, temp_boxes, temp_box_count, 1, occ_buf);
+
+  int dist_to_target[PLANNER_V3_BFS_MAX_CELLS];
+  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target_pos,
+                                             filtered_obstacles, filtered_obstacle_count,
+                                             temp_bombs, temp_bomb_count,
+                                             temp_boxes, temp_box_count,
+                                             dist_to_target, 1, occ_buf)) {
+    return INT_MAX;
+  }
   
   while (bomb.row != target_pos.row || bomb.col != target_pos.col) {
     if (steps >= PLANNER_V3_BFS_MAX_GREEDY_STEPS) {
@@ -3285,14 +3416,6 @@ static int planner_v3_bfs_simulate_push_bomb(int rows, int cols, Point car_start
     }
     
 
-    int dist_to_target[PLANNER_V3_BFS_MAX_CELLS];
-    if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target_pos,
-                                               filtered_obstacles, filtered_obstacle_count,
-                                               temp_bombs, temp_bomb_count,
-                                               temp_boxes, temp_box_count,
-                                               dist_to_target, 1, occ_buf)) {
-      return INT_MAX;
-    }
     Point bombs_with_current[MAX_BOMBS];
     size_t bwc = 0;
     for (size_t ii = 0; ii < temp_bomb_count && bwc < MAX_BOMBS; ii++) bombs_with_current[bwc++] = temp_bombs[ii];
@@ -3396,18 +3519,18 @@ static int planner_v3_bfs_simulate_push_box_score(
     if (boxes[i].row < 0 || boxes[i].col < 0) continue;
     temp_boxes[temp_count++] = boxes[i];
   }
+
+  int dist_to_target[PLANNER_V3_BFS_MAX_CELLS];
+  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
+        bombs, bomb_count, temp_boxes, temp_count, dist_to_target, 1, NULL)) {
+    return INT_MAX;
+  }
   
   while (box.row != target.row || box.col != target.col) {
     if (steps >= PLANNER_V3_BFS_MAX_GREEDY_STEPS) return INT_MAX;
     int is_first_push_step = (steps == 0);
     uint8_t occ_buf[PLANNER_V3_BFS_MAX_CELLS];
     planner_v3_bfs_build_occupancy_grid(rows, cols, obstacles, obstacle_count, bombs, bomb_count, boxes_local, n, 1, occ_buf);
-
-    int dist_to_target[PLANNER_V3_BFS_MAX_CELLS];
-    if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
-          bombs, bomb_count, temp_boxes, temp_count, dist_to_target, 1, NULL)) {
-      return INT_MAX;
-    }
 
     int dist_from_car[PLANNER_V3_BFS_MAX_CELLS];
     if (!planner_v3_bfs_global_bfs_from_source(rows, cols, car, obstacles, obstacle_count,
@@ -3801,7 +3924,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
                                              temp_boxes, temp_box_count,
                                              bomb_path_dist, 1, NULL)) {
     last_err_stage = 3;  // ????????????????????
-    last_err_detail = 310;  // ?????????????????????
+    last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PUSH_TARGET_BFS_FAILED;  // ?????????????????????
     return -6;
   }
   
@@ -3853,8 +3976,8 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
           has_bomb_path, path_steps, score_steps,
           planner_v3_push_only_bfs_astar_path, 0, 0,
           3,
-          328,
-          311,
+          LAST_ERR_DETAIL_V3_BOMB_PATH_ONLY_INVALID,
+          LAST_ERR_DETAIL_V3_BOMB_PATH_AND_SCORE_BOTH_FAILED,
           0, 0,
           &chosen_strategy) < 0) {
     return -6;
@@ -3873,7 +3996,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
 
       if (bomb_path_idx + 1 >= bomb_path_len) {
         last_err_stage = 3;  // ????????????????????
-        last_err_detail = 312;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_EXHAUSTED;  // ?????????????????????
         return -6;
       }
       
@@ -3883,7 +4006,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
       
       if (planner_v3_bfs_abs(dr) + planner_v3_bfs_abs(dc) != 1) {
         last_err_stage = 3;  // ????????????????????
-        last_err_detail = 313;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_STEP_NOT_ADJACENT;  // ?????????????????????
         return -6;
       }
 
@@ -3894,7 +4017,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
       if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
           !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
         last_err_stage = 3;  // ????????????????????
-        last_err_detail = 314;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_STEP_OUT_OF_BOUNDS;  // ?????????????????????
         return -6;
       }
       
@@ -3909,7 +4032,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
                                                    temp_bombs, temp_bomb_count, temp_boxes, temp_box_count,
                                                    SIZE_MAX, 1, occ_buf)) {
           last_err_stage = 3;  // ????????????????????
-          last_err_detail = 327;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOMB_BOUNDARY_PATH_INVALID;  // ?????????????????????
           return -6;
         }
       }
@@ -3917,14 +4040,14 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
       if (planner_v3_bfs_is_obstacle(occ_buf, cols, next_in_path.row, next_in_path.col) ||
           planner_v3_bfs_is_obstacle(occ_buf, cols, push_row, push_col)) {
         last_err_stage = 3;  // ????????????????????
-        last_err_detail = 315;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_OBSTACLE_CONFLICT;  // ?????????????????????
         return -6;
       }
       
       if (planner_v3_bfs_is_box_at(occ_buf, cols, next_in_path.row, next_in_path.col, SIZE_MAX) ||
           planner_v3_bfs_is_box_at(occ_buf, cols, push_row, push_col, SIZE_MAX)) {
         last_err_stage = 3;  // ????????????????????
-        last_err_detail = 316;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_BOX_CONFLICT;  // ?????????????????????
         return -6;
       }
       
@@ -3943,7 +4066,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
         }
         if (car_result == 0) {
           last_err_stage = 3;  // ????????????????????
-          last_err_detail = 317;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PATH_CAR_MOVE_FAILED;  // ?????????????????????
           return -6;
         }
       }
@@ -3951,7 +4074,9 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
         push_from, next_in_path,
         car_pos, &bomb, bombs, bomb_idx,
         path_buffer, path_capacity, out_steps,
-        3, 318, 319, 320
+        3, LAST_ERR_DETAIL_V3_BOMB_PATH_EXEC_CAR_MISMATCH,
+        LAST_ERR_DETAIL_V3_BOMB_PATH_EXEC_NOT_ADJACENT,
+        LAST_ERR_DETAIL_V3_BOMB_PATH_EXEC_NOT_CONTINUOUS
       };
       int exec_ret = planner_v3_bfs_execute_push_strategy(&exec_ctx);
       if (exec_ret < 0) {
@@ -3984,7 +4109,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
             0, last_dr, last_dc, reverse_count,
             candidates, sorted_dirs, &sorted_count)) {
       last_err_stage = 3;  // ????????????????????
-      last_err_detail = 321;  // ?????????????????????
+      last_err_detail = LAST_ERR_DETAIL_V3_BOMB_SCORE_NO_FEASIBLE_DIRECTION;  // ?????????????????????
       return -6;
     }
     
@@ -4020,7 +4145,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
     }
     if (!dir_ok) {
       last_err_stage = 3;
-      last_err_detail = 329;  // ?????????????????????
+      last_err_detail = LAST_ERR_DETAIL_V3_BOMB_SCORE_DIR_SELECTION_FAILED;  // ?????????????????????
       return -6;
     }
     
@@ -4037,7 +4162,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
       }
       if (car_result == 0) {
         last_err_stage = 3;
-        last_err_detail = 322;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOMB_SCORE_CAR_MOVE_FAILED;  // ?????????????????????
         return -6;
       }
     }
@@ -4045,7 +4170,9 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
       push_from, chosen.next_pos,
       car_pos, &bomb, bombs, bomb_idx,
       path_buffer, path_capacity, out_steps,
-      3, 323, 324, 325
+      3, LAST_ERR_DETAIL_V3_BOMB_SCORE_EXEC_CAR_MISMATCH,
+      LAST_ERR_DETAIL_V3_BOMB_SCORE_EXEC_NOT_ADJACENT,
+      LAST_ERR_DETAIL_V3_BOMB_SCORE_EXEC_NOT_CONTINUOUS
     };
     int exec_ret = planner_v3_bfs_execute_push_strategy(&exec_ctx);
     if (exec_ret < 0) {
@@ -4069,7 +4196,7 @@ static int planner_v3_bfs_push_bomb(int rows, int cols, Point *car_pos,
   }
   
   last_err_stage = 3;  // ????????????????????
-  last_err_detail = 326;  // ?????????????????????
+  last_err_detail = LAST_ERR_DETAIL_V3_BOMB_FINAL_NOT_AT_TARGET;  // ?????????????????????
   return -6;
 }
 
@@ -4247,138 +4374,6 @@ static int planner_v3_bfs_score_car_to_box(int rows, int cols, Point car, size_t
   return best;
 }
 
-// ?????????????
-// ?????????????
-static int planner_v3_bfs_compute_box_path_length(int rows, int cols, Point box_start,
-                                                   Point target, const Point *obstacles,
-                                                   size_t obstacle_count, const Point *bombs, size_t bomb_count,
-                                                   const Point *boxes,
-                                                   size_t box_count, size_t moving_idx,
-                                                   int include_bombs, Point car) {
-
-  Point temp_boxes[PLANNER_V3_BFS_MAX_BOXES];
-  size_t temp_count = 0;
-  for (size_t i = 0; i < box_count; ++i) {
-    if (i == moving_idx) {
-      continue;  // ?????????????????????
-    }
-    if (boxes[i].row < 0 || boxes[i].col < 0) {
-      continue;  // ?????????????????????
-    }
-    temp_boxes[temp_count++] = boxes[i];
-  }
-
-
-  int dist[PLANNER_V3_BFS_MAX_CELLS];
-  if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
-                                             bombs, bomb_count, temp_boxes, temp_count, dist, include_bombs, NULL)) {
-    return INT_MAX;
-  }
-
-  int box_start_idx = box_start.row * cols + box_start.col;
-  if (box_start_idx < 0 || box_start_idx >= rows * cols) {
-    return INT_MAX;
-  }
-
-
-  if (car.row >= 0 && car.col >= 0) {
-    Point path_buf[PLANNER_V3_BFS_MAX_PATH_LEN];
-    size_t path_len = 0;
-    if (!planner_v3_bfs_astar_with_dist(rows, cols, box_start, target,
-                                        obstacles, obstacle_count,
-                                        bombs, bomb_count,
-                                        temp_boxes, temp_count,
-                                        dist, path_buf, PLANNER_V3_BFS_MAX_PATH_LEN, &path_len,
-                                        include_bombs,
-                                        1, 0, car, 0, NULL, NULL, 0, NULL)) {
-      return INT_MAX;  // ???????????
-    }
-    if (path_len < 2) {
-      return (box_start.row == target.row && box_start.col == target.col) ? 0 : INT_MAX;
-    }
-    return (int)(path_len - 1);  // ???????????
-  }
-
-  return dist[box_start_idx];
-}
-
-/**
- */
-static void planner_v3_hungarian(int n, const int *cost, int *row_to_col) {
-  int u[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-  int v[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-  int p[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-  int way[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-  int i, j;
-  if (n <= 0 || n > PLANNER_V3_HUNGARIAN_MAX_N) {
-    return;
-  }
-  for (i = 0; i <= n; i++) {
-    u[i] = v[i] = 0;
-    p[i] = way[i] = 0;
-  }
-  for (i = 1; i <= n; i++) {
-    p[0] = i;
-    int j0 = 0;
-    int minv[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-    uint8_t used[PLANNER_V3_HUNGARIAN_MAX_N + 1];
-    for (j = 0; j <= n; j++) {
-      minv[j] = PLANNER_V3_HUNGARIAN_INF;
-      used[j] = 0;
-    }
-    do {
-      used[j0] = 1;
-      int i0 = p[j0];
-      int delta = PLANNER_V3_HUNGARIAN_INF;
-      int j1 = 0;
-      for (j = 1; j <= n; j++) {
-        if (used[j]) continue;
-        int cur = cost[(i0 - 1) * n + (j - 1)] - u[i0] - v[j];
-        if (cur < minv[j]) {
-          minv[j] = cur;
-          way[j] = j0;
-        }
-        if (minv[j] < delta) {
-          delta = minv[j];
-          j1 = j;
-        }
-      }
-      for (j = 0; j <= n; j++) {
-        if (used[j]) {
-          u[p[j]] += delta;
-          v[j] -= delta;
-        } else {
-          minv[j] -= delta;
-        }
-      }
-      j0 = j1;
-    } while (p[j0] != 0);
-    do {
-      int j1 = way[j0];
-      p[j0] = p[j1];
-      j0 = j1;
-    } while (j0 != 0);
-  }
-  for (j = 1; j <= n; j++) {
-    int r = p[j] - 1;
-    if (r >= 0 && r < n) {
-      row_to_col[r] = j - 1;
-    }
-  }
-}
-
-/**
- */
-static int planner_v3_bfs_pair_cost(int bfs_dist, int sp_dist) {
-  if (bfs_dist == INT_MAX && sp_dist == INT_MAX) {
-    return PLANNER_V3_HUNGARIAN_INF;
-  }
-  if (bfs_dist != INT_MAX) {
-    return bfs_dist;
-  }
-  return sp_dist;
-}
-
 /**
  */
 static int planner_v3_bfs_sp_bomb_extra_cost(int rows, int cols, Point car,
@@ -4458,7 +4453,7 @@ static int planner_v3_bfs_sp_bomb_extra_cost(int rows, int cols, Point car,
     if (best_valid != INT_MAX) {
       bomb_valid_dist[valid_count++] = best_valid;
     }
-    bomb_min_dist_no_check[bomb_idx_used] = (best_no_check == INT_MAX) ? (PLANNER_V3_HUNGARIAN_INF / 2) : best_no_check;
+    bomb_min_dist_no_check[bomb_idx_used] = (best_no_check == INT_MAX) ? (PLANNER_V3_LARGE_COST / 2) : best_no_check;
     bomb_idx_used++;
   }
 
@@ -4656,7 +4651,7 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
 
     if (best_t == SIZE_MAX) {
       last_err_stage = 2;
-      last_err_detail = 101;
+      last_err_detail = LAST_ERR_DETAIL_V3_BOX_TO_TARGET_INF;
       return -6;
     }
 
@@ -4705,12 +4700,12 @@ static int planner_v3_bfs_build_goals_from_manual(int rows, int cols,
     size_t ti = box_target_indices[i];
     if (ti >= target_count) {
       last_err_stage = 2;
-      last_err_detail = 105;  // ????????????????
+      last_err_detail = LAST_ERR_DETAIL_V3_MANUAL_TARGET_INDEX_INVALID;  // ????????????????
       return -11;  // ?????
     }
     if (target_used[ti]) {
       last_err_stage = 2;
-      last_err_detail = 106;  // ????????????????
+      last_err_detail = LAST_ERR_DETAIL_V3_MANUAL_TARGET_DUPLICATED;  // ????????????????
       return -11;  // ?????
     }
     target_used[ti] = 1;
@@ -4794,14 +4789,8 @@ static int planner_v3_bfs_resolve_first_push_by_bomb_special_path(
   for (size_t oi = 0; oi < bomb_order_count; ++oi) {
     size_t bomb_idx = bomb_order[oi];
 
-    if (*out_steps > PUSH_BOMB_SAVE_PATH_MAX) {
-      last_first_push_bomb_special_fail_reason = FIRST_PUSH_BOMB_FAIL_SAVE_PATH_OVERFLOW;
-      return 0;
-    }
     Point saved_car = *car_pos;
     size_t saved_steps = *out_steps;
-    Point saved_path[PUSH_BOMB_SAVE_PATH_MAX];
-    memcpy(saved_path, path_buffer, saved_steps * sizeof(Point));
     Point saved_bombs[MAX_BOMBS];
     memcpy(saved_bombs, bombs, bomb_count * sizeof(Point));
     Point saved_obstacles[200];
@@ -4890,7 +4879,6 @@ static int planner_v3_bfs_resolve_first_push_by_bomb_special_path(
       memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
       *car_pos = saved_car;
       *out_steps = saved_steps;
-      memcpy(path_buffer, saved_path, saved_steps * sizeof(Point));
       continue;
     }
 
@@ -4918,7 +4906,6 @@ static int planner_v3_bfs_resolve_first_push_by_bomb_special_path(
         memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
         *car_pos = saved_car;
         *out_steps = saved_steps;
-        memcpy(path_buffer, saved_path, saved_steps * sizeof(Point));
         continue;
       }
 
@@ -4989,7 +4976,6 @@ static int planner_v3_bfs_resolve_first_push_by_bomb_special_path(
     memcpy(bombs, saved_bombs, bomb_count * sizeof(Point));
     *car_pos = saved_car;
     *out_steps = saved_steps;
-    memcpy(path_buffer, saved_path, saved_steps * sizeof(Point));
   }
 
   if (last_first_push_bomb_special_fail_reason == FIRST_PUSH_BOMB_FAIL_NONE) {
@@ -5137,7 +5123,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           new_goals, &new_goal_count, temp_mapping);
       if (assign_res != 0 || new_goal_count == 0) {
         last_err_stage = 2;
-        last_err_detail = 102;  // ???????????????????????? goals??
+        last_err_detail = LAST_ERR_DETAIL_V3_GOAL_COUNT_MISMATCH;  // ???????????????????????? goals??
         return -6;
       }
     }
@@ -5239,14 +5225,14 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
 
       if (selected_box_idx == SIZE_MAX) {
         last_err_stage = 2;
-        last_err_detail = 103;  // ????????????��???????????/?????
+        last_err_detail = LAST_ERR_DETAIL_V3_SOURCE_BOX_NOT_FOUND;  // ????????????��???????????/?????
         return -6;
       }
       
       size_t box_idx = new_goals[selected_box_idx].source_idx;
       if (box_idx >= box_count) {
         last_err_stage = 2;
-        last_err_detail = 104;  // goals ?��????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_SOURCE_INDEX_INVALID;  // goals ?��????????????????????
         tried_goal_idx[selected_box_idx] = 1;
         if (++tried_goal_count >= new_goal_count) {
           return -6;
@@ -5286,11 +5272,9 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       int saved_current_obstacles_is_a = (current_obstacles == obstacles_buf_a) ? 1 : 0;
       int saved_scratch_obstacles_is_a = (scratch_obstacles == obstacles_buf_a) ? 1 : 0;
       size_t saved_out_steps = *out_steps;
-      Point *saved_path_buffer = loop_scratch->saved_path_buffer;
       if (saved_out_steps > PLANNER_V3_BFS_MAX_CELLS) {
         return -7;
       }
-      memcpy(saved_path_buffer, path_buffer, saved_out_steps * sizeof(Point));
       size_t saved_box_path_len = box_path_lens[box_idx];
       size_t saved_box_path_start = box_path_starts[box_idx];
       PlannerBoxPathOutput saved_special_path_entry = {0};
@@ -5354,7 +5338,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                                                target_dist, 1, occ);
     if (!target_bfs_ok) {
       last_err_stage = 2;
-      last_err_detail = 128;  // ??? BFS ??????????????��???????��????
+      last_err_detail = LAST_ERR_DETAIL_V3_BOX_TARGET_DIST_BFS_FAILED;  // ??? BFS ??????????????��???????��????
       use_special_path = 1;
     }
     if (!use_special_path) {
@@ -5387,7 +5371,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
       }
       if (!has_box_path) {
         last_err_stage = 2;
-        last_err_detail = 129;  // ???��??????��???????��????
+        last_err_detail = LAST_ERR_DETAIL_V3_BOX_PATH_ASTAR_FAILED;  // ???��??????��???????��????
         use_special_path = 1;
       } else {
         final_req3 = apply_req3;
@@ -5453,7 +5437,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
             }
           }
           last_err_stage = 2;
-          last_err_detail = 131;  // ????��???��??????? last_special_path_fail_reason??
+          last_err_detail = LAST_ERR_DETAIL_V3_SPECIAL_PATH_FAILED;  // ????��???��??????? last_special_path_fail_reason??
           if (last_special_path_fail_reason == SPECIAL_PATH_FAIL_NONE) {
             last_special_path_fail_reason = SPECIAL_PATH_FAIL_SP_NO_REQ_RELAX_MATCH;
           }
@@ -5474,7 +5458,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           for (;;) {
             if (inner_iter >= 200) {
               last_err_stage = 2;
-              last_err_detail = 137;  // ????��???????��????????
+              last_err_detail = LAST_ERR_DETAIL_V3_SPECIAL_PATH_COMBO_FAILED;  // ????��???????��????????
               special_substep_fail = 1;
               goto exit_inner_special_loop;
             }
@@ -5486,14 +5470,6 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
         Point saved_bombs[MAX_BOMBS];
         memcpy(saved_bombs, bombs_mutable, bomb_count * sizeof(Point));
         size_t saved_steps = *out_steps;
-        Point saved_path[PUSH_BOMB_SAVE_PATH_MAX];
-        if (saved_steps > PUSH_BOMB_SAVE_PATH_MAX) {
-          last_err_stage = 3;
-          last_err_detail = 300;  // ???????��???????????????????
-          special_substep_fail = 1;
-          goto exit_inner_special_loop;
-        }
-        memcpy(saved_path, path_buffer, saved_steps * sizeof(Point));
         Point saved_obstacles[200];
         size_t saved_obstacle_count = current_obstacle_count;
         if (saved_obstacle_count > 200) saved_obstacle_count = 200;
@@ -5556,7 +5532,6 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
             current_car = saved_car;
             memcpy(bombs_mutable, saved_bombs, bomb_count * sizeof(Point));
             *out_steps = saved_steps;
-            memcpy(path_buffer, saved_path, saved_steps * sizeof(Point));
             memcpy(current_obstacles, saved_obstacles, saved_obstacle_count * sizeof(Point));
             current_obstacle_count = saved_obstacle_count;
 
@@ -5596,7 +5571,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
 
         if (!push_success) {
           last_err_stage = 3;
-          last_err_detail = 301;  // ?????????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOMB_PUSH_FAILED;  // ?????????????????????????
           special_substep_fail = 1;
           if (apply_req1 && req1_blocked_on_bomb_push) {
             special_fail_reason = SPECIAL_PATH_FAIL_REQ1;
@@ -5675,7 +5650,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
               saw_req2_all_dirs_fail = 1;
               if (s_blocked_bomb_count >= MAX_BOMBS) {
                 last_err_stage = 3;
-                last_err_detail = 302;
+                last_err_detail = LAST_ERR_DETAIL_V3_BLOCKED_BOMB_REPLAN_FAILED;
                 special_substep_fail = 1;
                 if (apply_req2) {
                   special_fail_reason = SPECIAL_PATH_FAIL_REQ2;
@@ -5694,7 +5669,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
                                                        sp_path, PLANNER_V3_BFS_MAX_PATH_LEN, &sp_len,
                                                         apply_req1, apply_req3)) {
                 last_err_stage = 2;
-                last_err_detail = 131;
+                last_err_detail = LAST_ERR_DETAIL_V3_SPECIAL_PATH_FAILED;
                 if (last_special_path_fail_reason == SPECIAL_PATH_FAIL_NONE) {
                   last_special_path_fail_reason = SPECIAL_PATH_FAIL_SP_REPLAN_AFTER_BLOCKED_BOMB_FAILED;
                 }
@@ -5733,7 +5708,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
             } else {
 
               last_err_stage = 3;
-              last_err_detail = 302;  // ?????????????????????
+              last_err_detail = LAST_ERR_DETAIL_V3_BLOCKED_BOMB_REPLAN_FAILED;  // ?????????????????????
               special_substep_fail = 1;
               if (apply_req2 && saw_req2_all_dirs_fail) {
                 special_fail_reason = SPECIAL_PATH_FAIL_REQ2;
@@ -5756,7 +5731,7 @@ exit_inner_special_loop:
       // 特殊路径子流程成功后，直接采用当前特殊路径，不再重新求正式 box_path。
       if (sp_len <= 1 || sp_len > PLANNER_V3_BFS_MAX_CELLS) {
         last_err_stage = 2;
-        last_err_detail = special_bomb_handled ? 132 : 138;
+        last_err_detail = special_bomb_handled ? LAST_ERR_DETAIL_V3_SPECIAL_PATH_BOX_REPLAN_FAILED : LAST_ERR_DETAIL_V3_SPECIAL_PATH_PUSH_FAIL;
         special_substep_fail = 1;
         goto exit_inner_special_loop;
       }
@@ -5772,7 +5747,7 @@ exit_inner_special_loop:
     }
       if (!special_req_combo_success) {
         last_err_stage = 2;
-        last_err_detail = 131;  // ?????????????????????
+        last_err_detail = LAST_ERR_DETAIL_V3_SPECIAL_PATH_FAILED;  // ?????????????????????
         if (last_special_path_fail_reason == SPECIAL_PATH_FAIL_NONE) {
           last_special_path_fail_reason = SPECIAL_PATH_FAIL_SP_REQ_MASK_EXHAUSTED;
         }
@@ -5802,10 +5777,10 @@ exit_inner_special_loop:
             (has_box_path && box_path_len > 1), box_path_steps, box_score_steps,
             planner_v3_push_only_bfs_astar_path, 1, 1,
             2,
-            124,
-            134,
-            135,
-            136,
+            LAST_ERR_DETAIL_V3_PATH_ONLY_INVALID,
+            LAST_ERR_DETAIL_V3_PATH_AND_SCORE_BOTH_FAILED,
+            LAST_ERR_DETAIL_V3_SELECTED_PATH_INVALID,
+            LAST_ERR_DETAIL_V3_SELECTED_SCORE_INVALID,
             &chosen_box_strategy) < 0) {
       goto selected_box_failed;
     }
@@ -5817,7 +5792,7 @@ exit_inner_special_loop:
       while (box.row != target.row || box.col != target.col) {
         if (box_path_idx + 1 >= box_path_len) {
           last_err_stage = 2;
-          last_err_detail = 122;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOX_PATH_EXHAUSTED;  // ?????????????????????
           goto selected_box_failed;
         }
         
@@ -5827,7 +5802,7 @@ exit_inner_special_loop:
         
         if (planner_v3_bfs_abs(dr) + planner_v3_bfs_abs(dc) != 1) {
           last_err_stage = 2;
-          last_err_detail = 107;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOX_PATH_STEP_NOT_ADJACENT;  // ?????????????????????
           goto selected_box_failed;
         }
 
@@ -5839,7 +5814,7 @@ exit_inner_special_loop:
         if (!planner_v3_bfs_in_bounds(rows, cols, next_in_path.row, next_in_path.col) ||
             !planner_v3_bfs_in_bounds(rows, cols, push_row, push_col)) {
           last_err_stage = 2;
-          last_err_detail = 108;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_BOX_PATH_STEP_OUT_OF_BOUNDS;  // ?????????????????????
           goto selected_box_failed;
         }
         
@@ -5856,7 +5831,7 @@ exit_inner_special_loop:
                                                      bombs_mutable, bomb_count, current_boxes, box_count,
                                                      box_idx, 1, occ)) {
             last_err_stage = 2;
-            last_err_detail = 120;  // ?????????????????????
+            last_err_detail = LAST_ERR_DETAIL_V3_BOUNDARY_PATH_INVALID;  // ?????????????????????
             goto selected_box_failed;
           }
         }
@@ -5868,13 +5843,13 @@ exit_inner_special_loop:
               (planner_v3_bfs_is_obstacle(occ, cols, next_in_path.row, next_in_path.col) ||
                planner_v3_bfs_is_obstacle(occ, cols, push_row, push_col))) {
             last_err_stage = 2;
-            last_err_detail = 109;  // ?????????????????????
+            last_err_detail = LAST_ERR_DETAIL_V3_BOX_OR_PUSH_ON_OBSTACLE;  // ?????????????????????
             goto selected_box_failed;
           }
           if (planner_v3_bfs_is_box_at(occ, cols, next_in_path.row, next_in_path.col, box_idx) ||
               planner_v3_bfs_is_box_at(occ, cols, push_row, push_col, box_idx)) {
             last_err_stage = 2;
-            last_err_detail = 110;  // ?????????????????????
+            last_err_detail = LAST_ERR_DETAIL_V3_BOX_OR_PUSH_COLLIDE_BOX;  // ?????????????????????
             goto selected_box_failed;
           }
         }
@@ -5918,7 +5893,7 @@ exit_inner_special_loop:
           }
           if (car_result == 0) {
             last_err_stage = 2;
-            last_err_detail = first_push_assist_attempted ? 139 : 112;  // 112=δ�������Ʋ���, 139=���Ʋ��Ⱥ���ʧ��
+            last_err_detail = first_push_assist_attempted ? LAST_ERR_DETAIL_V3_FIRST_PUSH_ASSIST_FAILED : LAST_ERR_DETAIL_V3_CAR_CANNOT_REACH_PUSH_POS;  // 112=δ�������Ʋ���, 139=���Ʋ��Ⱥ���ʧ��
             goto selected_box_failed;
           }
         }
@@ -5926,7 +5901,9 @@ exit_inner_special_loop:
           push_from, next_in_path,
           &current_car, &box, current_boxes, box_idx,
           path_buffer, path_capacity, out_steps,
-          2, 113, 114, 115
+          2, LAST_ERR_DETAIL_V3_PUSH_EXEC_CAR_MISMATCH,
+          LAST_ERR_DETAIL_V3_PUSH_EXEC_NOT_ADJACENT,
+          LAST_ERR_DETAIL_V3_PUSH_EXEC_PATH_NOT_CONTINUOUS
         };
         int exec_ret = planner_v3_bfs_execute_push_strategy(&exec_ctx);
         if (exec_ret < 0) {
@@ -5965,7 +5942,7 @@ exit_inner_special_loop:
       while (box.row != target.row || box.col != target.col) {
         if (exec_steps >= (size_t)PLANNER_V3_BFS_MAX_GREEDY_STEPS) {
           last_err_stage = 2;
-          last_err_detail = 133;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_SCORE_EXEC_STEPS_OVERFLOW;  // ?????????????????????
           goto selected_box_failed;
         }
         const uint8_t *occ = planner_v3_occ_get(&occ_cache, occ_epoch, rows, cols,
@@ -5983,7 +5960,7 @@ exit_inner_special_loop:
                 0, last_dr, last_dc, reverse_count,
                 candidates, sorted_dirs, &sorted_count)) {
           last_err_stage = 2;
-          last_err_detail = 116;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_SCORE_NO_FEASIBLE_DIRECTION;  // ?????????????????????
           goto selected_box_failed;
         }
 
@@ -6019,7 +5996,7 @@ exit_inner_special_loop:
         }
         if (!dir_ok) {
           last_err_stage = 2;
-          last_err_detail = 127;  // ?????????????????????
+          last_err_detail = LAST_ERR_DETAIL_V3_SCORE_DIR_SELECTION_FAILED;  // ?????????????????????
           goto selected_box_failed;
         }
         
@@ -6061,7 +6038,7 @@ exit_inner_special_loop:
           }
           if (car_result == 0) {
             last_err_stage = 2;
-            last_err_detail = 123;  // ?????????????????????
+            last_err_detail = LAST_ERR_DETAIL_V3_SCORE_CAR_CANNOT_REACH_PUSH_POS;  // ?????????????????????
             goto selected_box_failed;
           }
         }
@@ -6069,7 +6046,9 @@ exit_inner_special_loop:
           push_from, chosen.next_pos,
           &current_car, &box, current_boxes, box_idx,
           path_buffer, path_capacity, out_steps,
-          2, 130, 125, 126
+          2, LAST_ERR_DETAIL_V3_SCORE_EXEC_CAR_MISMATCH,
+          LAST_ERR_DETAIL_V3_SCORE_EXEC_NOT_ADJACENT,
+          LAST_ERR_DETAIL_V3_SCORE_EXEC_PATH_NOT_CONTINUOUS
         };
         int exec_ret = planner_v3_bfs_execute_push_strategy(&exec_ctx);
         if (exec_ret < 0) {
@@ -6112,7 +6091,7 @@ exit_inner_special_loop:
     } else {
 
       last_err_stage = 2;
-      last_err_detail = 117;  // ?????????????????????
+      last_err_detail = LAST_ERR_DETAIL_V3_BOX_FINAL_NOT_AT_TARGET;  // ?????????????????????
       goto selected_box_failed;
     }
 
@@ -6127,7 +6106,6 @@ selected_box_failed:
     current_obstacles = saved_current_obstacles_is_a ? obstacles_buf_a : obstacles_buf_b;
     scratch_obstacles = saved_scratch_obstacles_is_a ? obstacles_buf_a : obstacles_buf_b;
     *out_steps = saved_out_steps;
-    memcpy(path_buffer, saved_path_buffer, saved_out_steps * sizeof(Point));
     box_path_lens[box_idx] = saved_box_path_len;
     box_path_starts[box_idx] = saved_box_path_start;
     if (orig_box_idx < PLANNER_V3_BFS_MAX_BOXES) {
@@ -6147,7 +6125,7 @@ selected_box_failed:
 
   if (*out_steps > 1 && !planner_v3_bfs_validate_continuous_path(path_buffer, *out_steps)) {
     last_err_stage = 2;
-    last_err_detail = 118;  // ???��????????????????
+    last_err_detail = LAST_ERR_DETAIL_V3_OVERALL_PATH_NOT_CONTINUOUS;  // ???��????????????????
     return -6;
   }
 
@@ -6179,7 +6157,7 @@ selected_box_failed:
           if (*out_steps > 0 && 
               !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], return_path[i])) {
             last_err_stage = 2;
-            last_err_detail = 119;  // ?????????��????????????????
+            last_err_detail = LAST_ERR_DETAIL_V3_RETURN_PATH_NOT_CONTINUOUS;  // ?????????��????????????????
             return -6;
           }
           path_buffer[(*out_steps)++] = return_path[i];

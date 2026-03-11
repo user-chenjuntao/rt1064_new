@@ -8,7 +8,7 @@ extern int last_err_stage;   // 错误阶段
 extern int last_err_detail;  // 错误详情
 
 int last_err_stage = 0;
-int last_err_detail = 0;
+int last_err_detail = LAST_ERR_DETAIL_NONE;
 int last_special_path_fail_reason = 0;  
 int last_first_push_bomb_special_fail_reason = 0;
 
@@ -1603,7 +1603,7 @@ static int planner_v3_bfs_assign_targets(int rows, int cols, Point car,
 
     if (best_t == SIZE_MAX) {
       last_err_stage = 2;  // 动态选目标失败
-      last_err_detail = 1; // 找不到可行目标
+      last_err_detail = LAST_ERR_DETAIL_V2_NO_FEASIBLE_TARGET; // 找不到可行目标
       return -6;  // 找不到可行目标
     }
 
@@ -1731,7 +1731,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     
     if (assign_res != 0 || new_goal_count == 0) {
       last_err_stage = 2;  // 动态选目标失败
-      last_err_detail = 4; // 重规划次数过多（重新分配失败）
+      last_err_detail = LAST_ERR_DETAIL_V2_REASSIGN_FAILED; // 重规划次数过多（重新分配失败）
       return -6;  // 重新分配失败
     }
     
@@ -1772,7 +1772,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     
     if (selected_box_idx == SIZE_MAX) {
       last_err_stage = 2;  // 动态选目标失败
-      last_err_detail = 3; // 无法找到候选箱子
+      last_err_detail = LAST_ERR_DETAIL_V2_NO_CANDIDATE_BOX; // 无法找到候选箱子
       return -6;  // 无法选择箱子
     }
     
@@ -1788,7 +1788,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     
     if (box_idx == SIZE_MAX) {
       last_err_stage = 2;  // 动态选目标失败
-      last_err_detail = 3; // 无法找到候选箱子（索引映射失败）
+      last_err_detail = LAST_ERR_DETAIL_V2_NO_CANDIDATE_BOX; // 无法找到候选箱子（索引映射失败）
       return -6;
     }
     
@@ -1819,7 +1819,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
     if (!planner_v3_bfs_global_bfs_from_target(rows, cols, target, obstacles, obstacle_count,
                                            current_boxes, goal_count, target_dist)) {
       last_err_stage = 2;  // 动态选目标失败
-      last_err_detail = 6; // 单箱推送全局BFS失败
+      last_err_detail = LAST_ERR_DETAIL_V2_SINGLE_BOX_BFS_FAILED; // 单箱推送全局BFS失败
       return -6;  // BFS失败
     }
 
@@ -1896,7 +1896,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
 
     if (!path_sim_ok && !score_sim_ok) {
       last_err_stage = 2;
-      last_err_detail = 7;
+      last_err_detail = LAST_ERR_DETAIL_V2_PUSH_SIM_BOTH_FAILED;
       return -6;
     }
 
@@ -1930,7 +1930,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
   // 验证生成的路径是否连续
   if (*out_steps > 1 && !planner_v3_bfs_validate_continuous_path(path_buffer, *out_steps)) {
     last_err_stage = 2;  // 动态选目标失败
-    last_err_detail = 2; // 推箱后车位置不连续（最终路径验证失败）
+    last_err_detail = LAST_ERR_DETAIL_V2_PATH_NOT_CONTINUOUS; // 推箱后车位置不连续（最终路径验证失败）
     return -6;  // 路径不连续，视为规划失败
   }
 
@@ -1963,7 +1963,7 @@ static int planner_v3_bfs_run_assigned(int rows, int cols, Point car,
           if (*out_steps > 0 && 
               !planner_v3_bfs_check_adjacent(path_buffer[*out_steps - 1], return_path[i])) {
             last_err_stage = 2;  // 动态选目标失败
-            last_err_detail = 2; // 推箱后车位置不连续（返回路径不连续）
+            last_err_detail = LAST_ERR_DETAIL_V2_PATH_NOT_CONTINUOUS; // 推箱后车位置不连续（返回路径不连续）
             return -6;  // 返回路径不连续
           }
           path_buffer[(*out_steps)++] = return_path[i];
