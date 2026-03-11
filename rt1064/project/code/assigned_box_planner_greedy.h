@@ -9,8 +9,8 @@ extern "C" {
 #endif
 
 typedef struct {
-  int row;
-  int col;
+  int8_t row;
+  int8_t col;
 } Point;
 
 typedef struct {

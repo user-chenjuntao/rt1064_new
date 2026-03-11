@@ -10,6 +10,7 @@ extern int last_err_detail;  // 错误详情
 int last_err_stage = 0;
 int last_err_detail = 0;
 int last_special_path_fail_reason = 0;  
+int last_first_push_bomb_special_fail_reason = 0;
 
 #define PLANNER_V3_BFS_MAX_BOXES 10
 #define PLANNER_V3_BFS_MAX_CELLS 400
