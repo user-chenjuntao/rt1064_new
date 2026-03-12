@@ -12,6 +12,7 @@ extern "C" {
 
 extern int last_err_stage;
 extern int last_err_detail;
+extern int last_err_detail_v3_stage3;
 
 /* last_err_detail v3 stage-2 codes */
 #define LAST_ERR_DETAIL_V3_BOX_TO_TARGET_INF                     101
@@ -96,6 +97,48 @@ extern PlannerAllBoxPaths special_paths;
 #define PLANNER_V3_REQ_MASK_ALL  (PLANNER_V3_REQ_MASK_REQ1 | PLANNER_V3_REQ_MASK_REQ2 | PLANNER_V3_REQ_MASK_REQ3)
 #define PLANNER_V3_RETURN_TO_START_DISABLE 0
 #define PLANNER_V3_RETURN_TO_START_ENABLE  1
+
+/* Two-phase preplan model limits (kept aligned with v3 implementation). */
+#define PLANNER_V3_TWO_PHASE_MAX_BOXES 5
+#define PLANNER_V3_TWO_PHASE_MAX_BOMBS 5
+#define PLANNER_V3_TWO_PHASE_MAX_PATH_LEN 400
+#define PLANNER_V3_TWO_PHASE_MAX_EXPLODED_OBSTACLES 200
+
+typedef struct {
+  size_t bomb_index;
+  Point bomb_position;
+  Point bomb_target;
+  uint8_t bomb_purpose;
+  Point exploded_obstacles[PLANNER_V3_TWO_PHASE_MAX_EXPLODED_OBSTACLES];
+  size_t exploded_obstacle_count;
+  int yielded_by_conflict;
+} PlannerV3BombPreplan;
+
+typedef struct {
+  size_t planned_order;
+  size_t box_index;
+  Point box_start;
+  Point target;
+
+  int normal_reachable;
+
+  int special_path_valid;
+  Point special_path[PLANNER_V3_TWO_PHASE_MAX_PATH_LEN];
+  size_t special_path_len;
+  int has_obstacle_to_clear;
+  Point obstacle_to_clear;
+
+  PlannerV3BombPreplan bomb_plan[PLANNER_V3_TWO_PHASE_MAX_BOMBS];
+  size_t bomb_plan_count;
+  Point predicted_exploded_obstacles[PLANNER_V3_TWO_PHASE_MAX_EXPLODED_OBSTACLES];
+  size_t predicted_exploded_obstacle_count;
+} PlannerV3BoxTwoPhasePlan;
+
+typedef struct {
+  size_t box_count;
+  size_t ordered_goal_indices[PLANNER_V3_TWO_PHASE_MAX_BOXES];
+  PlannerV3BoxTwoPhasePlan box_plan[PLANNER_V3_TWO_PHASE_MAX_BOXES];
+} PlannerV3TwoPhasePreplan;
 
 /* include_return_to_start_path:
  *   1 -> append the path from final car pose back to the initial car pose.

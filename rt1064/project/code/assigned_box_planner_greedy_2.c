@@ -9,6 +9,7 @@ extern int last_err_detail;  // 错误详情
 
 int last_err_stage = 0;
 int last_err_detail = LAST_ERR_DETAIL_NONE;
+int last_err_detail_v3_stage3 = LAST_ERR_DETAIL_NONE;
 int last_special_path_fail_reason = 0;  
 int last_first_push_bomb_special_fail_reason = 0;
 

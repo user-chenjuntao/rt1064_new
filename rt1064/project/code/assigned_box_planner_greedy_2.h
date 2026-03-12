@@ -10,6 +10,7 @@ extern "C" {
 
 extern int last_err_stage;   // 错误阶段
 extern int last_err_detail;  // 错误详情
+extern int last_err_detail_v3_stage3; // v3阶段3错误详情（仅stage=3时更新）
 
 /* last_err_detail common / v2 codes */
 #define LAST_ERR_DETAIL_NONE                              0
@@ -37,6 +38,14 @@ typedef struct {
   int bomb_extra_exploded_count;    // 上述辅助炸弹爆炸数量，0..5
   Point bomb_on_path[5];           // 特殊路径经过的炸弹坐标（用于菜单标蓝）
   int bomb_on_path_count;          // 上述数量，0..5
+  int pre_reachable;               // 箱子到分配目标的预检查可达性（1可达，0不可达）
+  int planned_order;               // 预规划推行顺序（0-based，无效为-1）
+  Point planned_bomb_pos[5];       // 该箱子预规划会使用的炸弹位置
+  Point planned_bomb_target[5];    // 对应炸弹预规划目标（爆炸中心/移开目标）
+  int planned_bomb_purpose[5];     // 对应炸弹用途编码
+  int planned_bomb_count;          // 预规划炸弹数量，0..5
+  Point planned_exploded_obstacles[20]; // 预规划预计会清掉的障碍物（按特殊路径累计估计）
+  int planned_exploded_obstacle_count;  // 上述数量，0..20
   int dropped_req1;                // 特殊路径：是否去掉要求1（1=去掉，0=未去掉）
   int dropped_req2;                // 特殊路径：是否去掉要求2（1=去掉，0=未去掉）
   int dropped_req3;                // 特殊路径：是否去掉要求3（1=去掉，0=未去掉）
